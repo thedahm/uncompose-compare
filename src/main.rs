@@ -29,12 +29,9 @@ struct Cli {}
 fn main() {
     Cli::parse();
 
-    match run() {
-        Ok(()) => {}
-        Err(err) => {
-            eprintln!("uncompose-compare: {err}");
-            std::process::exit(1);
-        }
+    if let Err(err) = run() {
+        eprintln!("uncompose-compare: {err}");
+        std::process::exit(1);
     }
 }
 
