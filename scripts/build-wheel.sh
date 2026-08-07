@@ -33,7 +33,8 @@ maturin build --release --out target/wheels >&2
 
 end=$(date +%s)
 
-WHEEL="$(ls "$REPO_ROOT"/target/wheels/*.whl)"
+wheels=("$REPO_ROOT"/target/wheels/*.whl)
+WHEEL="${wheels[0]}"
 size_bytes=$(stat -c%s "$WHEEL")
 size_kib=$(( (size_bytes + 1023) / 1024 ))
 elapsed=$(( end - start ))
