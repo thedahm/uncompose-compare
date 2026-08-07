@@ -4,6 +4,9 @@
   "scripts": {
     "build:frontend": "npm --prefix frontend install && npm --prefix frontend run build",
     "build": "npm run build:frontend && cargo build --release",
+    "wheel": "bash scripts/build-wheel.sh",
+    "clean-install-proof": "bash scripts/clean-install-proof.sh",
+    "pipeline": "bash scripts/pipeline.sh",
     "typecheck": "npm --prefix frontend run typecheck",
     "test": "npm run build:frontend && cargo test",
     "serve": "npm run build:frontend && cargo run"
