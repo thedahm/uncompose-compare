@@ -1,0 +1,19 @@
+[package]
+name = "uncompose-compare"
+version = "0.1.0"
+edition = "2021"
+description = "Spike 1: embedded hello skeleton — a Vite/React stub embedded in a Rust binary and served over loopback."
+publish = false
+
+[[bin]]
+name = "uncompose-compare"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rust-embed = { version = "8", features = ["mime-guess"] }
+tiny_http = "0.12"
+
+[profile.release]
+opt-level = "z"
+strip = true

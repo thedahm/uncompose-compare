@@ -1,4 +1,13 @@
 {
+  "name": "uncompose-compare",
+  "private": true,
+  "scripts": {
+    "build:frontend": "npm --prefix frontend install && npm --prefix frontend run build",
+    "build": "npm run build:frontend && cargo build --release",
+    "typecheck": "npm --prefix frontend run typecheck",
+    "test": "npm run build:frontend && cargo test",
+    "serve": "npm run build:frontend && cargo run"
+  },
   "dependencies": {
     "@ai-hero/sandcastle": "^0.12.0",
     "zod": "^4.4.3"
