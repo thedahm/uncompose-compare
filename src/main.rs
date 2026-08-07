@@ -78,14 +78,13 @@ fn serve(request: Request, token: &str) {
     }
 
     // The token may arrive as a `?token=` query param (the printed URL) or as
-    // the cookie the page seeds for its sub-resource requests.
+    // the cookie the page seeds for its sub-resource requests. Either presenting
+    // the right value authorizes the request; a wrong or missing one refuses it.
     let raw = request.url().to_string();
-    let (path, query) = match raw.split_once('?') {
-        Some((path, query)) => (path, query),
-        None => (raw.as_str(), ""),
-    };
-    let query_ok = query_token(query).is_some_and(|t| ct_eq(t.as_bytes(), token.as_bytes()));
-    let cookie_ok = cookie_token(&request).is_some_and(|t| ct_eq(t.as_bytes(), token.as_bytes()));
+    let (path, query) = raw.split_once('?').unwrap_or((raw.as_str(), ""));
+    let matches = |t: &str| ct_eq(t.as_bytes(), token.as_bytes());
+    let query_ok = query_token(query).is_some_and(matches);
+    let cookie_ok = cookie_token(&request).is_some_and(matches);
     if !query_ok && !cookie_ok {
         return refuse(request);
     }
@@ -143,7 +142,7 @@ fn query_token(query: &str) -> Option<&str> {
 }
 
 /// Extract the `token` value from the request's Cookie header, if present.
-fn cookie_token(request: &Request) -> Option<String> {
+fn cookie_token(request: &Request) -> Option<&str> {
     request
         .headers()
         .iter()
@@ -153,7 +152,7 @@ fn cookie_token(request: &Request) -> Option<String> {
                 .as_str()
                 .split(';')
                 .map(str::trim)
-                .find_map(|kv| kv.strip_prefix("token=").map(str::to_string))
+                .find_map(|kv| kv.strip_prefix("token="))
         })
 }
 
