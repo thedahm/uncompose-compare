@@ -14,7 +14,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WHEEL="${1:-$(ls "$REPO_ROOT"/target/wheels/*.whl)}"
+default_wheel=("$REPO_ROOT"/target/wheels/*.whl)
+WHEEL="${1:-${default_wheel[0]}}"
 
 if [ ! -f "$WHEEL" ]; then
     echo "clean-install-proof: wheel not found: $WHEEL" >&2
