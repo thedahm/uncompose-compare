@@ -1,0 +1,42 @@
+name: packaging pipeline
+
+# Track C packaging spike (spec #1, issue #3): prove Vite build -> rust-embed ->
+# maturin wheel -> clean pip install -> embedded page served, on a stock runner.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-clean-install:
+    # ubuntu-latest per the roadmap; Linux-only for the v0.1 packaging scope.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build-time toolchain only (#60). The clean-install step below sanitizes
+      # PATH inside a fresh venv, so none of this leaks into the install story.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install maturin
+        run: pipx install maturin || pip install maturin
+
+      # One command: build the wheel from a clean checkout, then prove it
+      # pip-installs and serves the embedded page in a toolchain-free venv.
+      # Wheel size and end-to-end build time are printed by the script.
+      - name: Run packaging pipeline (build + clean-install proof)
+        run: bash scripts/pipeline.sh
+
+      - name: Upload wheel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uncompose-compare-wheel
+          path: target/wheels/*.whl
+          if-no-files-found: warn
