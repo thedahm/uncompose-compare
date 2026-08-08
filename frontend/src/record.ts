@@ -86,14 +86,13 @@ export function buildRecordPayload(params: {
 }): RecordPayload {
   const { verdict, context, observations, region } = params;
 
-  const prefers = verdict.preference === "A" || verdict.preference === "B";
-  const result: RecordResult = {
-    // "no preference" is a valid, honest outcome: a null preference.
-    preference: prefers ? (verdict.preference as Label) : null,
-  };
+  // "no preference" is a valid, honest outcome: a null preference.
+  const preference =
+    verdict.preference === "A" || verdict.preference === "B" ? verdict.preference : null;
+  const result: RecordResult = { preference };
   // Confidence is meaningful — and required by the schema — exactly when a
   // candidate is preferred; a no-preference result carries none.
-  if (prefers && verdict.confidence !== null) result.confidence = verdict.confidence;
+  if (preference !== null && verdict.confidence !== null) result.confidence = verdict.confidence;
   const criterion = verdict.criterion.trim();
   if (criterion) result.criterion = criterion;
   const summary = verdict.summary.trim();

@@ -11,7 +11,6 @@
 // engines differ, keeps the full matrix per the spec's testing decisions).
 import { test, expect } from "@playwright/test";
 import { readFileSync } from "node:fs";
-import { readFileSync as read } from "node:fs";
 import { URL_FILE } from "./global-setup.mjs";
 
 const SERVED_URL = readFileSync(URL_FILE, "utf8").trim();
@@ -344,7 +343,7 @@ test("conclude: writes a record that matches the session and reports where it la
 
   // The UI reports the path; read that record back and assert it is the session.
   const recordPath = await page.getByTestId("conclude-path").locator("code").innerText();
-  const record = JSON.parse(read(recordPath, "utf8"));
+  const record = JSON.parse(readFileSync(recordPath, "utf8"));
   expect(record.schema).toContain("compare/v0");
   expect(record.mode).toBe("ab");
   expect(record.id).toHaveLength(26);

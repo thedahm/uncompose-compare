@@ -849,14 +849,11 @@ impl Recorder {
     /// The record destination: `--out` when set (resolved against the invoking
     /// directory if relative), else `<ULID>.json` in the invoking directory.
     fn destination(&self, id: &str) -> PathBuf {
-        let dest = match &self.out {
-            Some(out) => out.clone(),
+        match &self.out {
+            // `join` keeps an absolute `--out` as-is and resolves a relative
+            // one against the invoking directory.
+            Some(out) => self.dir.join(out),
             None => self.dir.join(format!("{id}.json")),
-        };
-        if dest.is_absolute() {
-            dest
-        } else {
-            self.dir.join(dest)
         }
     }
 }

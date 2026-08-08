@@ -192,16 +192,22 @@ fn serving_from(mut command: Command, dir: TempDir) -> Serving {
 /// Minimal HTTP/1.1 GET over a fresh connection with full control over the Host
 /// header and an optional Cookie. Returns (status, lowercased-headers, body).
 fn request(addr: &str, path: &str, host: &str, cookie: Option<&str>) -> (u16, String, Vec<u8>) {
-    let mut stream = TcpStream::connect(addr).expect("connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
     let cookie_line = match cookie {
         Some(c) => format!("Cookie: {c}\r\n"),
         None => String::new(),
     };
     let req =
         format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{cookie_line}Connection: close\r\n\r\n");
+    roundtrip(addr, &req)
+}
+
+/// Send a raw HTTP/1.1 request over a fresh connection and parse the response.
+/// Returns (status, lowercased-headers, body).
+fn roundtrip(addr: &str, req: &str) -> (u16, String, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     stream.write_all(req.as_bytes()).expect("write request");
 
     let mut raw = Vec::new();
@@ -261,39 +267,12 @@ fn http_get(addr: &str, path: &str) -> (u16, String, Vec<u8>) {
 /// Minimal HTTP/1.1 POST of a JSON body over a fresh connection, with full
 /// control over the Host header. Returns (status, lowercased-headers, body).
 fn post(addr: &str, path: &str, host: &str, body: &str) -> (u16, String, Vec<u8>) {
-    let mut stream = TcpStream::connect(addr).expect("connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(req.as_bytes()).expect("write request");
-
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("read response");
-
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("response has header/body separator");
-    let head = String::from_utf8_lossy(&raw[..split]).to_string();
-    let mut body = raw[split + 4..].to_vec();
-
-    let status = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse::<u16>().ok())
-        .expect("parse status code");
-
-    let headers = head.to_lowercase();
-    if headers.contains("transfer-encoding: chunked") {
-        body = dechunk(&body);
-    }
-    (status, headers, body)
+    roundtrip(addr, &req)
 }
 
 /// POST to the record endpoint over the tokened loopback Host.
