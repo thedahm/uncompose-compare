@@ -7,11 +7,10 @@ import { installSyncHarness, renderSync } from "./sync";
 // re-unit-tested here (per the spec's testing decisions).
 describe("installSyncHarness", () => {
   it("registers renderSync as the sync seam on window", () => {
-    const g = globalThis as unknown as {
-      window?: { __uncomposeSync?: unknown };
-    };
-    g.window = {};
+    // vitest runs in Node, which has no `window`; stub the bare object the
+    // seam is installed onto.
+    globalThis.window = {} as Window & typeof globalThis;
     installSyncHarness();
-    expect(g.window.__uncomposeSync).toBe(renderSync);
+    expect(window.__uncomposeSync).toBe(renderSync);
   });
 });
