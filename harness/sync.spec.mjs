@@ -13,6 +13,7 @@ import { test, expect } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { URL_FILE } from "./global-setup.mjs";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const b64 = (f) => readFileSync(path.join(dir, "fixtures", f)).toString("base64");
@@ -28,7 +29,7 @@ const FRAMES = 66150;
 const SWITCH_SAMPLE = 30870; // 0.7 s
 const FADE_SAMPLES = 441; // 10 ms
 
-const SERVED_URL = readFileSync(path.join(dir, ".served-url"), "utf8").trim();
+const SERVED_URL = readFileSync(URL_FILE, "utf8").trim();
 
 let result;
 test.beforeAll(async ({ browser }) => {
