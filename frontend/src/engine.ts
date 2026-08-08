@@ -19,8 +19,11 @@ import { clampPosition, equalPowerCurves, type Label, otherLabel, stepPosition }
 
 /** The equal-power switch fade, ~10 ms — matches the sync contract's bound. */
 const FADE_SECONDS = 0.01;
-/** Resolution of the crossfade curve handed to `setValueCurveAtTime`. */
-const CURVE_STEPS = 64;
+/**
+ * The crossfade curves, 64 steps, computed once — `setValueCurveAtTime` copies
+ * the arrays, so sharing them across switches is safe.
+ */
+const FADE_CURVES = equalPowerCurves(64);
 
 export class PlaybackEngine {
   private ctx: AudioContext;
@@ -38,6 +41,9 @@ export class PlaybackEngine {
   private startOffset = 0;
   /** Bumped on every (re)start so a stale `onended` cannot fire transport logic. */
   private generation = 0;
+
+  /** Notified when playback ends on its own (reaches the end of the track). */
+  onEnded: (() => void) | null = null;
 
   constructor(ctx: AudioContext, a: AudioBuffer, b: AudioBuffer) {
     this.ctx = ctx;
@@ -142,7 +148,7 @@ export class PlaybackEngine {
     this.liveLabel = label;
     const now = this.ctx.currentTime;
     if (this.playing) {
-      const { up, down } = equalPowerCurves(CURVE_STEPS);
+      const { up, down } = FADE_CURVES;
       this.gains[label].gain.cancelScheduledValues(now);
       this.gains[outgoing].gain.cancelScheduledValues(now);
       // Anchor the ramp at the present value so the curve starts from "now".
@@ -160,9 +166,6 @@ export class PlaybackEngine {
   toggleSwitch(): void {
     this.switchTo(otherLabel(this.liveLabel));
   }
-
-  /** Notified when playback ends on its own (reaches the end of the track). */
-  onEnded: (() => void) | null = null;
 
   private startSources(offset: number): void {
     this.teardownSources();

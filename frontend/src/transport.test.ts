@@ -88,4 +88,7 @@ describe("formatTime", () => {
   it("never renders a negative readout", () => {
     expect(formatTime(-1)).toBe("0:00.000");
   });
+  it("carries rounded milliseconds across the minute boundary", () => {
+    expect(formatTime(59.9996)).toBe("1:00.000");
+  });
 });

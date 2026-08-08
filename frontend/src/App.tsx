@@ -23,7 +23,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PlaybackEngine } from "./engine";
 import { Waveform } from "./Waveform";
-import { computePeaks, formatTime, type Label } from "./transport";
+import { computePeaks, formatTime, otherLabel, type Label } from "./transport";
 
 interface Candidate {
   label: string;
@@ -59,7 +59,7 @@ function candidateColor(label: Label): string {
 export function App() {
   const [session, setSession] = useState<SessionMeta | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [ready, setReady] = useState(false);
+  const [candidates, setCandidates] = useState<Record<Label, Candidate> | null>(null);
   const [peaks, setPeaks] = useState<Record<Label, Peaks> | null>(null);
 
   const [live, setLive] = useState<Label>("A");
@@ -79,18 +79,18 @@ export function App() {
   }, []);
 
   // Load /session, then fetch and decode both proxies into one Web Audio graph.
+  // The ref makes this a one-shot: StrictMode's dev-mode double-mount must not
+  // build a second graph, and the single flight is allowed to finish (App is
+  // the root component, so it never unmounts mid-flight in practice).
   useEffect(() => {
     if (startedRef.current) return;
     startedRef.current = true;
-    let cancelled = false;
-    let ctx: AudioContext | null = null;
 
     (async () => {
       try {
         const res = await fetch("/session");
         if (!res.ok) throw new Error(`session ${res.status}`);
         const s = (await res.json()) as SessionMeta;
-        if (cancelled) return;
         setSession(s);
 
         const byLabel = (label: Label) =>
@@ -99,35 +99,27 @@ export function App() {
         const b = byLabel("B");
         if (!a || !b) throw new Error("session is missing candidate A or B");
 
-        ctx = new AudioContext();
+        const ctx = new AudioContext();
         const decode = async (c: Candidate): Promise<AudioBuffer> => {
           const buf = await (await fetch(c.audio)).arrayBuffer();
-          return await ctx!.decodeAudioData(buf);
+          return await ctx.decodeAudioData(buf);
         };
         const [bufA, bufB] = await Promise.all([decode(a), decode(b)]);
-        if (cancelled) {
-          void ctx.close();
-          return;
-        }
 
         const eng = new PlaybackEngine(ctx, bufA, bufB);
         eng.onEnded = () => syncFrom(eng);
         engineRef.current = eng;
+        setCandidates({ A: a, B: b });
         setPeaks({
           A: computePeaks(bufA.getChannelData(0), BUCKETS),
           B: computePeaks(bufB.getChannelData(0), BUCKETS),
         });
         setDuration(eng.duration());
-        setReady(true);
         syncFrom(eng);
       } catch (e) {
-        if (!cancelled) setError(String(e));
+        setError(String(e));
       }
     })();
-
-    return () => {
-      cancelled = true;
-    };
   }, [syncFrom]);
 
   // While playing, follow the transport so the playhead and readout track it.
@@ -146,25 +138,28 @@ export function App() {
     return () => cancelAnimationFrame(raf);
   }, [playing]);
 
-  const seek = useCallback(
-    (sec: number) => {
+  /** Run a transport action, then mirror the engine's state into React. */
+  const withEngine = useCallback(
+    (action: (eng: PlaybackEngine) => void) => {
       const eng = engineRef.current;
       if (!eng) return;
-      eng.seek(sec);
+      action(eng);
       syncFrom(eng);
     },
     [syncFrom],
   );
 
-  const switchTo = useCallback(
-    (label: Label) => {
-      const eng = engineRef.current;
-      if (!eng) return;
-      eng.switchTo(label);
-      syncFrom(eng);
-    },
-    [syncFrom],
+  const seek = useCallback(
+    (sec: number) => withEngine((eng) => eng.seek(sec)),
+    [withEngine],
   );
+
+  const switchTo = useCallback(
+    (label: Label) => withEngine((eng) => eng.switchTo(label)),
+    [withEngine],
+  );
+
+  const togglePlay = () => withEngine((eng) => eng.togglePlay(stopReturns));
 
   // Keyboard transport: bare keys only, ctrl reserved for undo/redo (a later
   // ticket), and never while typing into a future ledger/verdict field.
@@ -175,44 +170,28 @@ export function App() {
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) {
         return;
       }
-      const eng = engineRef.current;
       switch (e.key) {
         case " ":
           e.preventDefault();
-          if (eng) {
-            eng.togglePlay(stopReturns);
-            syncFrom(eng);
-          }
+          withEngine((eng) => eng.togglePlay(stopReturns));
           break;
         case "x":
         case "X":
-          if (eng) {
-            eng.toggleSwitch();
-            syncFrom(eng);
-          }
+          withEngine((eng) => eng.toggleSwitch());
           break;
         case "ArrowLeft":
         case "-":
           e.preventDefault();
-          if (eng) {
-            eng.step(-STEP_SECONDS);
-            syncFrom(eng);
-          }
+          withEngine((eng) => eng.step(-STEP_SECONDS));
           break;
         case "ArrowRight":
         case "=":
           e.preventDefault();
-          if (eng) {
-            eng.step(STEP_SECONDS);
-            syncFrom(eng);
-          }
+          withEngine((eng) => eng.step(STEP_SECONDS));
           break;
         case "Home":
           e.preventDefault();
-          if (eng) {
-            eng.rewind();
-            syncFrom(eng);
-          }
+          withEngine((eng) => eng.rewind());
           break;
         case "?":
           e.preventDefault();
@@ -224,14 +203,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [stopReturns, syncFrom]);
-
-  const togglePlay = () => {
-    const eng = engineRef.current;
-    if (!eng) return;
-    eng.togglePlay(stopReturns);
-    syncFrom(eng);
-  };
+  }, [stopReturns, withEngine]);
 
   return (
     <main style={{ fontFamily: "system-ui, sans-serif", color: "#eee", background: "#0a0a0a", minHeight: "100vh", padding: 16 }}>
@@ -250,9 +222,9 @@ export function App() {
         <p data-testid="session-error">Could not load session: {error}</p>
       )}
 
-      {!ready && !error && <p data-testid="loading">Loading candidates…</p>}
+      {!peaks && !error && <p data-testid="loading">Loading candidates…</p>}
 
-      {ready && peaks && session && (
+      {peaks && candidates && (
         <section data-testid="workbench">
           {/* Primary stage: the live candidate's waveform with the transport. */}
           <div data-testid="stage" style={{ marginBottom: 12 }}>
@@ -277,7 +249,7 @@ export function App() {
               <button data-testid="play-toggle" onClick={togglePlay}>
                 {playing ? "Stop" : "Play"}
               </button>
-              <button data-testid="switch" onClick={() => switchTo(live === "A" ? "B" : "A")}>
+              <button data-testid="switch" onClick={() => switchTo(otherLabel(live))}>
                 Switch (x)
               </button>
               <button data-testid="rewind" onClick={() => seek(0)}>
@@ -303,7 +275,7 @@ export function App() {
           {/* A/B lane rows: click to audition; ● marks the live lane. */}
           <div data-testid="lanes">
             {(["A", "B"] as Label[]).map((label) => {
-              const c = session.candidates.find((cc) => cc.label === label)!;
+              const c = candidates[label];
               const isLive = live === label;
               return (
                 <div

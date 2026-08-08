@@ -62,19 +62,13 @@ export function computePeaks(
   for (let b = 0; b < buckets; b++) {
     const start = Math.floor(b * per);
     const end = Math.min(data.length, Math.max(start + 1, Math.floor((b + 1) * per)));
-    let lo = 0;
-    let hi = 0;
-    let seen = false;
-    for (let i = start; i < end; i++) {
+    // A bucket that falls past the data (short input) stays at silence.
+    let lo = start < data.length ? data[start] : 0;
+    let hi = lo;
+    for (let i = start + 1; i < end; i++) {
       const v = data[i];
-      if (!seen) {
-        lo = v;
-        hi = v;
-        seen = true;
-      } else {
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
-      }
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
     }
     min[b] = lo;
     max[b] = hi;
@@ -84,13 +78,11 @@ export function computePeaks(
 
 /** Format a position (seconds) as `m:ss.mmm`, never negative. */
 export function formatTime(sec: number): string {
-  const t = sec > 0 ? sec : 0;
-  const minutes = Math.floor(t / 60);
-  const seconds = Math.floor(t % 60);
-  const millis = Math.round((t - Math.floor(t)) * 1000);
-  // Rounding can carry milliseconds to 1000; fold it into the next second.
-  const ms = millis === 1000 ? 0 : millis;
-  const carry = millis === 1000 ? 1 : 0;
-  const s = seconds + carry;
-  return `${minutes}:${String(s).padStart(2, "0")}.${String(ms).padStart(3, "0")}`;
+  // Round once to whole milliseconds, then decompose, so rounding carries
+  // cleanly through every unit (59.9996 s reads "1:00.000", not "0:60.000").
+  const totalMs = Math.round(Math.max(0, sec) * 1000);
+  const minutes = Math.floor(totalMs / 60_000);
+  const seconds = Math.floor((totalMs % 60_000) / 1000);
+  const ms = totalMs % 1000;
+  return `${minutes}:${String(seconds).padStart(2, "0")}.${String(ms).padStart(3, "0")}`;
 }
