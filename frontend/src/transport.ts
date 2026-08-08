@@ -99,22 +99,35 @@ export function equalPowerCurves(steps: number): { up: Float32Array; down: Float
   return { up, down };
 }
 
+/** A min/max peak envelope: one pair per bucket, for waveform drawing. */
+export interface Peaks {
+  min: Float32Array;
+  max: Float32Array;
+}
+
+/**
+ * The sample range `[start, end)` covered by bucket `b` of an equal split into
+ * buckets of `per` samples each: at least one sample wide, clamped to the data.
+ * Shared by the peak and loudness reducers so both views bucket identically.
+ */
+function bucketRange(b: number, per: number, length: number): { start: number; end: number } {
+  const start = Math.floor(b * per);
+  const end = Math.min(length, Math.max(start + 1, Math.floor((b + 1) * per)));
+  return { start, end };
+}
+
 /**
  * Reduce a channel's samples to `buckets` min/max pairs for waveform drawing.
  * Each bucket spans an equal slice of the samples; drawing a vertical line from
  * `min[i]` to `max[i]` gives the familiar filled-envelope waveform without
  * touching every sample at paint time.
  */
-export function computePeaks(
-  data: Float32Array,
-  buckets: number,
-): { min: Float32Array; max: Float32Array } {
+export function computePeaks(data: Float32Array, buckets: number): Peaks {
   const min = new Float32Array(buckets);
   const max = new Float32Array(buckets);
   const per = data.length / buckets;
   for (let b = 0; b < buckets; b++) {
-    const start = Math.floor(b * per);
-    const end = Math.min(data.length, Math.max(start + 1, Math.floor((b + 1) * per)));
+    const { start, end } = bucketRange(b, per, data.length);
     // A bucket that falls past the data (short input) stays at silence.
     let lo = start < data.length ? data[start] : 0;
     let hi = lo;
@@ -140,16 +153,12 @@ export function computeLoudness(data: Float32Array, buckets: number): Float32Arr
   const rms = new Float32Array(buckets);
   const per = data.length / buckets;
   for (let b = 0; b < buckets; b++) {
-    const start = Math.floor(b * per);
-    const end = Math.min(data.length, Math.max(start + 1, Math.floor((b + 1) * per)));
+    const { start, end } = bucketRange(b, per, data.length);
     let sum = 0;
-    let count = 0;
     for (let i = start; i < end; i++) {
-      const v = i < data.length ? data[i] : 0;
-      sum += v * v;
-      count++;
+      sum += data[i] * data[i];
     }
-    rms[b] = count > 0 ? Math.sqrt(sum / count) : 0;
+    rms[b] = end > start ? Math.sqrt(sum / (end - start)) : 0;
   }
   return rms;
 }
@@ -217,7 +226,7 @@ export interface Spectrogram {
  * picks which of these every display draws.
  */
 export interface CandidateViews {
-  peaks: { min: Float32Array; max: Float32Array };
+  peaks: Peaks;
   loudness: Float32Array;
   spectral: Spectrogram;
 }
