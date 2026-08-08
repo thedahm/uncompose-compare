@@ -1,5 +1,9 @@
 # uncompose-compare
 
+## Documentation policy
+
+Commit only documentation that code alone can't explain: decisions, tradeoffs, constraints ("we considered X, chose Y because Z" — ADRs are the canonical form). Research, findings, and spike write-ups go to issues or the wiki, never into the repo, so committed docs can't drift from or duplicate the actual implementation.
+
 ## Agent skills
 
 ### Issue tracker
