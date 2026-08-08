@@ -142,6 +142,12 @@ fn launch_opts(
     if let Some(home) = cache_home {
         command.env("XDG_CACHE_HOME", home);
     }
+    serving_from(command, dir)
+}
+
+/// Launch the binary with a caller-built command (so record tests can set the
+/// invoking directory and `--out`), parsing the tokened URL line it prints.
+fn serving_from(mut command: Command, dir: TempDir) -> Serving {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -186,16 +192,22 @@ fn launch_opts(
 /// Minimal HTTP/1.1 GET over a fresh connection with full control over the Host
 /// header and an optional Cookie. Returns (status, lowercased-headers, body).
 fn request(addr: &str, path: &str, host: &str, cookie: Option<&str>) -> (u16, String, Vec<u8>) {
-    let mut stream = TcpStream::connect(addr).expect("connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
     let cookie_line = match cookie {
         Some(c) => format!("Cookie: {c}\r\n"),
         None => String::new(),
     };
     let req =
         format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{cookie_line}Connection: close\r\n\r\n");
+    roundtrip(addr, &req)
+}
+
+/// Send a raw HTTP/1.1 request over a fresh connection and parse the response.
+/// Returns (status, lowercased-headers, body).
+fn roundtrip(addr: &str, req: &str) -> (u16, String, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     stream.write_all(req.as_bytes()).expect("write request");
 
     let mut raw = Vec::new();
@@ -250,6 +262,22 @@ fn dechunk(raw: &[u8]) -> Vec<u8> {
 /// GET with the correct (loopback) Host header and no cookie.
 fn http_get(addr: &str, path: &str) -> (u16, String, Vec<u8>) {
     request(addr, path, addr, None)
+}
+
+/// Minimal HTTP/1.1 POST of a JSON body over a fresh connection, with full
+/// control over the Host header. Returns (status, lowercased-headers, body).
+fn post(addr: &str, path: &str, host: &str, body: &str) -> (u16, String, Vec<u8>) {
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    roundtrip(addr, &req)
+}
+
+/// POST to the record endpoint over the tokened loopback Host.
+fn http_post(server: &Serving, path: &str, body: &str) -> (u16, String, Vec<u8>) {
+    post(&server.addr, path, &server.addr, body)
 }
 
 #[test]
@@ -1011,4 +1039,298 @@ fn cache_clear_empties_and_reports() {
 
     let after = std::fs::read_dir(&cache_dir).unwrap().count();
     assert_eq!(after, 0, "the cache should be empty after clear");
+}
+
+// --- Issue #16: the comparison record — conclude, validate, write once --------
+
+/// The schema's `$id`, which every written record carries in its `schema` field.
+const RECORD_SCHEMA_ID: &str =
+    "https://uncompose.org/schemas/compare/v0/uncompose.compare.schema.json";
+
+/// Launch the binary for a record test: two matched fixtures, a chosen invoking
+/// directory (the default record destination), and an optional `--out`.
+fn launch_recording(cwd: &Path, out: Option<&Path>) -> Serving {
+    let dir = TempDir::new("record-fixtures");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    write_wav(&a, 44_100, 44_100, 2, 71);
+    write_wav(&b, 44_100, 44_100, 2, 72);
+    let mut command = Command::new(BIN);
+    command.arg(&a).arg(&b).current_dir(cwd);
+    if let Some(o) = out {
+        command.arg("--out").arg(o);
+    }
+    serving_from(command, dir)
+}
+
+/// Read a written record, assert it validates against the in-repo v0 schema (the
+/// repo-owned artifact used server-side), and return it for field checks.
+fn validate_record_file(path: &Path) -> serde_json::Value {
+    let bytes = std::fs::read(path).expect("read record file");
+    let record: serde_json::Value = serde_json::from_slice(&bytes).expect("record is valid JSON");
+    let schema_src = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("schemas/compare/v0/uncompose.compare.schema.json"),
+    )
+    .expect("read the committed schema");
+    let schema: serde_json::Value =
+        serde_json::from_str(&schema_src).expect("schema is valid JSON");
+    let validator = jsonschema::validator_for(&schema).expect("compile schema");
+    let errors: Vec<String> = validator
+        .iter_errors(&record)
+        .map(|e| e.to_string())
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "record must validate against the v0 schema: {errors:?}\n{record}"
+    );
+    record
+}
+
+/// The lone `*.json` record in a directory, or a panic if there isn't exactly one.
+fn sole_record(dir: &Path) -> PathBuf {
+    let mut records: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    assert_eq!(records.len(), 1, "expected exactly one record in {dir:?}");
+    records.pop().unwrap()
+}
+
+#[test]
+fn conclude_writes_valid_record_with_matching_hashes() {
+    let cwd = TempDir::new("record-default");
+    let server = launch_recording(&cwd.path, None);
+    let session = session_json(&server);
+    let sha_a = first_sha256(&session);
+
+    let body = r#"{
+        "result": {"preference": "A", "confidence": 4, "criterion": "clarity", "summary": "A cleaner"},
+        "observations": [
+            {"at": "2026-08-08T10:00:00Z", "position_ms": 1200, "loop": 0, "candidate": "A", "text": "bright"},
+            {"at": "2026-08-08T10:01:00Z", "text": "difference only in the chorus"}
+        ],
+        "loops": [{"start_ms": 1000, "end_ms": 3000}],
+        "context": "picking a master"
+    }"#;
+    let (status, headers, resp) =
+        http_post(&server, &format!("/record?token={}", server.token), body);
+    let resp = String::from_utf8_lossy(&resp);
+    assert_eq!(status, 200, "a valid conclude is accepted: {resp}");
+    assert!(
+        headers.contains("cache-control: no-store"),
+        "the record response is uncached like every other: {headers}"
+    );
+
+    // The UI is told where the record landed, and it landed there.
+    let response: serde_json::Value = serde_json::from_str(&resp).expect("record response is JSON");
+    let reported = response["path"].as_str().expect("response reports a path");
+    let record_path = sole_record(&cwd.path);
+    assert_eq!(
+        reported,
+        record_path.to_string_lossy(),
+        "the reported path is the written file"
+    );
+
+    let record = validate_record_file(&record_path);
+    // Server-authoritative fields: schema id, ULID, mode, empty playback.
+    assert_eq!(record["schema"], RECORD_SCHEMA_ID);
+    assert_eq!(record["mode"], "ab");
+    assert_eq!(record["playback"], serde_json::json!({}));
+    assert_eq!(
+        record["id"].as_str().map(|s| s.len()),
+        Some(26),
+        "id is a 26-char ULID: {record}"
+    );
+    assert!(
+        record["created_at"].as_str().unwrap().ends_with('Z')
+            && record["completed_at"].as_str().unwrap().ends_with('Z'),
+        "timestamps are RFC3339 UTC: {record}"
+    );
+
+    // The record's hashes provably match the loaded inputs (they come from the
+    // trusted load, not the request body).
+    let candidates = record["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0]["label"], "A");
+    assert_eq!(candidates[0]["sha256"], sha_a);
+    assert!(candidates[0]["path"].is_string() && candidates[0]["size"].is_u64());
+
+    // Session-authored fields survive the round trip in the order made.
+    assert_eq!(record["result"]["preference"], "A");
+    assert_eq!(record["result"]["confidence"], 4);
+    assert_eq!(record["observations"].as_array().unwrap().len(), 2);
+    assert_eq!(record["observations"][0]["text"], "bright");
+    assert_eq!(record["observations"][0]["candidate"], "A");
+    assert_eq!(record["loops"][0]["start_ms"], 1000);
+    assert_eq!(record["context"], "picking a master");
+}
+
+#[test]
+fn conclude_records_no_preference_as_null() {
+    let cwd = TempDir::new("record-nopref");
+    let server = launch_recording(&cwd.path, None);
+
+    // "No preference" is a valid outcome: a null preference and no confidence.
+    let body = r#"{"result": {"preference": null}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(
+        status,
+        200,
+        "no-preference is a valid conclude: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let record = validate_record_file(&sole_record(&cwd.path));
+    assert!(
+        record["result"]["preference"].is_null(),
+        "no preference: {record}"
+    );
+    assert!(
+        record["result"].get("confidence").is_none(),
+        "no confidence without a preference: {record}"
+    );
+}
+
+#[test]
+fn conclude_enforces_confidence_iff_preference() {
+    let cwd = TempDir::new("record-conf");
+    let server = launch_recording(&cwd.path, None);
+
+    // A chosen preference with no confidence is refused by schema validation.
+    let (status, _, resp) = http_post(
+        &server,
+        &format!("/record?token={}", server.token),
+        r#"{"result": {"preference": "B"}, "observations": [], "loops": []}"#,
+    );
+    assert_eq!(
+        status,
+        400,
+        "a preference needs a confidence: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    // A null preference carrying a confidence is likewise refused.
+    let (status, _, _) = http_post(
+        &server,
+        &format!("/record?token={}", server.token),
+        r#"{"result": {"preference": null, "confidence": 3}, "observations": [], "loops": []}"#,
+    );
+    assert_eq!(status, 400, "no preference must omit confidence");
+
+    // Neither refusal wrote anything: the session is not concluded.
+    assert!(
+        std::fs::read_dir(&cwd.path).unwrap().next().is_none(),
+        "a refused conclude writes no record"
+    );
+}
+
+#[test]
+fn second_conclude_is_refused() {
+    let cwd = TempDir::new("record-twice");
+    let server = launch_recording(&cwd.path, None);
+    let body =
+        r#"{"result": {"preference": "A", "confidence": 5}, "observations": [], "loops": []}"#;
+
+    let (first, _, _) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(first, 200, "the first conclude writes the record");
+
+    let (second, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(second, 409, "a second conclude is refused");
+    assert!(
+        String::from_utf8_lossy(&resp).contains("already"),
+        "the refusal explains itself: {}",
+        String::from_utf8_lossy(&resp)
+    );
+    // Still exactly one record: the write happened exactly once.
+    let _ = sole_record(&cwd.path);
+}
+
+#[test]
+fn conclude_refuses_to_overwrite_existing_destination() {
+    let cwd = TempDir::new("record-overwrite-cwd");
+    let out_dir = TempDir::new("record-overwrite-out");
+    let out = out_dir.join("record.json");
+    std::fs::write(&out, b"do not clobber me").unwrap();
+
+    let server = launch_recording(&cwd.path, Some(&out));
+    let body =
+        r#"{"result": {"preference": "A", "confidence": 3}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(status, 409, "an existing --out destination is refused");
+    assert!(
+        String::from_utf8_lossy(&resp).contains("overwrite"),
+        "the refusal names the overwrite: {}",
+        String::from_utf8_lossy(&resp)
+    );
+    // The pre-existing file is untouched.
+    assert_eq!(std::fs::read(&out).unwrap(), b"do not clobber me");
+}
+
+#[test]
+fn conclude_honors_out_override() {
+    let cwd = TempDir::new("record-out-cwd");
+    let out_dir = TempDir::new("record-out-dest");
+    let out = out_dir.join("verdict.json");
+
+    let server = launch_recording(&cwd.path, Some(&out));
+    let body =
+        r#"{"result": {"preference": "B", "confidence": 2}, "observations": [], "loops": []}"#;
+    let (status, _, _) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(status, 200, "--out is a valid destination");
+
+    // The record is at --out, and not in the invoking directory.
+    assert!(out.exists(), "the record is written to --out");
+    let record = validate_record_file(&out);
+    assert_eq!(record["result"]["preference"], "B");
+    assert!(
+        std::fs::read_dir(&cwd.path).unwrap().next().is_none(),
+        "--out means nothing lands in the invoking directory"
+    );
+}
+
+#[test]
+fn abandoned_session_writes_no_record() {
+    let cwd = TempDir::new("record-abandoned");
+    {
+        // Launch, load the session, but never conclude — then drop (kill) it.
+        let server = launch_recording(&cwd.path, None);
+        let _ = session_json(&server);
+    }
+    assert!(
+        std::fs::read_dir(&cwd.path).unwrap().next().is_none(),
+        "an abandoned session leaves no record file"
+    );
+}
+
+#[test]
+fn record_endpoint_enforces_the_privacy_contract() {
+    let cwd = TempDir::new("record-guard");
+    let server = launch_recording(&cwd.path, None);
+    let body = r#"{"result": {"preference": null}, "observations": [], "loops": []}"#;
+
+    // No token: refused, and uncached like every refusal.
+    let (status, headers, _) = http_post(&server, "/record", body);
+    assert_eq!(status, 403, "the record endpoint needs the token");
+    assert!(
+        headers.contains("cache-control: no-store"),
+        "refusal is uncached: {headers}"
+    );
+
+    // Bad Host: refused (DNS-rebinding guard).
+    let (status, _, _) = post(
+        &server.addr,
+        &format!("/record?token={}", server.token),
+        "evil.example.com",
+        body,
+    );
+    assert_eq!(status, 403, "the record endpoint honors the Host check");
+
+    // Nothing was written by a refused request.
+    assert!(
+        std::fs::read_dir(&cwd.path).unwrap().next().is_none(),
+        "a refused conclude writes no record"
+    );
 }

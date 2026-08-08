@@ -28,15 +28,17 @@
 //! a non-zero exit: wrong argument count (clap), a missing or unreadable file,
 //! or an undecodable format.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{File, FileTimes};
+use std::fs::{File, FileTimes, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use rust_embed::RustEmbed;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -45,7 +47,7 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use tiny_http::{Header, Request, Response, Server};
+use tiny_http::{Header, Method, Request, Response, Server};
 
 /// The Vite/React stub bundle, embedded at compile time. `build.rs` guarantees
 /// the folder is present and non-empty, so a build that reaches here has assets.
@@ -56,6 +58,16 @@ struct Assets;
 /// The default proxy-cache cap: 2 GiB, per #72. Overridable with
 /// `--cache-max-bytes` so the LRU prune is testable and tunable.
 const DEFAULT_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The v0 comparison-record JSON Schema, this repo's owned artifact (issue #16,
+/// decision uncompose#65), embedded so the record endpoint validates against the
+/// exact bytes committed here — no drift between the published schema and what
+/// the server enforces, and no file read at conclude time.
+const SCHEMA_STR: &str = include_str!("../schemas/compare/v0/uncompose.compare.schema.json");
+
+/// The schema's `$id` — the value every written record carries in its `schema`
+/// field (serving it at this URL is M6; owning it is M3).
+const SCHEMA_ID: &str = "https://uncompose.org/schemas/compare/v0/uncompose.compare.schema.json";
 
 /// uncompose-compare — load two audio files and open the listening workbench.
 #[derive(Parser)]
@@ -72,6 +84,12 @@ struct Cli {
     /// Prune the proxy cache to at most this many bytes (LRU, at startup only).
     #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_CACHE_MAX_BYTES)]
     cache_max_bytes: u64,
+
+    /// Write the concluded comparison record here instead of the default
+    /// `<ULID>.json` in the invoking directory. An existing destination is
+    /// refused, never overwritten.
+    #[arg(long, value_name = "PATH")]
+    out: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -153,12 +171,19 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // knowing the port alone is not enough to talk to the server.
     let token = session_token()?;
 
+    // The record writer: the default destination is the invoking directory
+    // (named by the record's ULID at conclude time), overridden by `--out`. The
+    // session's start is the record's `created_at`; `completed_at` is stamped at
+    // conclude. Built before serving so a bad `--out` or an unreadable cwd fails
+    // fast rather than at the end of a session.
+    let recorder = Recorder::new(cli.out.clone(), std::env::current_dir()?, SystemTime::now())?;
+
     let url = format!("http://127.0.0.1:{port}/?token={token}");
     println!("{url}");
     std::io::stdout().flush()?;
 
     for request in server.incoming_requests() {
-        serve(request, &token, &session);
+        serve(request, &token, &session, &recorder);
     }
 
     Ok(())
@@ -668,9 +693,255 @@ fn encode_wav(pcm: &DecodedPcm) -> Result<Vec<u8>, String> {
     Ok(buf.into_inner())
 }
 
+/// The comparison-record writer (issue #16): the compiled schema validator, the
+/// destination policy, the session's start time, and the write-once guard. The
+/// server loop is single-threaded, so a `Cell` is all "written exactly once"
+/// needs — a successful write flips it, and every later conclude is refused.
+struct Recorder {
+    validator: jsonschema::Validator,
+    /// The `--out` override, if any; otherwise the record lands in `dir`.
+    out: Option<PathBuf>,
+    /// The invoking directory: the default destination and the base a relative
+    /// `--out` resolves against.
+    dir: PathBuf,
+    /// The session's `created_at`, stamped once at startup (RFC 3339, UTC).
+    created_at: String,
+    concluded: Cell<bool>,
+}
+
+/// Why a conclude was refused, mapped to an HTTP status the UI can act on.
+enum RecordError {
+    /// A second conclude, or any conclude after a successful write (#65).
+    AlreadyConcluded,
+    /// The POST body was not the JSON the endpoint expects.
+    BadRequest(String),
+    /// The assembled record failed schema validation.
+    Invalid(String),
+    /// The destination already exists — refused, never overwritten.
+    Overwrite(String),
+    /// The record could not be written for some other reason.
+    Io(String),
+}
+
+impl RecordError {
+    fn status(&self) -> u16 {
+        match self {
+            RecordError::BadRequest(_) | RecordError::Invalid(_) => 400,
+            RecordError::AlreadyConcluded | RecordError::Overwrite(_) => 409,
+            RecordError::Io(_) => 500,
+        }
+    }
+}
+
+impl fmt::Display for RecordError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RecordError::AlreadyConcluded => {
+                write!(f, "this session has already been concluded")
+            }
+            RecordError::BadRequest(m) => write!(f, "{m}"),
+            RecordError::Invalid(m) => write!(f, "record does not conform to the schema: {m}"),
+            RecordError::Overwrite(m) => write!(f, "{m}"),
+            RecordError::Io(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl Recorder {
+    fn new(
+        out: Option<PathBuf>,
+        dir: PathBuf,
+        created_at: SystemTime,
+    ) -> Result<Recorder, Box<dyn std::error::Error + Send + Sync>> {
+        let schema: Value = serde_json::from_str(SCHEMA_STR)?;
+        let validator = jsonschema::validator_for(&schema).map_err(|e| e.to_string())?;
+        Ok(Recorder {
+            validator,
+            out,
+            dir,
+            created_at: rfc3339(created_at),
+            concluded: Cell::new(false),
+        })
+    }
+
+    /// Assemble the record from the server-authoritative fields plus the
+    /// session-authored body, validate it, and write it once. The server owns
+    /// `schema`/`id`/timestamps/`candidates`/`mode`/`playback` (so hashes and
+    /// paths can't be forged from the browser); the body supplies only `result`,
+    /// `observations`, `loops`, and `context`.
+    fn conclude(&self, session: &Session, body: &str) -> Result<String, RecordError> {
+        // Refuse a second conclude before doing any work.
+        if self.concluded.get() {
+            return Err(RecordError::AlreadyConcluded);
+        }
+
+        let posted: Value = serde_json::from_str(body)
+            .map_err(|e| RecordError::BadRequest(format!("record is not valid JSON: {e}")))?;
+
+        // Candidates come from the trusted load, never the request: this is what
+        // makes the record's hashes provably match the inputs.
+        let candidates: Vec<Value> = session
+            .candidates
+            .iter()
+            .map(|c| {
+                json!({
+                    "label": c.label,
+                    "path": c.path,
+                    "sha256": c.sha256,
+                    "size": c.size,
+                })
+            })
+            .collect();
+
+        let id = new_ulid().map_err(|e| RecordError::Io(e.to_string()))?;
+
+        let mut record = json!({
+            "schema": SCHEMA_ID,
+            "id": id,
+            "created_at": self.created_at,
+            "completed_at": rfc3339(SystemTime::now()),
+            "candidates": candidates,
+            "mode": "ab",
+            "playback": {},
+            "loops": posted.get("loops").cloned().unwrap_or_else(|| json!([])),
+            "observations": posted.get("observations").cloned().unwrap_or_else(|| json!([])),
+            "result": posted.get("result").cloned().unwrap_or(Value::Null),
+        });
+        // Context is optional; carry it through only when the listener wrote one.
+        if let Some(context) = posted.get("context") {
+            record["context"] = context.clone();
+        }
+
+        // Validate the assembled record against the owned schema, surfacing the
+        // first few errors so a refused conclude says why.
+        if let Err(msg) = validate(&self.validator, &record) {
+            return Err(RecordError::Invalid(msg));
+        }
+
+        let dest = self.destination(&id);
+        // `create_new` refuses an existing destination atomically — the record is
+        // written exactly once and never overwrites what is already there.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    RecordError::Overwrite(format!(
+                        "refusing to overwrite an existing record at {}",
+                        dest.display()
+                    ))
+                } else {
+                    RecordError::Io(format!("cannot write {}: {e}", dest.display()))
+                }
+            })?;
+        let serialized =
+            serde_json::to_string_pretty(&record).map_err(|e| RecordError::Io(e.to_string()))?;
+        file.write_all(serialized.as_bytes())
+            .and_then(|_| file.write_all(b"\n"))
+            .map_err(|e| RecordError::Io(format!("cannot write {}: {e}", dest.display())))?;
+
+        // Only a completed write concludes the session; that write is the one.
+        self.concluded.set(true);
+        Ok(dest.display().to_string())
+    }
+
+    /// The record destination: `--out` when set (resolved against the invoking
+    /// directory if relative), else `<ULID>.json` in the invoking directory.
+    fn destination(&self, id: &str) -> PathBuf {
+        match &self.out {
+            // `join` keeps an absolute `--out` as-is and resolves a relative
+            // one against the invoking directory.
+            Some(out) => self.dir.join(out),
+            None => self.dir.join(format!("{id}.json")),
+        }
+    }
+}
+
+/// Validate `instance` against the compiled schema, joining the first few error
+/// messages (a fully-wrong record can produce many) into one line.
+fn validate(validator: &jsonschema::Validator, instance: &Value) -> Result<(), String> {
+    let errors: Vec<String> = validator
+        .iter_errors(instance)
+        .map(|e| e.to_string())
+        .take(5)
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// A JSON response for the record endpoint, uncached like every other response.
+fn record_response(status: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>> {
+    Response::from_string(body.to_string())
+        .with_status_code(status)
+        .with_header(header("Content-Type", "application/json"))
+        .with_header(header("Cache-Control", "no-store"))
+}
+
+/// Mint a ULID: 48 bits of wall-clock milliseconds (most-significant, so ids
+/// sort by time) followed by 80 bits of OS randomness, Crockford base32 in 26
+/// chars. Enough to give each record a unique, sortable, machine-minted id (the
+/// human slug lives on the manifest side, #63) without a crate.
+fn new_ulid() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut rand = [0u8; 10];
+    File::open("/dev/urandom")?.read_exact(&mut rand)?;
+    let mut rnd: u128 = 0;
+    for &b in &rand {
+        rnd = (rnd << 8) | b as u128;
+    }
+    let value = ((ms & 0xFFFF_FFFF_FFFF) << 80) | rnd;
+    Ok(crockford32(value))
+}
+
+/// Encode a u128 as 26 Crockford-base32 characters (5 bits each, most
+/// significant first). The top character carries only the value's high 3 bits.
+fn crockford32(mut value: u128) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut buf = [0u8; 26];
+    for slot in buf.iter_mut().rev() {
+        *slot = ALPHABET[(value & 0x1f) as usize];
+        value >>= 5;
+    }
+    String::from_utf8(buf.to_vec()).expect("crockford alphabet is ascii")
+}
+
+/// Format a `SystemTime` as an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) —
+/// the `date-time` the schema wants for `created_at`/`completed_at`, without a
+/// calendar crate.
+fn rfc3339(t: SystemTime) -> String {
+    let secs = t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Days-since-Unix-epoch → (year, month, day), Howard Hinnant's `civil_from_days`
+/// (proleptic Gregorian, valid across the range any real timestamp lands in).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m as u32, d)
+}
+
 /// Resolve the request against the session endpoint and the embedded bundle,
 /// enforcing the #72 contract (Host check, then token) before serving anything.
-fn serve(request: Request, token: &str, session: &Session) {
+fn serve(mut request: Request, token: &str, session: &Session, recorder: &Recorder) {
     // DNS-rebinding guard: only a loopback Host is ever honored. A page on
     // another origin that resolves its name to 127.0.0.1 still sends its own
     // Host, so this refuses it before any asset is touched.
@@ -699,6 +970,27 @@ fn serve(request: Request, token: &str, session: &Session) {
             .with_header(header("Content-Type", "application/json"))
             .with_header(header("Cache-Control", "no-store"));
         let _ = request.respond(response);
+        return;
+    }
+
+    // The record endpoint: an explicit conclude POSTs the concluded session
+    // here. The server validates it against the owned schema, stamps completion,
+    // and writes the immutable record exactly once (issue #16). A second conclude
+    // — or any conclude after a successful write — is refused.
+    if path == "record" && *request.method() == Method::Post {
+        let mut body = String::new();
+        if request.as_reader().read_to_string(&mut body).is_err() {
+            let _ = request.respond(record_response(
+                400,
+                &json!({"error": "unreadable request body"}),
+            ));
+            return;
+        }
+        let (status, payload) = match recorder.conclude(session, &body) {
+            Ok(path) => (200, json!({ "path": path })),
+            Err(e) => (e.status(), json!({ "error": e.to_string() })),
+        };
+        let _ = request.respond(record_response(status, &payload));
         return;
     }
 
