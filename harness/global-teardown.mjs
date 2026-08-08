@@ -1,12 +1,7 @@
 // Kill the packaged binary launched in global-setup and clean up its pid/url
 // files, so a run never leaks the server process.
 import { readFileSync, rmSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
-
-const dir = path.dirname(fileURLToPath(import.meta.url));
-const URL_FILE = path.join(dir, ".served-url");
-const PID_FILE = path.join(dir, ".server-pid");
+import { PID_FILE, URL_FILE } from "./global-setup.mjs";
 
 export default async function globalTeardown() {
   try {
