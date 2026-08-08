@@ -23,7 +23,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PlaybackEngine } from "./engine";
 import { Waveform, type Pin } from "./Waveform";
-import { computePeaks, formatTime, otherLabel, type Label, type Region } from "./transport";
+import {
+  computeLoudness,
+  computePeaks,
+  computeSpectrogram,
+  formatTime,
+  otherLabel,
+  type CandidateViews,
+  type Label,
+  type Region,
+  type ViewMode,
+} from "./transport";
 import {
   addObservation,
   canRedo,
@@ -59,22 +69,44 @@ interface SessionMeta {
   duration_delta_ms: number;
 }
 
-/** Waveform peak resolution — enough detail for the stage without paint cost. */
+/** Waveform/loudness envelope resolution — enough detail without paint cost. */
 const BUCKETS = 1000;
+/** Spectral view resolution: time columns and FFT window (bins = size / 2). */
+const SPECTRAL_COLUMNS = 512;
+const FFT_SIZE = 512;
 /** The transport step, per the #61 keymap. */
 const STEP_SECONDS = 2;
 
-type Peaks = { min: Float32Array; max: Float32Array };
+/** The view toggle options, in display order (issue #14). */
+const VIEWS: { id: ViewMode; label: string }[] = [
+  { id: "waveform", label: "Waveform" },
+  { id: "loudness", label: "Loudness" },
+  { id: "spectral", label: "Spectral" },
+];
 
 function candidateColor(label: Label): string {
   return label === "A" ? "#4ea1ff" : "#ff8f4e";
+}
+
+/**
+ * Compute all three views of a decoded channel once (issue #14). The waveform,
+ * loudness (RMS), and spectral (FFT) data live only in this returned object, in
+ * browser memory — nothing is persisted or fetched (privacy contract).
+ */
+function computeViews(channel: Float32Array): CandidateViews {
+  return {
+    peaks: computePeaks(channel, BUCKETS),
+    loudness: computeLoudness(channel, BUCKETS),
+    spectral: computeSpectrogram(channel, SPECTRAL_COLUMNS, FFT_SIZE),
+  };
 }
 
 export function App() {
   const [session, setSession] = useState<SessionMeta | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [candidates, setCandidates] = useState<Record<Label, Candidate> | null>(null);
-  const [peaks, setPeaks] = useState<Record<Label, Peaks> | null>(null);
+  const [views, setViews] = useState<Record<Label, CandidateViews> | null>(null);
+  const [view, setView] = useState<ViewMode>("waveform");
 
   const [live, setLive] = useState<Label>("A");
   const [playing, setPlaying] = useState(false);
@@ -137,9 +169,9 @@ export function App() {
         eng.onEnded = () => syncFrom(eng);
         engineRef.current = eng;
         setCandidates({ A: a, B: b });
-        setPeaks({
-          A: computePeaks(bufA.getChannelData(0), BUCKETS),
-          B: computePeaks(bufB.getChannelData(0), BUCKETS),
+        setViews({
+          A: computeViews(bufA.getChannelData(0)),
+          B: computeViews(bufB.getChannelData(0)),
         });
         setDuration(eng.duration());
         syncFrom(eng);
@@ -347,22 +379,41 @@ export function App() {
         <p data-testid="session-error">Could not load session: {error}</p>
       )}
 
-      {!peaks && !error && <p data-testid="loading">Loading candidates…</p>}
+      {!views && !error && <p data-testid="loading">Loading candidates…</p>}
 
-      {peaks && candidates && (
+      {views && candidates && (
         <section data-testid="workbench">
-          {/* Primary stage: the live candidate's waveform with the transport. */}
+          {/* Primary stage: the live candidate's display with the transport. */}
           <div data-testid="stage" style={{ marginBottom: 12 }}>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
               <span data-testid="live-lane">
                 Live: <strong>{live}</strong>
+              </span>
+              {/* View toggle: switches every display (stage + lanes) together. */}
+              <span data-testid="view-toggle" role="group" aria-label="View">
+                {VIEWS.map((v) => (
+                  <button
+                    key={v.id}
+                    data-testid={`view-${v.id}`}
+                    aria-pressed={view === v.id}
+                    onClick={() => setView(v.id)}
+                    style={{
+                      marginLeft: 4,
+                      fontWeight: view === v.id ? "bold" : "normal",
+                      textDecoration: view === v.id ? "underline" : "none",
+                    }}
+                  >
+                    {v.label}
+                  </button>
+                ))}
               </span>
               <span data-testid="transport-position">
                 {formatTime(position)} / {formatTime(duration)}
               </span>
             </div>
             <Waveform
-              peaks={peaks[live]}
+              views={views[live]}
+              view={view}
               duration={duration}
               position={position}
               onSeek={seek}
@@ -447,7 +498,8 @@ export function App() {
                   </span>
                   <div style={{ flex: 1 }}>
                     <Waveform
-                      peaks={peaks[label]}
+                      views={views[label]}
+                      view={view}
                       duration={duration}
                       position={position}
                       onSeek={seek}
@@ -618,6 +670,12 @@ export function App() {
                 <li>drag a waveform — select a region</li>
                 <li><kbd>r</kbd> — loop the region (plays into it, then loops)</li>
                 <li><kbd>u</kbd> — clear the region</li>
+              </ul>
+            </section>
+            <section>
+              <h3>Views</h3>
+              <ul>
+                <li>Waveform / Loudness / Spectral toggle — switches every display</li>
               </ul>
             </section>
             <section>

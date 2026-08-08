@@ -11,6 +11,13 @@
 /** The two candidate labels, in argument order (CONTEXT.md: the reference key). */
 export type Label = "A" | "B";
 
+/**
+ * Which visualization every audio display shows. The toggle applies to all
+ * displays at once (stage + lanes): the raw sample envelope, the RMS loudness
+ * envelope, or the FFT spectrogram.
+ */
+export type ViewMode = "waveform" | "loudness" | "spectral";
+
 /** The other candidate — the target of an A/B switch. */
 export function otherLabel(label: Label): Label {
   return label === "A" ? "B" : "A";
@@ -92,22 +99,35 @@ export function equalPowerCurves(steps: number): { up: Float32Array; down: Float
   return { up, down };
 }
 
+/** A min/max peak envelope: one pair per bucket, for waveform drawing. */
+export interface Peaks {
+  min: Float32Array;
+  max: Float32Array;
+}
+
+/**
+ * The sample range `[start, end)` covered by bucket `b` of an equal split into
+ * buckets of `per` samples each: at least one sample wide, clamped to the data.
+ * Shared by the peak and loudness reducers so both views bucket identically.
+ */
+function bucketRange(b: number, per: number, length: number): { start: number; end: number } {
+  const start = Math.floor(b * per);
+  const end = Math.min(length, Math.max(start + 1, Math.floor((b + 1) * per)));
+  return { start, end };
+}
+
 /**
  * Reduce a channel's samples to `buckets` min/max pairs for waveform drawing.
  * Each bucket spans an equal slice of the samples; drawing a vertical line from
  * `min[i]` to `max[i]` gives the familiar filled-envelope waveform without
  * touching every sample at paint time.
  */
-export function computePeaks(
-  data: Float32Array,
-  buckets: number,
-): { min: Float32Array; max: Float32Array } {
+export function computePeaks(data: Float32Array, buckets: number): Peaks {
   const min = new Float32Array(buckets);
   const max = new Float32Array(buckets);
   const per = data.length / buckets;
   for (let b = 0; b < buckets; b++) {
-    const start = Math.floor(b * per);
-    const end = Math.min(data.length, Math.max(start + 1, Math.floor((b + 1) * per)));
+    const { start, end } = bucketRange(b, per, data.length);
     // A bucket that falls past the data (short input) stays at silence.
     let lo = start < data.length ? data[start] : 0;
     let hi = lo;
@@ -120,6 +140,137 @@ export function computePeaks(
     max[b] = hi;
   }
   return { min, max };
+}
+
+/**
+ * Reduce a channel's samples to `buckets` RMS values for the loudness view —
+ * the root-mean-square level over each equal slice of the samples, in the same
+ * [0, 1] magnitude scale as the peaks. Drawing a symmetric envelope from these
+ * gives the "loudness" (RMS) view: the same time axis as the waveform, but the
+ * energy rather than the raw sample extremes. Computed once per decoded buffer.
+ */
+export function computeLoudness(data: Float32Array, buckets: number): Float32Array {
+  const rms = new Float32Array(buckets);
+  const per = data.length / buckets;
+  for (let b = 0; b < buckets; b++) {
+    const { start, end } = bucketRange(b, per, data.length);
+    let sum = 0;
+    for (let i = start; i < end; i++) {
+      sum += data[i] * data[i];
+    }
+    rms[b] = end > start ? Math.sqrt(sum / (end - start)) : 0;
+  }
+  return rms;
+}
+
+/**
+ * In-place radix-2 Cooley–Tukey FFT (decimation-in-time). `re`/`im` are the
+ * real and imaginary parts of the input, overwritten with the transform; their
+ * length MUST be a power of two. This is the real-FFT engine behind the spectral
+ * view — a self-contained transform so nothing but the decoded PCM is needed and
+ * no library is fetched over the network.
+ */
+export function fft(re: Float32Array, im: Float32Array): void {
+  const n = re.length;
+  // Bit-reversal permutation.
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      const tr = re[i];
+      re[i] = re[j];
+      re[j] = tr;
+      const ti = im[i];
+      im[i] = im[j];
+      im[j] = ti;
+    }
+  }
+  // Butterflies, doubling the transform length each stage.
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (-2 * Math.PI) / len;
+    const wr = Math.cos(ang);
+    const wi = Math.sin(ang);
+    const half = len >> 1;
+    for (let i = 0; i < n; i += len) {
+      let cr = 1;
+      let ci = 0;
+      for (let k = 0; k < half; k++) {
+        const a = i + k;
+        const b = a + half;
+        const vr = re[b] * cr - im[b] * ci;
+        const vi = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - vr;
+        im[b] = im[a] - vi;
+        re[a] += vr;
+        im[a] += vi;
+        const ncr = cr * wr - ci * wi;
+        ci = cr * wi + ci * wr;
+        cr = ncr;
+      }
+    }
+  }
+}
+
+/** A precomputed FFT spectrogram: a `columns × bins` grid, each cell in [0, 1]. */
+export interface Spectrogram {
+  columns: number;
+  bins: number;
+  /** Row-major by column: `data[col * bins + bin]`, dB-normalized to [0, 1]. */
+  data: Float32Array;
+}
+
+/**
+ * The three visualizations of one candidate, each computed once per decoded
+ * buffer and kept in browser memory only (privacy contract). The view toggle
+ * picks which of these every display draws.
+ */
+export interface CandidateViews {
+  peaks: Peaks;
+  loudness: Float32Array;
+  spectral: Spectrogram;
+}
+
+/** dB floor for the spectral view: energy this far below full scale reads black. */
+const SPECTRAL_DB_FLOOR = 100;
+
+/**
+ * Compute a real FFT spectrogram of a channel for the spectral view: `columns`
+ * evenly spaced Hann-windowed frames of `fftSize` samples, each transformed to
+ * `fftSize / 2` magnitude bins in dB, normalized to [0, 1] against a fixed floor.
+ * `bin` 0 is DC (lowest frequency); the renderer flips the axis so highs sit on
+ * top. Computed once per decoded buffer and kept in browser memory only.
+ */
+export function computeSpectrogram(
+  data: Float32Array,
+  columns: number,
+  fftSize: number,
+): Spectrogram {
+  const bins = fftSize >> 1;
+  const out = new Float32Array(columns * bins);
+  const re = new Float32Array(fftSize);
+  const im = new Float32Array(fftSize);
+  // Hann window over the frame, tapering edges to suppress spectral leakage.
+  const win = new Float32Array(fftSize);
+  for (let i = 0; i < fftSize; i++) {
+    win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (fftSize - 1));
+  }
+  const span = Math.max(0, data.length - fftSize);
+  for (let c = 0; c < columns; c++) {
+    const start = columns > 1 ? Math.floor((c * span) / (columns - 1)) : 0;
+    for (let i = 0; i < fftSize; i++) {
+      const s = start + i;
+      re[i] = s < data.length ? data[s] * win[i] : 0;
+      im[i] = 0;
+    }
+    fft(re, im);
+    for (let k = 0; k < bins; k++) {
+      const mag = Math.hypot(re[k], im[k]) / bins;
+      const db = 20 * Math.log10(mag + 1e-9);
+      out[c * bins + k] = clampPosition((db + SPECTRAL_DB_FLOOR) / SPECTRAL_DB_FLOOR, 1);
+    }
+  }
+  return { columns, bins, data: out };
 }
 
 /** Format a position (seconds) as `m:ss.mmm`, never negative. */
