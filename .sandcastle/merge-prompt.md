@@ -4,7 +4,7 @@ Merge the following branches into `{{SPEC_BRANCH}}`, each via a pull request so 
 
 {{BRANCHES}}
 
-The PR is the merge vehicle, not just paperwork: `{{SPEC_BRANCH}}` only advances through `gh pr merge --merge`, so every landed branch shows up as a real merge commit on GitHub. Never `git merge` a branch into `{{SPEC_BRANCH}}` yourself and never push `{{SPEC_BRANCH}}` directly to land a branch — the one exception is the final fix-up step at the end.
+The PR is the merge vehicle, not just paperwork: `{{SPEC_BRANCH}}` only advances through `gh pr merge --merge`, so every landed branch shows up as a real merge commit on GitHub. Never `git merge` a branch into `{{SPEC_BRANCH}}` yourself and never push `{{SPEC_BRANCH}}` directly to land a branch — the one exception is the final fix-up step at the end. Never change repository settings; if the repo doesn't allow merge commits, fall back to `gh pr merge --rebase` and say so in your summary.
 
 For each branch, one at a time:
 
