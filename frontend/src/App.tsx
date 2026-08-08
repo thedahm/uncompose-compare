@@ -23,7 +23,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PlaybackEngine } from "./engine";
 import { Waveform } from "./Waveform";
-import { computePeaks, formatTime, otherLabel, type Label } from "./transport";
+import { computePeaks, formatTime, otherLabel, type Label, type Region } from "./transport";
 
 interface Candidate {
   label: string;
@@ -68,6 +68,8 @@ export function App() {
   const [duration, setDuration] = useState(0);
   const [stopReturns, setStopReturns] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [region, setRegion] = useState<Region | null>(null);
+  const [looping, setLooping] = useState(false);
 
   const engineRef = useRef<PlaybackEngine | null>(null);
   const startedRef = useRef(false);
@@ -76,6 +78,8 @@ export function App() {
     setLive(eng.live());
     setPlaying(eng.isPlaying());
     setPosition(eng.position());
+    setRegion(eng.getRegion());
+    setLooping(eng.isLooping());
   }, []);
 
   // Load /session, then fetch and decode both proxies into one Web Audio graph.
@@ -161,6 +165,11 @@ export function App() {
 
   const togglePlay = () => withEngine((eng) => eng.togglePlay(stopReturns));
 
+  const selectRegion = useCallback(
+    (a: number, b: number) => withEngine((eng) => eng.setRegion(a, b)),
+    [withEngine],
+  );
+
   // Keyboard transport: bare keys only, ctrl reserved for undo/redo (a later
   // ticket), and never while typing into a future ledger/verdict field.
   useEffect(() => {
@@ -192,6 +201,14 @@ export function App() {
         case "Home":
           e.preventDefault();
           withEngine((eng) => eng.rewind());
+          break;
+        case "r":
+        case "R":
+          withEngine((eng) => eng.toggleLoop());
+          break;
+        case "u":
+        case "U":
+          withEngine((eng) => eng.clearRegion());
           break;
         case "?":
           e.preventDefault();
@@ -241,6 +258,9 @@ export function App() {
               duration={duration}
               position={position}
               onSeek={seek}
+              region={region}
+              looping={looping}
+              onSelectRegion={selectRegion}
               color={candidateColor(live)}
               height={96}
               testid="stage-waveform"
@@ -255,6 +275,25 @@ export function App() {
               <button data-testid="rewind" onClick={() => seek(0)}>
                 Rewind
               </button>
+              <button
+                data-testid="loop-toggle"
+                disabled={!region}
+                onClick={() => withEngine((eng) => eng.toggleLoop())}
+              >
+                {looping ? "Looping (r)" : "Loop (r)"}
+              </button>
+              <button
+                data-testid="clear-region"
+                disabled={!region}
+                onClick={() => withEngine((eng) => eng.clearRegion())}
+              >
+                Clear region (u)
+              </button>
+              <span data-testid="loop-status" data-region={region ? "true" : "false"} data-looping={looping ? "true" : "false"}>
+                {region
+                  ? `Region ${formatTime(region.start)}–${formatTime(region.end)}${looping ? " (looping)" : ""}`
+                  : "No region"}
+              </span>
               <label data-testid="stop-returns" style={{ marginLeft: "auto" }}>
                 <input
                   type="checkbox"
@@ -282,7 +321,6 @@ export function App() {
                   key={label}
                   data-testid={`lane-${label}`}
                   data-live={isLive}
-                  onClick={() => switchTo(label)}
                   style={{
                     display: "flex",
                     alignItems: "center",
@@ -290,10 +328,11 @@ export function App() {
                     marginBottom: 6,
                     padding: 4,
                     borderLeft: `3px solid ${isLive ? "#fff" : "transparent"}`,
-                    cursor: "pointer",
                   }}
                 >
-                  <span style={{ width: 90 }}>
+                  {/* Clicking the label auditions; dragging the waveform selects a
+                      region, while a plain click on it also auditions (onActivate). */}
+                  <span style={{ width: 90, cursor: "pointer" }} onClick={() => switchTo(label)}>
                     <span data-testid={`live-marker-${label}`}>{isLive ? "● " : "  "}</span>
                     <strong>{label}</strong> {c.name}
                   </span>
@@ -303,6 +342,10 @@ export function App() {
                       duration={duration}
                       position={position}
                       onSeek={seek}
+                      region={region}
+                      looping={looping}
+                      onSelectRegion={selectRegion}
+                      onActivate={() => switchTo(label)}
                       color={candidateColor(label)}
                       height={48}
                       testid={`waveform-${label}`}
@@ -346,6 +389,14 @@ export function App() {
                 <li><kbd>←</kbd> / <kbd>→</kbd> or <kbd>-</kbd> / <kbd>=</kbd> — step 2 s</li>
                 <li><kbd>home</kbd> — rewind to start</li>
                 <li>click a waveform — seek</li>
+              </ul>
+            </section>
+            <section>
+              <h3>Region &amp; loop</h3>
+              <ul>
+                <li>drag a waveform — select a region</li>
+                <li><kbd>r</kbd> — loop the region (plays into it, then loops)</li>
+                <li><kbd>u</kbd> — clear the region</li>
               </ul>
             </section>
             <section>

@@ -9,13 +9,29 @@
  * it is instant and gap-free. Seeking/stepping restarts both sources together at
  * the new offset (a buffer source cannot be repositioned in place).
  *
+ * A drag-selected region (issue #13) drives DAW-style looping: both sources get
+ * the same native `loopStart`/`loopEnd`, so looping is sample-accurate and stays
+ * sample-locked across an A/B switch (the switch only ramps the gains). A
+ * playhead before the region plays into it and then loops; toggling the loop off
+ * continues out. Toggling loop on/off (or seeking) while playing restarts both
+ * sources at the current position with the new loop configuration.
+ *
  * Decoded PCM lives only in the `AudioBuffer`s here, in browser memory; nothing
  * is written to disk client-side (acceptance criterion). The pure arithmetic
  * (clamping, stepping, the crossfade curve) lives in `transport.ts`; this module
  * is the imperative shell around the Web Audio nodes and is exercised by the
  * browser flow spec, not unit tests (no Web Audio off a browser).
  */
-import { clampPosition, equalPowerCurves, type Label, otherLabel, stepPosition } from "./transport";
+import {
+  clampPosition,
+  equalPowerCurves,
+  type Label,
+  loopedPosition,
+  orderedRegion,
+  otherLabel,
+  type Region,
+  stepPosition,
+} from "./transport";
 
 /** The equal-power switch fade, ~10 ms — matches the sync contract's bound. */
 const FADE_SECONDS = 0.01;
@@ -41,6 +57,11 @@ export class PlaybackEngine {
   private startOffset = 0;
   /** Bumped on every (re)start so a stale `onended` cannot fire transport logic. */
   private generation = 0;
+
+  /** The drag-selected region (seconds), or null when none is selected. */
+  private region: Region | null = null;
+  /** Whether the region is currently looping (only ever true with a region). */
+  private looping = false;
 
   /** Notified when playback ends on its own (reaches the end of the track). */
   onEnded: (() => void) | null = null;
@@ -76,7 +97,50 @@ export class PlaybackEngine {
   position(): number {
     if (!this.playing) return this.pausePos;
     const elapsed = this.ctx.currentTime - this.startedAt;
-    return clampPosition(this.startOffset + elapsed, this.duration());
+    return loopedPosition(this.startOffset + elapsed, this.region, this.looping, this.duration());
+  }
+
+  /** The selected region (seconds), or null. */
+  getRegion(): Region | null {
+    return this.region;
+  }
+
+  /** Whether the region is currently looping. */
+  isLooping(): boolean {
+    return this.looping;
+  }
+
+  /**
+   * Drag-to-select: set the region to the two endpoints (order-independent,
+   * clamped to the track). Selecting a new region while looping re-applies the
+   * loop bounds to the running sources.
+   */
+  setRegion(a: number, b: number): void {
+    this.region = orderedRegion(a, b, this.duration());
+    if (this.playing && this.looping) this.startSources(this.position());
+  }
+
+  /**
+   * `r`: toggle looping over the region (no-op without one). A live toggle
+   * restarts both sources at the current position so the change takes effect
+   * sample-locked: on turns native looping on (play-into from before the region);
+   * off lets playback continue out past the region.
+   */
+  toggleLoop(): void {
+    if (!this.region) return;
+    this.looping = !this.looping;
+    if (this.playing) this.startSources(this.position());
+  }
+
+  /**
+   * `u`: clear the region and any looping. If a loop was running, playback
+   * continues out from the current position rather than stopping.
+   */
+  clearRegion(): void {
+    const wasLooping = this.looping;
+    this.region = null;
+    this.looping = false;
+    if (this.playing && wasLooping) this.startSources(this.position());
   }
 
   /** Space: start from the frozen position (resumes a suspended context). */
@@ -178,6 +242,14 @@ export class PlaybackEngine {
     (["A", "B"] as Label[]).forEach((label) => {
       const src = sources[label];
       src.buffer = this.buffers[label];
+      // Native sample-accurate looping: both sources loop over the same region,
+      // started together, so a mid-loop A/B switch stays sample-locked. A start
+      // offset before `loopStart` plays into the region first (play-into).
+      if (this.looping && this.region) {
+        src.loop = true;
+        src.loopStart = this.region.start;
+        src.loopEnd = this.region.end;
+      }
       src.connect(this.gains[label]);
       // Restore the steady-state gains (a mid-switch restart lands on the live
       // lane fully up, the other fully down) so a seek never leaves a fade half
