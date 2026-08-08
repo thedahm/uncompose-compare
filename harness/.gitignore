@@ -1,0 +1,7 @@
+node_modules/
+fixtures/
+test-results/
+playwright-report/
+package-lock.json
+.served-url
+.server-pid
