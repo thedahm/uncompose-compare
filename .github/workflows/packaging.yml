@@ -40,3 +40,41 @@ jobs:
           name: uncompose-compare-wheel
           path: target/wheels/*.whl
           if-no-files-found: warn
+
+  sync-harness:
+    # The #73 cross-engine sync harness (issue #5), run against the *packaged*
+    # binary: build + pip-install the wheel into a fresh venv, then drive the
+    # served page on all three engines. Pinned to ubuntu-latest so
+    # `playwright install --with-deps` covers WebKit's system libs (#73 finding).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build-time toolchain only (#60); the wheel is pip-installed into a fresh
+      # venv inside scripts/sync-harness.sh, so nothing here leaks into install.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install maturin
+        run: pipx install maturin || pip install maturin
+
+      # One command: build the wheel, pip-install it toolchain-free, install the
+      # harness deps + all three browsers (WebKit needs --with-deps), generate
+      # the seeded-noise fixtures, and run the Chromium/Firefox/WebKit matrix
+      # against the installed binary's served page.
+      - name: Run sync harness against the packaged binary
+        env:
+          PW_WITH_DEPS: "1"
+        run: bash scripts/sync-harness.sh
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-harness-report
+          path: harness/playwright-report
+          if-no-files-found: ignore

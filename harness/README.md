@@ -43,7 +43,7 @@ bash scripts/pipeline.sh
 cd harness
 npm install
 npx playwright install --with-deps chromium firefox webkit
-FFMPEG=ffmpeg node gen-fixtures.mjs        # needs ffmpeg for the FLAC pair
+node gen-fixtures.mjs                       # FLAC via the bundled ffmpeg-static
 UNCOMPOSE_BIN=/path/to/venv/bin/uncompose-compare npx playwright test
 ```
 
@@ -52,7 +52,9 @@ UNCOMPOSE_BIN=/path/to/venv/bin/uncompose-compare npx playwright test
 ## Notes
 
 - Fixtures are deterministic seeded noise (`gen-fixtures.mjs`); noise, not sine,
-  so the correlation peak is unambiguous. `ffmpeg` is build-time only.
+  so the correlation peak is unambiguous. FLAC is encoded by the bundled
+  `ffmpeg-static` binary (a devDependency), so fixture generation needs no
+  system ffmpeg or apt; it stays build-time only and never ships in the wheel.
 - WebKit needs extra system libs off-Ubuntu; on `ubuntu-latest`
   `npx playwright install --with-deps` covers it (the #73 finding). CI pins the
   matrix to `ubuntu-latest` for exactly this reason.
