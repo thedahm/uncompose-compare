@@ -4,6 +4,8 @@ import {
   computePeaks,
   equalPowerCurves,
   formatTime,
+  loopedPosition,
+  orderedRegion,
   otherLabel,
   stepPosition,
 } from "./transport";
@@ -77,6 +79,47 @@ describe("computePeaks", () => {
     const { min, max } = computePeaks(new Float32Array([0.2]), 8);
     expect(min).toHaveLength(8);
     expect(max).toHaveLength(8);
+  });
+});
+
+describe("orderedRegion", () => {
+  it("orders the two drag endpoints into start<=end", () => {
+    expect(orderedRegion(3, 1, 10)).toEqual({ start: 1, end: 3 });
+    expect(orderedRegion(1, 3, 10)).toEqual({ start: 1, end: 3 });
+  });
+  it("clamps both endpoints into the track", () => {
+    expect(orderedRegion(-2, 99, 10)).toEqual({ start: 0, end: 10 });
+  });
+});
+
+describe("loopedPosition", () => {
+  const region = { start: 4, end: 6 };
+  it("clamps linearly when not looping", () => {
+    expect(loopedPosition(5, region, false, 10)).toBe(5);
+    expect(loopedPosition(99, region, false, 10)).toBe(10);
+  });
+  it("clamps linearly when looping without a region", () => {
+    expect(loopedPosition(5, null, true, 10)).toBe(5);
+  });
+  it("plays linearly into the region from before it", () => {
+    // A playhead before the region advances straight into it — no wrap yet.
+    expect(loopedPosition(2, region, true, 10)).toBe(2);
+    expect(loopedPosition(4, region, true, 10)).toBe(4);
+  });
+  it("advances linearly through the first pass of the region", () => {
+    expect(loopedPosition(5, region, true, 10)).toBe(5);
+  });
+  it("wraps back to the region start once past the region end", () => {
+    // Just past the end folds back to just past the start (sample-accurate wrap).
+    expect(loopedPosition(6.5, region, true, 10)).toBeCloseTo(4.5, 6);
+  });
+  it("wraps repeatedly across many loop lengths", () => {
+    // start=4, len=2: linear 10 => 4 + ((10-4) % 2) = 4.
+    expect(loopedPosition(10, region, true, 10)).toBeCloseTo(4, 6);
+    expect(loopedPosition(11, region, true, 10)).toBeCloseTo(5, 6);
+  });
+  it("clamps linearly for a degenerate zero-length region", () => {
+    expect(loopedPosition(7, { start: 5, end: 5 }, true, 10)).toBe(7);
   });
 });
 

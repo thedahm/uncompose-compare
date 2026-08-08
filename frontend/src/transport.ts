@@ -16,6 +16,52 @@ export function otherLabel(label: Label): Label {
   return label === "A" ? "B" : "A";
 }
 
+/**
+ * A drag-selected loop region (seconds). The UI term is "region" (drag-to-
+ * select); the comparison-record schema stores it under `loops[]` — CONTEXT.md
+ * records the mapping so neither term drifts.
+ */
+export interface Region {
+  start: number;
+  end: number;
+}
+
+/**
+ * Turn the two endpoints of a drag into an ordered, in-track region: the earlier
+ * point is `start`, the later `end`, both clamped to `[0, duration]`. A drag left
+ * or right lands on the same region.
+ */
+export function orderedRegion(a: number, b: number, duration: number): Region {
+  return {
+    start: clampPosition(Math.min(a, b), duration),
+    end: clampPosition(Math.max(a, b), duration),
+  };
+}
+
+/**
+ * Map a linear playback offset to the audible position under DAW-style looping.
+ *
+ * With looping off (or no region), position is just the offset clamped to the
+ * track. With looping on, a playhead before the region plays linearly *into* it
+ * and through its first pass (so `linear < region.end` stays linear — the
+ * "play-into" semantics); once the offset passes the region end it folds back
+ * onto `[start, end)` by the loop length, matching the sample-accurate wrap the
+ * Web Audio source performs natively. This mirrors `engine.ts`'s native
+ * `loopStart`/`loopEnd` so the rendered playhead tracks the audio.
+ */
+export function loopedPosition(
+  linear: number,
+  region: Region | null,
+  looping: boolean,
+  duration: number,
+): number {
+  if (!looping || !region) return clampPosition(linear, duration);
+  const len = region.end - region.start;
+  if (len <= 0) return clampPosition(linear, duration);
+  if (linear < region.end) return clampPosition(linear, duration);
+  return region.start + ((linear - region.start) % len);
+}
+
 /** Clamp a playback position (seconds) into `[0, duration]`. */
 export function clampPosition(pos: number, duration: number): number {
   if (pos < 0) return 0;
