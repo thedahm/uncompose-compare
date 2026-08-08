@@ -1,0 +1,14 @@
+{
+  "name": "uncompose-compare-sync-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Spike 4: the #73 cross-engine sync harness, run against the pip-installed uncompose-compare binary's served page.",
+  "scripts": {
+    "gen-fixtures": "node gen-fixtures.mjs",
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1"
+  }
+}

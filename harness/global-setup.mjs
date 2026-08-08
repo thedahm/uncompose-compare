@@ -1,0 +1,57 @@
+// Playwright global setup: launch the *pip-installed* uncompose-compare binary
+// and capture the tokened loopback URL it prints, so every engine in the matrix
+// drives the same served page — the one the wheel actually ships (issue #5,
+// acceptance: "harness target is the pip-installed binary").
+//
+// The binary under test is resolved from UNCOMPOSE_BIN (the clean-install
+// pipeline points this at $VENV/bin/uncompose-compare); it falls back to
+// `uncompose-compare` on PATH for a locally-installed wheel. We deliberately do
+// NOT fall back to `cargo run`: the whole point is to exercise the packaged
+// artifact.
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+
+const dir = path.dirname(fileURLToPath(import.meta.url));
+export const URL_FILE = path.join(dir, ".served-url");
+export const PID_FILE = path.join(dir, ".server-pid");
+
+export default async function globalSetup() {
+  const bin = process.env.UNCOMPOSE_BIN || "uncompose-compare";
+
+  const child = spawn(bin, [], { stdio: ["ignore", "pipe", "inherit"] });
+
+  const url = await new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${bin} printed no URL within 15s`)),
+      15_000,
+    );
+    child.on("error", (err) =>
+      reject(new Error(`failed to launch ${bin}: ${err.message}`)),
+    );
+    child.on("exit", (code) =>
+      reject(new Error(`${bin} exited (code ${code}) before printing a URL`)),
+    );
+
+    let buf = "";
+    child.stdout.on("data", (chunk) => {
+      buf += chunk.toString();
+      const nl = buf.indexOf("\n");
+      if (nl === -1) return;
+      const line = buf.slice(0, nl).trim();
+      clearTimeout(timer);
+      if (!line.startsWith("http://127.0.0.1:")) {
+        reject(new Error(`expected a loopback URL, got: ${line}`));
+      } else {
+        resolve(line);
+      }
+    });
+  });
+
+  writeFileSync(URL_FILE, url);
+  writeFileSync(PID_FILE, String(child.pid));
+  // Let the process outlive setup; global-teardown kills it by pid.
+  child.unref();
+  console.log(`[harness] serving packaged binary at ${url}`);
+}

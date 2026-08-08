@@ -1,16 +1,16 @@
 /**
- * Spike 1 stub page: the "embedded hello skeleton".
+ * Spike stub page.
  *
- * This is intentionally minimal — it carries only enough to prove the
- * packaging chain (Vite build → rust-embed → served page). The Web Audio
- * plumbing the #73 sync harness needs lands in a later issue; here we just
- * render a stable marker the served-page tests can assert against.
+ * It stays intentionally minimal — a stable marker the served-page HTTP tests
+ * assert against. The Web Audio dual-source plumbing the #73 sync harness
+ * exercises lives in `sync.ts` (registered on `window` from `main.tsx`), not in
+ * this component: the harness drives that seam, not the DOM.
  */
 export function App() {
   return (
     <main>
       <h1 data-testid="hello">uncompose-compare</h1>
-      <p>Embedded hello skeleton served from the Rust binary.</p>
+      <p>Embedded stub page served from the Rust binary — carries the sync plumbing only.</p>
     </main>
   );
 }
