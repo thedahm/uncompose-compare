@@ -144,3 +144,94 @@ test("loop: plays into the region, loops within it, then continues out on deacti
   await expect.poll(() => leftPct(page, "stage-waveform-playhead"), { timeout: 8_000 })
     .toBeGreaterThan(82);
 });
+
+// Observation ledger (issue #15). Locators match by testid prefix because the
+// per-entry ids are runtime UUIDs the test can't know ahead of time.
+const entries = (page) => page.locator('[data-testid^="ledger-entry-"]');
+const carets = (page) => page.locator('[data-testid^="stage-waveform-caret-"]');
+
+// Seek into the middle of the track (so a pin's caret sits well inside the
+// waveform), type a note in the composer, and submit it (shift tags both).
+async function pinViaComposer(page, text, { shift = false } = {}) {
+  const stage = page.getByTestId("stage-waveform");
+  const box = await stage.boundingBox();
+  await page.mouse.click(box.x + box.width * 0.5, box.y + box.height / 2);
+  await page.getByTestId("composer").click();
+  await page.getByTestId("composer").fill(text);
+  await page.getByTestId("composer").press(shift ? "Shift+Enter" : "Enter");
+}
+
+test("pin: enter pins on the live candidate and draws a ▼ caret on the stage", async ({ page }) => {
+  await expect(page.getByTestId("ledger-empty")).toBeVisible();
+  await pinViaComposer(page, "boxy low end");
+  // The observation lands in the chronological ledger with its text.
+  await expect(entries(page)).toHaveCount(1);
+  await expect(entries(page).first()).toContainText("boxy low end");
+  // A is live, so the caret is tagged to A (▼).
+  await expect(carets(page)).toHaveCount(1);
+  await expect(carets(page).first()).toHaveAttribute("data-caret-candidate", "A");
+  await expect(carets(page).first()).toContainText("▼");
+});
+
+test("pin: shift+enter pins on both candidates (◆ caret)", async ({ page }) => {
+  await pinViaComposer(page, "both muddy here", { shift: true });
+  await expect(carets(page).first()).toHaveAttribute("data-caret-candidate", "both");
+  await expect(carets(page).first()).toContainText("◆");
+});
+
+test("ledger: clicking text edits it in place", async ({ page }) => {
+  await pinViaComposer(page, "first take");
+  const entry = entries(page).first();
+  await entry.getByText("first take").click();
+  const input = page.locator('[data-testid^="ledger-text-input-"]');
+  await expect(input).toBeVisible();
+  await input.fill("edited take");
+  await input.press("Enter");
+  await expect(entry).toContainText("edited take");
+});
+
+test("ledger: each entry deletes", async ({ page }) => {
+  await pinViaComposer(page, "to be removed");
+  await expect(entries(page)).toHaveCount(1);
+  await page.locator('[data-testid^="ledger-delete-"]').first().click();
+  await expect(entries(page)).toHaveCount(0);
+  await expect(carets(page)).toHaveCount(0);
+});
+
+test("ledger: ctrl+z / ctrl+shift+z undo and redo ledger changes", async ({ page }) => {
+  await pinViaComposer(page, "note one");
+  await pinViaComposer(page, "note two");
+  await expect(entries(page)).toHaveCount(2);
+  // Blur the composer so the ctrl keys reach the transport keymap, not the input.
+  await page.getByTestId("hello").click();
+  await page.keyboard.press("Control+z");
+  await expect(entries(page)).toHaveCount(1);
+  await expect(entries(page).first()).toContainText("note one");
+  await page.keyboard.press("Control+Shift+z");
+  await expect(entries(page)).toHaveCount(2);
+  await expect(entries(page).nth(1)).toContainText("note two");
+});
+
+test("caret: hover and click connect a caret to its ledger entry both ways", async ({ page }) => {
+  await pinViaComposer(page, "linked note");
+  const caret = carets(page).first();
+  const entry = entries(page).first();
+  // Hovering the caret highlights the ledger entry.
+  await caret.hover();
+  await expect(entry).toHaveAttribute("data-active", "true");
+  // Hovering the ledger entry highlights the caret.
+  await entry.hover();
+  await expect(caret).toHaveAttribute("data-active", "true");
+  // Clicking the caret finds (selects) the entry.
+  await page.getByTestId("hello").hover();
+  await expect(entry).toHaveAttribute("data-active", "false");
+  await caret.click();
+  await expect(entry).toHaveAttribute("data-active", "true");
+});
+
+test("help: ? documents the observation and ledger keys", async ({ page }) => {
+  await page.keyboard.press("?");
+  await expect(page.getByTestId("help-modal")).toContainText("pin an observation");
+  await expect(page.getByTestId("help-modal")).toContainText("focus the composer");
+  await expect(page.getByTestId("help-modal")).toContainText("undo / redo");
+});
