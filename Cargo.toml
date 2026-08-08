@@ -2,7 +2,7 @@
 name = "uncompose-compare"
 version = "0.1.0"
 edition = "2021"
-description = "Spike 1: embedded hello skeleton — a Vite/React stub embedded in a Rust binary and served over loopback."
+description = "uncompose-compare — load two audio files as candidates A and B and serve the listening workbench over a guarded loopback server."
 publish = false
 
 [[bin]]
@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
+sha2 = "0.10"
+symphonia = { version = "0.5", default-features = false, features = ["wav", "flac", "pcm"] }
 tiny_http = "0.12"
 
 [profile.release]
