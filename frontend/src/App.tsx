@@ -12,9 +12,9 @@
  * Transport keymap (confirmed #61): `space` play/stop, `x` switch, `←`/`→` or
  * `-`/`=` step 2 s, `home` rewind, click-to-seek on any waveform, a "stop
  * returns" toggle (default: resume), and `?` toggling the help modal. Bare keys
- * only — `ctrl` stays reserved for undo/redo (a later ticket). The SRC lane and
- * stems section are kept as empty structural slots so M4/M5 add rows rather than
- * redesign.
+ * only, except `ctrl+z` / `ctrl+shift+z` for ledger undo/redo (issue #15). The
+ * SRC lane and stems section are kept as empty structural slots so M4/M5 add
+ * rows rather than redesign.
  *
  * The `/session` fetch, the "uncompose-compare" marker, and the duration-mismatch
  * warning (issue #10) survive; the `window.__uncomposeSync` harness seam lives in
@@ -231,7 +231,9 @@ export function App() {
     [composer, live, pin],
   );
 
-  const seekTo = useCallback(
+  // Jump the transport to an observation's pinned position (untethered notes
+  // just highlight) and light up its caret/row pair.
+  const seekToObservation = useCallback(
     (id: string, pos: number | null) => {
       if (pos !== null) seek(pos);
       setActivePin(id);
@@ -239,8 +241,17 @@ export function App() {
     [seek],
   );
 
-  // Keyboard transport: bare keys only, ctrl reserved for undo/redo (a later
-  // ticket), and never while typing into a future ledger/verdict field.
+  // Commit the in-place ledger edit (enter or blur both land here).
+  const commitEdit = () => {
+    if (!editing) return;
+    const { id, text } = editing;
+    setLedger((l) => editObservation(l, id, text));
+    setEditing(null);
+  };
+
+  // Keyboard transport: bare keys for the transport and pins, ctrl+z /
+  // ctrl+shift+z for ledger undo/redo, and none of it while typing into the
+  // composer or a ledger edit.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -315,9 +326,9 @@ export function App() {
   }, [stopReturns, withEngine, pin, live]);
 
   // Only positioned observations get a caret on the stage waveform.
-  const pins: Pin[] = ledger.observations
-    .filter((o) => o.position !== null)
-    .map((o) => ({ id: o.id, position: o.position as number, candidate: o.candidate }));
+  const pins: Pin[] = ledger.observations.flatMap((o) =>
+    o.position === null ? [] : [{ id: o.id, position: o.position, candidate: o.candidate }],
+  );
 
   return (
     <main style={{ fontFamily: "system-ui, sans-serif", color: "#eee", background: "#0a0a0a", minHeight: "100vh", padding: 16 }}>
@@ -521,7 +532,7 @@ export function App() {
                       <button
                         data-testid={`ledger-seek-${o.id}`}
                         title="Seek to this observation"
-                        onClick={() => seekTo(o.id, o.position)}
+                        onClick={() => seekToObservation(o.id, o.position)}
                         style={{ fontVariantNumeric: "tabular-nums" }}
                       >
                         <span data-testid={`ledger-caret-${o.id}`}>{caretGlyph(o.candidate)}</span>{" "}
@@ -534,15 +545,11 @@ export function App() {
                           autoFocus
                           value={editing.text}
                           onChange={(e) => setEditing({ id: o.id, text: e.target.value })}
-                          onBlur={() => {
-                            setLedger((l) => editObservation(l, o.id, editing.text));
-                            setEditing(null);
-                          }}
+                          onBlur={commitEdit}
                           onKeyDown={(e) => {
                             if (e.key === "Enter") {
                               e.preventDefault();
-                              setLedger((l) => editObservation(l, o.id, editing.text));
-                              setEditing(null);
+                              commitEdit();
                             } else if (e.key === "Escape") {
                               e.preventDefault();
                               setEditing(null);

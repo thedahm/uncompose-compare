@@ -45,6 +45,13 @@ interface WaveformProps {
 /** Below this many pixels of travel a press is a click (seek), not a drag. */
 const DRAG_THRESHOLD_PX = 4;
 
+/** A caret's vertical placement: ▼ A above, ▲ B below, ◆ both centered. */
+function caretPlacement(candidate: Target | null): React.CSSProperties {
+  if (candidate === "A") return { top: 0, transform: "translateX(-50%)" };
+  if (candidate === "B") return { bottom: 0, transform: "translateX(-50%)" };
+  return { top: "50%", transform: "translate(-50%, -50%)" };
+}
+
 export function Waveform({
   peaks,
   duration,
@@ -188,48 +195,40 @@ export function Waveform({
           They sit above the drag/seek surface, so their pointer events are
           stopped from reaching it (a caret click finds its ledger entry, never
           seeks). */}
-      {pins?.map((pin) => {
-        if (duration <= 0) return null;
-        const frac = clampPosition(pin.position, duration) / duration;
-        const active = activePin === pin.id;
-        const vertical =
-          pin.candidate === "A"
-            ? { top: 0 }
-            : pin.candidate === "B"
-              ? { bottom: 0 }
-              : { top: "50%", transform: "translate(-50%, -50%)" };
-        return (
-          <span
-            key={pin.id}
-            data-testid={`${testid}-caret-${pin.id}`}
-            data-caret-candidate={pin.candidate ?? "none"}
-            data-active={String(active)}
-            onPointerDown={(e) => e.stopPropagation()}
-            onPointerUp={(e) => e.stopPropagation()}
-            onMouseEnter={() => onPinEnter?.(pin.id)}
-            onMouseLeave={() => onPinLeave?.()}
-            onClick={(e) => {
-              e.stopPropagation();
-              onPinClick?.(pin.id);
-            }}
-            style={{
-              position: "absolute",
-              left: `${frac * 100}%`,
-              transform: vertical.transform ?? "translateX(-50%)",
-              top: vertical.top,
-              bottom: vertical.bottom,
-              fontSize: 12,
-              lineHeight: 1,
-              cursor: "pointer",
-              color: active ? "#fff" : "#bbb",
-              textShadow: active ? "0 0 4px #fff" : "none",
-              userSelect: "none",
-            }}
-          >
-            {caretGlyph(pin.candidate)}
-          </span>
-        );
-      })}
+      {duration > 0 &&
+        pins?.map((pin) => {
+          const frac = clampPosition(pin.position, duration) / duration;
+          const active = activePin === pin.id;
+          return (
+            <span
+              key={pin.id}
+              data-testid={`${testid}-caret-${pin.id}`}
+              data-caret-candidate={pin.candidate ?? "none"}
+              data-active={String(active)}
+              onPointerDown={(e) => e.stopPropagation()}
+              onPointerUp={(e) => e.stopPropagation()}
+              onMouseEnter={() => onPinEnter?.(pin.id)}
+              onMouseLeave={() => onPinLeave?.()}
+              onClick={(e) => {
+                e.stopPropagation();
+                onPinClick?.(pin.id);
+              }}
+              style={{
+                position: "absolute",
+                left: `${frac * 100}%`,
+                ...caretPlacement(pin.candidate),
+                fontSize: 12,
+                lineHeight: 1,
+                cursor: "pointer",
+                color: active ? "#fff" : "#bbb",
+                textShadow: active ? "0 0 4px #fff" : "none",
+                userSelect: "none",
+              }}
+            >
+              {caretGlyph(pin.candidate)}
+            </span>
+          );
+        })}
     </div>
   );
 }
