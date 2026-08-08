@@ -17,9 +17,9 @@ over a guarded loopback server. Two toolchains:
   the Web Audio plumbing the cross-engine sync harness drives; the audio graph, not the
   DOM, is the thing under test.
 
-From the repo root, `npm run typecheck` and `npm run test` are the canonical gates: they
-build the frontend, then run `cargo test`. `npm run build` produces the release binary;
-`npm run wheel` packages it as a maturin wheel.
+From the repo root, `npm run typecheck` and `npm run test` are the canonical gates (the
+latter builds the frontend, then runs `cargo test`). `npm run build` produces the release
+binary; `npm run wheel` packages it as a maturin wheel.
 
 ## Testing at the seams
 
