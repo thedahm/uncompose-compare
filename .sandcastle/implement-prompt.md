@@ -26,7 +26,7 @@ Pay extra attention to test files that touch the relevant parts of the code.
 
 # EXECUTION
 
-If applicable, use RGR to complete the task.
+If applicable, use RGR (or the /tdd skill) to complete the task.
 
 1. RED: write one test
 2. GREEN: write the implementation to pass that test
@@ -35,7 +35,7 @@ If applicable, use RGR to complete the task.
 
 # FEEDBACK LOOPS
 
-Before committing, run `npm run typecheck` and `npm run test` to ensure the tests pass.
+Before committing, run the repo checks: `npm run typecheck` and `npm run test` (the root scripts — they cover the frontend typecheck/build and `cargo test`).
 
 # COMMIT
 
