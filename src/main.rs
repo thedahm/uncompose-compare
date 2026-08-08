@@ -115,6 +115,23 @@ impl Candidate {
             self.frames as f64 * 1000.0 / self.sample_rate as f64
         }
     }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"label\":{},\"name\":{},\"path\":{},\"sha256\":{},\
+             \"size\":{},\"frames\":{},\"duration_ms\":{},\
+             \"sample_rate\":{},\"channels\":{}}}",
+            json_str(self.label),
+            json_str(&self.name),
+            json_str(&self.path),
+            json_str(&self.sha256),
+            self.size,
+            self.frames,
+            json_num(self.duration_ms()),
+            self.sample_rate,
+            self.channels,
+        )
+    }
 }
 
 impl Session {
@@ -146,25 +163,6 @@ impl Session {
             self.duration_mismatch(),
             delta_samples,
             json_num(delta_ms),
-        )
-    }
-}
-
-impl Candidate {
-    fn to_json(&self) -> String {
-        format!(
-            "{{\"label\":{},\"name\":{},\"path\":{},\"sha256\":{},\
-             \"size\":{},\"frames\":{},\"duration_ms\":{},\
-             \"sample_rate\":{},\"channels\":{}}}",
-            json_str(self.label),
-            json_str(&self.name),
-            json_str(&self.path),
-            json_str(&self.sha256),
-            self.size,
-            self.frames,
-            json_num(self.duration_ms()),
-            self.sample_rate,
-            self.channels,
         )
     }
 }
@@ -270,24 +268,21 @@ fn decode_metadata(path: &Path) -> Result<DecodedMeta, String> {
         .map_err(|e| e.to_string())?;
 
     let mut format = probed.format;
+    // Only the track id and codec params outlive this borrow of `format`;
+    // `next_packet` below needs `format` mutable again.
     let track = format
         .default_track()
-        .ok_or_else(|| "no audio track".to_string())?
-        .clone();
+        .ok_or_else(|| "no audio track".to_string())?;
     let track_id = track.id;
+    let codec_params = track.codec_params.clone();
 
-    let sample_rate = track
-        .codec_params
+    let sample_rate = codec_params
         .sample_rate
         .ok_or_else(|| "unknown sample rate".to_string())?;
-    let channels = track
-        .codec_params
-        .channels
-        .map(|c| c.count() as u16)
-        .unwrap_or(0);
+    let channels = codec_params.channels.map(|c| c.count() as u16).unwrap_or(0);
 
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make(&codec_params, &DecoderOptions::default())
         .map_err(|e| e.to_string())?;
 
     let mut frames: u64 = 0;
@@ -431,8 +426,9 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// JSON-encode a string as a quoted, escaped literal. File names and paths are
-/// arbitrary bytes, so the escaping is not optional.
+/// JSON-encode a string as a quoted, escaped literal. File names and paths can
+/// contain quotes, backslashes, and control characters, so the escaping is not
+/// optional.
 fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
