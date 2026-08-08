@@ -48,6 +48,7 @@ import {
   type Ledger,
   type Target,
 } from "./ledger";
+import { buildRecordPayload, confidenceTier, type Verdict } from "./record";
 
 interface Candidate {
   label: string;
@@ -88,6 +89,22 @@ function candidateColor(label: Label): string {
   return label === "A" ? "#4ea1ff" : "#ff8f4e";
 }
 
+/** The confidence-tier colors (red 1-2, amber 3, green 4-5) — confirmed #61. */
+const TIER_COLOR = { low: "#ff5c5c", mid: "#ffcf6b", high: "#5cd67a" } as const;
+
+/** A read-only five-star string (filled up to `confidence`). */
+function starString(confidence: number): string {
+  return "★".repeat(confidence) + "☆".repeat(5 - confidence);
+}
+
+/** The verdict a fresh session starts with: undecided, nothing engraved. */
+const emptyVerdict: Verdict = {
+  preference: null,
+  confidence: null,
+  criterion: "",
+  summary: "",
+};
+
 /**
  * Compute all three views of a decoded channel once (issue #14). The waveform,
  * loudness (RMS), and spectral (FFT) data live only in this returned object, in
@@ -124,6 +141,19 @@ export function App() {
   const [activePin, setActivePin] = useState<string | null>(null);
   // The ledger entry whose text is being edited in place (null when none).
   const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
+
+  // The verdict (issue #16): a preferred candidate (or "no preference"), color-
+  // coded confidence, and optional criterion/summary + free-text session context.
+  // Save engraves it (`verdictSaved`) but everything stays editable until the
+  // session is concluded (and the record is written) — reopening the modal edits.
+  const [verdict, setVerdict] = useState<Verdict>(emptyVerdict);
+  const [context, setContext] = useState("");
+  const [verdictOpen, setVerdictOpen] = useState(false);
+  const [verdictSaved, setVerdictSaved] = useState(false);
+  // The conclude outcome: where the record landed, or why the write was refused.
+  const [concludeResult, setConcludeResult] = useState<{ path?: string; error?: string } | null>(
+    null,
+  );
 
   const engineRef = useRef<PlaybackEngine | null>(null);
   const startedRef = useRef(false);
@@ -280,6 +310,45 @@ export function App() {
     setLedger((l) => editObservation(l, id, text));
     setEditing(null);
   };
+
+  // A verdict is savable once a decision is made: a chosen candidate needs a
+  // confidence (the schema requires it), while "no preference" needs nothing.
+  const preferenceChosen = verdict.preference === "A" || verdict.preference === "B";
+  const canSaveVerdict =
+    verdict.preference !== null && (!preferenceChosen || verdict.confidence !== null);
+
+  // Save engraves the verdict but never finalizes it: everything stays editable
+  // until conclude writes the record (#61).
+  const saveVerdict = () => {
+    if (!canSaveVerdict) return;
+    setVerdictSaved(true);
+    setVerdictOpen(false);
+  };
+
+  // Conclude the session: build the session-authored record payload and POST it.
+  // The server assembles the rest, validates against the owned schema, and writes
+  // the immutable record exactly once, reporting where it landed (issue #16).
+  const conclude = useCallback(async () => {
+    const payload = buildRecordPayload({
+      verdict,
+      context,
+      observations: ledger.observations,
+      region,
+    });
+    try {
+      const res = await fetch("/record", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = (await res.json().catch(() => ({}))) as { path?: string; error?: string };
+      setConcludeResult(
+        res.ok ? { path: data.path } : { error: data.error ?? `record ${res.status}` },
+      );
+    } catch (e) {
+      setConcludeResult({ error: String(e) });
+    }
+  }, [verdict, context, ledger.observations, region]);
 
   // Keyboard transport: bare keys for the transport and pins, ctrl+z /
   // ctrl+shift+z for ledger undo/redo, and none of it while typing into the
@@ -496,6 +565,22 @@ export function App() {
                     <span data-testid={`live-marker-${label}`}>{isLive ? "● " : "  "}</span>
                     <strong>{label}</strong> {c.name}
                   </span>
+                  {/* The saved verdict shows its color-coded confidence stars on
+                      the preferred lane row (issue #16). */}
+                  {verdictSaved &&
+                    verdict.preference === label &&
+                    verdict.confidence !== null && (
+                      <span
+                        data-testid={`verdict-stars-${label}`}
+                        title={`Preferred — confidence ${verdict.confidence}/5`}
+                        style={{
+                          color: TIER_COLOR[confidenceTier(verdict.confidence)],
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {starString(verdict.confidence)}
+                      </span>
+                    )}
                   <div style={{ flex: 1 }}>
                     <Waveform
                       views={views[label]}
@@ -631,7 +716,188 @@ export function App() {
               </ol>
             )}
           </section>
+
+          {/* Verdict & conclude (issue #16): decide a preference (or no
+              preference), then write the immutable comparison record. */}
+          <section data-testid="verdict" style={{ marginTop: 16 }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <h2 style={{ fontSize: 15, margin: 0 }}>Verdict</h2>
+              <button data-testid="open-verdict" onClick={() => setVerdictOpen(true)}>
+                {verdictSaved ? "Edit verdict…" : "Set verdict…"}
+              </button>
+              {verdictSaved && (
+                <span data-testid="verdict-summary" style={{ color: "#bbb" }}>
+                  {verdict.preference === "none" ? (
+                    "No preference"
+                  ) : (
+                    <>
+                      Prefers <strong>{verdict.preference}</strong>
+                      {verdict.confidence !== null && (
+                        <span
+                          data-testid="verdict-summary-stars"
+                          style={{
+                            marginLeft: 6,
+                            color: TIER_COLOR[confidenceTier(verdict.confidence)],
+                          }}
+                        >
+                          {starString(verdict.confidence)}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </span>
+              )}
+              <button
+                data-testid="conclude"
+                style={{ marginLeft: "auto" }}
+                disabled={!verdictSaved || !!concludeResult?.path}
+                onClick={conclude}
+                title={
+                  verdictSaved
+                    ? "Write the comparison record"
+                    : "Save a verdict before concluding"
+                }
+              >
+                Conclude &amp; write record
+              </button>
+            </div>
+            {concludeResult?.path && (
+              <p data-testid="conclude-path" style={{ color: "#5cd67a" }}>
+                Record written to <code>{concludeResult.path}</code>
+              </p>
+            )}
+            {concludeResult?.error && (
+              <p data-testid="conclude-error" role="alert" style={{ color: "#ff5c5c" }}>
+                Conclude refused: {concludeResult.error}
+              </p>
+            )}
+          </section>
         </section>
+      )}
+
+      {verdictOpen && (
+        <div
+          data-testid="verdict-modal"
+          role="dialog"
+          aria-label="Verdict"
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.8)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+          onClick={() => setVerdictOpen(false)}
+        >
+          <div
+            style={{ background: "#161616", padding: 24, maxWidth: 460, width: "90%" }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 style={{ marginTop: 0 }}>Verdict</h2>
+
+            {/* Prefer buttons select without closing the modal (#61). */}
+            <div role="group" aria-label="Preference" style={{ display: "flex", gap: 8 }}>
+              {(["A", "B", "none"] as const).map((choice) => (
+                <button
+                  key={choice}
+                  data-testid={`prefer-${choice}`}
+                  aria-pressed={verdict.preference === choice}
+                  onClick={() => setVerdict((v) => ({ ...v, preference: choice }))}
+                  style={{
+                    padding: "6px 12px",
+                    fontWeight: verdict.preference === choice ? "bold" : "normal",
+                    outline:
+                      verdict.preference === choice ? "2px solid #5cd67a" : "1px solid #444",
+                  }}
+                >
+                  {choice === "none" ? "No preference" : `Prefer ${choice}`}
+                </button>
+              ))}
+            </div>
+
+            {/* Confidence stars: required when a candidate is preferred, color
+                coded red 1-2 / amber 3 / green 4-5, and hidden for no-preference. */}
+            {preferenceChosen && (
+              <div style={{ marginTop: 12 }}>
+                <label style={{ display: "block", marginBottom: 4 }}>
+                  Confidence{" "}
+                  <span style={{ color: "#888" }}>(required)</span>
+                </label>
+                <div data-testid="confidence-stars" role="group" aria-label="Confidence">
+                  {[1, 2, 3, 4, 5].map((n) => {
+                    const filled = verdict.confidence !== null && n <= verdict.confidence;
+                    const color =
+                      verdict.confidence !== null
+                        ? TIER_COLOR[confidenceTier(verdict.confidence)]
+                        : "#888";
+                    return (
+                      <button
+                        key={n}
+                        data-testid={`confidence-${n}`}
+                        aria-pressed={filled}
+                        title={`${n} of 5`}
+                        onClick={() => setVerdict((v) => ({ ...v, confidence: n }))}
+                        style={{
+                          background: "none",
+                          border: "none",
+                          cursor: "pointer",
+                          fontSize: 22,
+                          color: filled ? color : "#555",
+                        }}
+                      >
+                        {filled ? "★" : "☆"}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            <label style={{ display: "block", marginTop: 12 }}>
+              Criterion <span style={{ color: "#888" }}>(optional)</span>
+              <input
+                data-testid="verdict-criterion"
+                value={verdict.criterion}
+                placeholder="What you judged on (e.g. clarity)"
+                onChange={(e) => setVerdict((v) => ({ ...v, criterion: e.target.value }))}
+                style={{ display: "block", width: "100%", padding: 4, marginTop: 4 }}
+              />
+            </label>
+            <label style={{ display: "block", marginTop: 12 }}>
+              Summary <span style={{ color: "#888" }}>(optional)</span>
+              <input
+                data-testid="verdict-summary-input"
+                value={verdict.summary}
+                placeholder="A one-line summary of the decision"
+                onChange={(e) => setVerdict((v) => ({ ...v, summary: e.target.value }))}
+                style={{ display: "block", width: "100%", padding: 4, marginTop: 4 }}
+              />
+            </label>
+            <label style={{ display: "block", marginTop: 12 }}>
+              Session context <span style={{ color: "#888" }}>(optional)</span>
+              <input
+                data-testid="verdict-context"
+                value={context}
+                placeholder="Why you were comparing these files"
+                onChange={(e) => setContext(e.target.value)}
+                style={{ display: "block", width: "100%", padding: 4, marginTop: 4 }}
+              />
+            </label>
+
+            <div style={{ display: "flex", gap: 8, marginTop: 16, alignItems: "center" }}>
+              <button data-testid="save-verdict" disabled={!canSaveVerdict} onClick={saveVerdict}>
+                Save verdict
+              </button>
+              <button data-testid="cancel-verdict" onClick={() => setVerdictOpen(false)}>
+                Close
+              </button>
+              {preferenceChosen && verdict.confidence === null && (
+                <span style={{ color: "#ffcf6b" }}>Pick a confidence to save.</span>
+              )}
+            </div>
+          </div>
+        </div>
       )}
 
       {helpOpen && (
@@ -686,6 +952,14 @@ export function App() {
                 <li><kbd>tab</kbd> — focus the composer to write a note</li>
                 <li>click a timestamp — seek; click text — edit; ✕ — delete</li>
                 <li><kbd>ctrl</kbd>+<kbd>z</kbd> / <kbd>ctrl</kbd>+<kbd>shift</kbd>+<kbd>z</kbd> — undo / redo</li>
+              </ul>
+            </section>
+            <section>
+              <h3>Verdict &amp; conclude</h3>
+              <ul>
+                <li>Set verdict — prefer A, B, or no preference; stars set confidence</li>
+                <li>Save engraves the verdict but keeps it editable</li>
+                <li>Conclude — write the immutable comparison record</li>
               </ul>
             </section>
             <section>

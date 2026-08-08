@@ -11,6 +11,7 @@
 // engines differ, keeps the full matrix per the spec's testing decisions).
 import { test, expect } from "@playwright/test";
 import { readFileSync } from "node:fs";
+import { readFileSync as read } from "node:fs";
 import { URL_FILE } from "./global-setup.mjs";
 
 const SERVED_URL = readFileSync(URL_FILE, "utf8").trim();
@@ -274,4 +275,87 @@ test("help: ? documents the observation and ledger keys", async ({ page }) => {
   await expect(page.getByTestId("help-modal")).toContainText("pin an observation");
   await expect(page.getByTestId("help-modal")).toContainText("focus the composer");
   await expect(page.getByTestId("help-modal")).toContainText("undo / redo");
+});
+
+// Verdict & conclude (issue #16) — the record end of the DoD slice. This runs
+// against the packaged binary's served page, so a conclude actually writes a
+// record to disk (in the binary's invoking directory); the spec reads it back
+// and asserts it matches what the session did.
+async function setVerdict(page, { prefer, confidence, criterion, summary, context } = {}) {
+  await page.getByTestId("open-verdict").click();
+  await expect(page.getByTestId("verdict-modal")).toBeVisible();
+  if (prefer) await page.getByTestId(`prefer-${prefer}`).click();
+  if (confidence) await page.getByTestId(`confidence-${confidence}`).click();
+  if (criterion) await page.getByTestId("verdict-criterion").fill(criterion);
+  if (summary) await page.getByTestId("verdict-summary-input").fill(summary);
+  if (context) await page.getByTestId("verdict-context").fill(context);
+  await page.getByTestId("save-verdict").click();
+  await expect(page.getByTestId("verdict-modal")).toHaveCount(0);
+}
+
+test("verdict: preferring a candidate needs a confidence before it can save", async ({ page }) => {
+  await page.getByTestId("open-verdict").click();
+  await page.getByTestId("prefer-A").click();
+  // A preferred candidate with no confidence yet cannot be saved (schema needs it).
+  await expect(page.getByTestId("save-verdict")).toBeDisabled();
+  await page.getByTestId("confidence-4").click();
+  await expect(page.getByTestId("save-verdict")).toBeEnabled();
+});
+
+test("verdict: no preference is a valid, savable outcome with no stars", async ({ page }) => {
+  await page.getByTestId("open-verdict").click();
+  await page.getByTestId("prefer-none").click();
+  // No preference needs no confidence.
+  await expect(page.getByTestId("confidence-stars")).toHaveCount(0);
+  await expect(page.getByTestId("save-verdict")).toBeEnabled();
+  await page.getByTestId("save-verdict").click();
+  await expect(page.getByTestId("verdict-summary")).toContainText("No preference");
+});
+
+test("verdict: saved confidence shows color-coded stars on the preferred lane row", async ({ page }) => {
+  await setVerdict(page, { prefer: "A", confidence: 4 });
+  const stars = page.getByTestId("verdict-stars-A");
+  await expect(stars).toBeVisible();
+  await expect(stars).toContainText("★");
+  // The other lane carries no verdict stars.
+  await expect(page.getByTestId("verdict-stars-B")).toHaveCount(0);
+  // Save engraves but stays editable: the modal reopens.
+  await page.getByTestId("open-verdict").click();
+  await expect(page.getByTestId("verdict-modal")).toBeVisible();
+  await expect(page.getByTestId("prefer-A")).toHaveAttribute("aria-pressed", "true");
+});
+
+test("conclude: writes a record that matches the session and reports where it landed", async ({ page }) => {
+  // A full DoD slice: pin an observation, select a region, decide a verdict,
+  // then conclude and assert the on-disk record matches.
+  await pinViaComposer(page, "chorus is cleaner on A");
+  await dragRegion(page, "stage-waveform", 0.3, 0.6);
+  await setVerdict(page, {
+    prefer: "A",
+    confidence: 5,
+    criterion: "clarity",
+    summary: "A wins in the chorus",
+    context: "picking a master",
+  });
+
+  await expect(page.getByTestId("conclude")).toBeEnabled();
+  await page.getByTestId("conclude").click();
+  await expect(page.getByTestId("conclude-path")).toBeVisible();
+
+  // The UI reports the path; read that record back and assert it is the session.
+  const recordPath = await page.getByTestId("conclude-path").locator("code").innerText();
+  const record = JSON.parse(read(recordPath, "utf8"));
+  expect(record.schema).toContain("compare/v0");
+  expect(record.mode).toBe("ab");
+  expect(record.id).toHaveLength(26);
+  expect(record.candidates).toHaveLength(2);
+  expect(record.candidates[0].label).toBe("A");
+  expect(record.candidates[0].sha256).toMatch(/^[0-9a-f]{64}$/);
+  expect(record.result).toMatchObject({ preference: "A", confidence: 5, criterion: "clarity" });
+  expect(record.observations[0].text).toBe("chorus is cleaner on A");
+  expect(record.loops).toHaveLength(1);
+  expect(record.context).toBe("picking a master");
+
+  // A second conclude is refused: once written, the button is spent.
+  await expect(page.getByTestId("conclude")).toBeDisabled();
 });
