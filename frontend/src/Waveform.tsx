@@ -9,8 +9,8 @@
  * overlay so the same region shows consistently on every display, and reads as
  * "looping" when the loop is active.
  */
-import { useRef, useState, useEffect } from "react";
-import { clampPosition, type Region } from "./transport";
+import { useEffect, useRef, useState } from "react";
+import { clampPosition, orderedRegion, type Region } from "./transport";
 
 interface WaveformProps {
   peaks: { min: Float32Array; max: Float32Array };
@@ -95,7 +95,7 @@ export function Waveform({
     const endFrac = fracFromEvent(e);
     if (Math.abs(e.clientX - drag.startX) < DRAG_THRESHOLD_PX) {
       // A click, not a drag: seek to the press point (and, on a lane, audition).
-      onSeek(clampPosition(endFrac * duration, duration));
+      onSeek(endFrac * duration);
       onActivate?.();
     } else {
       // A drag: select the region between the press and release points.
@@ -108,11 +108,12 @@ export function Waveform({
     region && duration > 0
       ? { start: region.start / duration, end: region.end / duration }
       : null;
-  const previewFrac = preview
-    ? { start: Math.min(preview.a, preview.b), end: Math.max(preview.a, preview.b) }
-    : null;
-  // While dragging, show the live preview; otherwise the committed region.
+  const previewFrac = preview ? orderedRegion(preview.a, preview.b, 1) : null;
+  // While dragging, show the live preview; otherwise the committed region. Only
+  // a committed region reads as looping — a drag preview is always neutral.
   const shown = previewFrac ?? regionFrac;
+  const shownLooping = looping && !previewFrac;
+  const regionBorder = `1px solid ${shownLooping ? "#78dc8c" : "#bbb"}`;
 
   return (
     <div
@@ -137,16 +138,16 @@ export function Waveform({
       {shown && shown.end > shown.start && (
         <div
           data-testid={`${testid}-region`}
-          data-looping={previewFrac ? "false" : String(looping)}
+          data-looping={String(shownLooping)}
           style={{
             position: "absolute",
             top: 0,
             bottom: 0,
             left: `${shown.start * 100}%`,
             width: `${(shown.end - shown.start) * 100}%`,
-            background: looping && !previewFrac ? "rgba(120,220,140,0.28)" : "rgba(255,255,255,0.16)",
-            borderLeft: `1px solid ${looping && !previewFrac ? "#78dc8c" : "#bbb"}`,
-            borderRight: `1px solid ${looping && !previewFrac ? "#78dc8c" : "#bbb"}`,
+            background: shownLooping ? "rgba(120,220,140,0.28)" : "rgba(255,255,255,0.16)",
+            borderLeft: regionBorder,
+            borderRight: regionBorder,
             pointerEvents: "none",
           }}
         />

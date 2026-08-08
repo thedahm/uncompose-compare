@@ -164,6 +164,8 @@ export function App() {
   );
 
   const togglePlay = () => withEngine((eng) => eng.togglePlay(stopReturns));
+  const toggleLoop = () => withEngine((eng) => eng.toggleLoop());
+  const clearRegion = () => withEngine((eng) => eng.clearRegion());
 
   const selectRegion = useCallback(
     (a: number, b: number) => withEngine((eng) => eng.setRegion(a, b)),
@@ -275,21 +277,17 @@ export function App() {
               <button data-testid="rewind" onClick={() => seek(0)}>
                 Rewind
               </button>
-              <button
-                data-testid="loop-toggle"
-                disabled={!region}
-                onClick={() => withEngine((eng) => eng.toggleLoop())}
-              >
+              <button data-testid="loop-toggle" disabled={!region} onClick={toggleLoop}>
                 {looping ? "Looping (r)" : "Loop (r)"}
               </button>
-              <button
-                data-testid="clear-region"
-                disabled={!region}
-                onClick={() => withEngine((eng) => eng.clearRegion())}
-              >
+              <button data-testid="clear-region" disabled={!region} onClick={clearRegion}>
                 Clear region (u)
               </button>
-              <span data-testid="loop-status" data-region={region ? "true" : "false"} data-looping={looping ? "true" : "false"}>
+              <span
+                data-testid="loop-status"
+                data-region={region ? "true" : "false"}
+                data-looping={looping ? "true" : "false"}
+              >
                 {region
                   ? `Region ${formatTime(region.start)}–${formatTime(region.end)}${looping ? " (looping)" : ""}`
                   : "No region"}
