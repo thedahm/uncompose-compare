@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   clampPosition,
+  computeLoudness,
   computePeaks,
+  computeSpectrogram,
   equalPowerCurves,
+  fft,
   formatTime,
   loopedPosition,
   orderedRegion,
@@ -120,6 +123,91 @@ describe("loopedPosition", () => {
   });
   it("clamps linearly for a degenerate zero-length region", () => {
     expect(loopedPosition(7, { start: 5, end: 5 }, true, 10)).toBe(7);
+  });
+});
+
+describe("computeLoudness", () => {
+  it("reduces samples to one RMS value per bucket", () => {
+    // A ±1 square wave has RMS 1; a ±0.5 one has RMS 0.5.
+    const data = new Float32Array([1, -1, 0.5, -0.5]);
+    const rms = computeLoudness(data, 2);
+    expect(rms).toHaveLength(2);
+    expect(rms[0]).toBeCloseTo(1, 6);
+    expect(rms[1]).toBeCloseTo(0.5, 6);
+  });
+  it("returns the RMS of a constant signal as its magnitude", () => {
+    const rms = computeLoudness(new Float32Array([0.25, 0.25, 0.25, 0.25]), 1);
+    expect(rms[0]).toBeCloseTo(0.25, 6);
+  });
+  it("emits exactly `buckets` values even for short data", () => {
+    expect(computeLoudness(new Float32Array([0.2]), 8)).toHaveLength(8);
+  });
+});
+
+describe("fft", () => {
+  it("puts all energy in bin 0 for a DC signal", () => {
+    const n = 8;
+    const re = new Float32Array(n).fill(1);
+    const im = new Float32Array(n);
+    fft(re, im);
+    expect(re[0]).toBeCloseTo(n, 5); // sum of ones
+    for (let k = 1; k < n; k++) {
+      expect(Math.hypot(re[k], im[k])).toBeCloseTo(0, 5);
+    }
+  });
+  it("peaks at the bin matching a pure sinusoid's frequency", () => {
+    const n = 64;
+    const k = 5;
+    const re = new Float32Array(n);
+    const im = new Float32Array(n);
+    for (let i = 0; i < n; i++) re[i] = Math.sin((2 * Math.PI * k * i) / n);
+    fft(re, im);
+    let argmax = 0;
+    let peak = -1;
+    for (let b = 0; b < n / 2; b++) {
+      const mag = Math.hypot(re[b], im[b]);
+      if (mag > peak) {
+        peak = mag;
+        argmax = b;
+      }
+    }
+    expect(argmax).toBe(k);
+  });
+});
+
+describe("computeSpectrogram", () => {
+  it("produces a columns × bins grid (bins = fftSize / 2)", () => {
+    const spec = computeSpectrogram(new Float32Array(1024), 4, 64);
+    expect(spec.columns).toBe(4);
+    expect(spec.bins).toBe(32);
+    expect(spec.data).toHaveLength(4 * 32);
+  });
+  it("concentrates energy in the bin matching a steady sinusoid", () => {
+    // 8 cycles per 64-sample window => a peak at bin 8 in every column.
+    const len = 512;
+    const data = new Float32Array(len);
+    for (let i = 0; i < len; i++) data[i] = Math.sin((2 * Math.PI * 8 * i) / 64);
+    const spec = computeSpectrogram(data, 4, 64);
+    let argmax = 0;
+    let peak = -1;
+    for (let b = 0; b < spec.bins; b++) {
+      const v = spec.data[b]; // first column
+      if (v > peak) {
+        peak = v;
+        argmax = b;
+      }
+    }
+    expect(argmax).toBe(8);
+  });
+  it("normalizes every value into [0, 1]", () => {
+    const len = 256;
+    const data = new Float32Array(len);
+    for (let i = 0; i < len; i++) data[i] = Math.sin((2 * Math.PI * 4 * i) / 32);
+    const spec = computeSpectrogram(data, 3, 32);
+    for (const v of spec.data) {
+      expect(v).toBeGreaterThanOrEqual(0);
+      expect(v).toBeLessThanOrEqual(1);
+    }
   });
 });
 

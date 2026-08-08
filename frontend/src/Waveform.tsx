@@ -1,8 +1,14 @@
 /**
- * A waveform view for one candidate (issue #12): the min/max peak envelope
- * drawn on a canvas, a playhead overlay, and click-to-seek. Used for both the
- * primary stage waveform and the A/B lane rows. Loudness and spectral views are
- * later sub-issues; this is the waveform the workbench core needs.
+ * One candidate's audio display (issues #12–#14): a canvas view plus a region
+ * overlay, a playhead overlay, click-to-seek, and drag-to-select. Used for both
+ * the primary stage waveform and the A/B lane rows.
+ *
+ * The canvas renders one of three views selected by the shared `view` toggle
+ * (issue #14): the raw sample envelope ("waveform"), the RMS loudness envelope
+ * ("loudness"), or the FFT spectrogram ("spectral"), all precomputed once per
+ * decoded buffer (`transport.ts`) and tinted with the candidate colour. The
+ * time axis is identical across views, so the region overlay and the playhead —
+ * both positioned as track fractions — render correctly in every view.
  *
  * Drag-to-select (issue #13): pressing and dragging paints a region; a plain
  * click (no meaningful drag) still seeks. The selected region is drawn as an
@@ -10,10 +16,17 @@
  * "looping" when the loop is active.
  */
 import { useEffect, useRef, useState } from "react";
-import { clampPosition, orderedRegion, type Region } from "./transport";
+import {
+  clampPosition,
+  orderedRegion,
+  type CandidateViews,
+  type Region,
+  type ViewMode,
+} from "./transport";
 
 interface WaveformProps {
-  peaks: { min: Float32Array; max: Float32Array };
+  views: CandidateViews;
+  view: ViewMode;
   duration: number;
   position: number;
   onSeek: (sec: number) => void;
@@ -30,8 +43,76 @@ interface WaveformProps {
 /** Below this many pixels of travel a press is a click (seek), not a drag. */
 const DRAG_THRESHOLD_PX = 4;
 
+/** Parse a `#rrggbb` colour into its 0–255 channels, for tinting the spectrogram. */
+function rgbOf(hex: string): [number, number, number] {
+  const n = parseInt(hex.replace("#", ""), 16);
+  return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
+}
+
+/**
+ * Draw the selected `view` onto the canvas, sized to the view's own resolution
+ * (CSS stretches it to the display). The waveform and loudness views draw a
+ * symmetric envelope; the spectral view paints the spectrogram as a tinted
+ * bitmap with high frequencies on top.
+ */
+function drawView(
+  canvas: HTMLCanvasElement,
+  views: CandidateViews,
+  view: ViewMode,
+  color: string,
+  height: number,
+): void {
+  const g = canvas.getContext("2d");
+  if (!g) return;
+
+  if (view === "spectral") {
+    const { columns, bins, data } = views.spectral;
+    canvas.width = columns;
+    canvas.height = bins;
+    const img = g.createImageData(columns, bins);
+    const [r, gr, b] = rgbOf(color);
+    for (let c = 0; c < columns; c++) {
+      for (let k = 0; k < bins; k++) {
+        const v = data[c * bins + k];
+        // Flip the frequency axis so the highest bin sits on top.
+        const y = bins - 1 - k;
+        const o = (y * columns + c) * 4;
+        img.data[o] = r * v;
+        img.data[o + 1] = gr * v;
+        img.data[o + 2] = b * v;
+        img.data[o + 3] = 255;
+      }
+    }
+    g.putImageData(img, 0, 0);
+    return;
+  }
+
+  // Envelope views (waveform / loudness) share the min/max drawing loop.
+  const w = view === "loudness" ? views.loudness.length : views.peaks.max.length;
+  canvas.width = w;
+  canvas.height = height;
+  g.clearRect(0, 0, w, height);
+  g.fillStyle = color;
+  const mid = height / 2;
+  for (let x = 0; x < w; x++) {
+    let top: number;
+    let bottom: number;
+    if (view === "loudness") {
+      // A symmetric envelope around the centre from the RMS magnitude.
+      const rms = views.loudness[x];
+      top = mid - rms * mid;
+      bottom = mid + rms * mid;
+    } else {
+      top = mid - views.peaks.max[x] * mid;
+      bottom = mid - views.peaks.min[x] * mid;
+    }
+    g.fillRect(x, top, 1, Math.max(1, bottom - top));
+  }
+}
+
 export function Waveform({
-  peaks,
+  views,
+  view,
   duration,
   position,
   onSeek,
@@ -49,25 +130,13 @@ export function Waveform({
   const dragRef = useRef<{ startX: number; startFrac: number } | null>(null);
   const [preview, setPreview] = useState<{ a: number; b: number } | null>(null);
 
-  // Redraw the envelope only when the peaks or colour change — the playhead is a
+  // Redraw only when the view, its data, or the colour change — the playhead is a
   // cheap DOM overlay, so animation never repaints the canvas.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const w = peaks.max.length;
-    canvas.width = w;
-    canvas.height = height;
-    const g = canvas.getContext("2d");
-    if (!g) return;
-    g.clearRect(0, 0, w, height);
-    g.fillStyle = color;
-    const mid = height / 2;
-    for (let x = 0; x < w; x++) {
-      const top = mid - peaks.max[x] * mid;
-      const bottom = mid - peaks.min[x] * mid;
-      g.fillRect(x, top, 1, Math.max(1, bottom - top));
-    }
-  }, [peaks, color, height]);
+    drawView(canvas, views, view, color, height);
+  }, [views, view, color, height]);
 
   const fracFromEvent = (e: React.PointerEvent<HTMLDivElement>): number => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -118,6 +187,7 @@ export function Waveform({
   return (
     <div
       data-testid={testid}
+      data-view={view}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}

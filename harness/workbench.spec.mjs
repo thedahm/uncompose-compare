@@ -4,9 +4,11 @@
 // Where sync.spec.mjs certifies the cross-engine audio contract, this spec
 // certifies the DoD slice a listener can observe: both candidates load and
 // render waveforms, `x`/lane-click switches the audible candidate at the current
-// position, and clicking a waveform seeks. It runs on Chromium only (the flow is
-// engine-independent; the contract, where engines differ, keeps the full matrix
-// per the spec's testing decisions).
+// position, clicking a waveform seeks, dragging selects a loop region, and the
+// waveform/loudness/spectral view toggle (issue #14) switches every display
+// together while seek and region drag keep working in a non-waveform view. It
+// runs on Chromium only (the flow is engine-independent; the contract, where
+// engines differ, keeps the full matrix per the spec's testing decisions).
 import { test, expect } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { URL_FILE } from "./global-setup.mjs";
@@ -118,6 +120,44 @@ test("loop: r activates/deactivates looping and u clears the region", async ({ p
   await page.keyboard.press("u");
   await expect(page.getByTestId("loop-status")).toHaveAttribute("data-region", "false");
   await expect(page.getByTestId("stage-waveform-region")).toHaveCount(0);
+});
+
+test("views: the toggle switches every display together (stage + lanes)", async ({ page }) => {
+  // All displays start on the waveform view.
+  for (const id of ["stage-waveform", "waveform-A", "waveform-B"]) {
+    await expect(page.getByTestId(id)).toHaveAttribute("data-view", "waveform");
+  }
+  await page.getByTestId("view-spectral").click();
+  // A single toggle moves the stage and both lane rows to the spectral view.
+  for (const id of ["stage-waveform", "waveform-A", "waveform-B"]) {
+    await expect(page.getByTestId(id)).toHaveAttribute("data-view", "spectral");
+  }
+  await page.getByTestId("view-loudness").click();
+  for (const id of ["stage-waveform", "waveform-A", "waveform-B"]) {
+    await expect(page.getByTestId(id)).toHaveAttribute("data-view", "loudness");
+  }
+});
+
+test("views: seek and region drag work in a non-waveform view", async ({ page }) => {
+  await page.getByTestId("view-spectral").click();
+  await expect(page.getByTestId("stage-waveform")).toHaveAttribute("data-view", "spectral");
+
+  // Seek: clicking the spectral stage moves the playhead just like the waveform.
+  const stage = page.getByTestId("stage-waveform");
+  const box = await stage.boundingBox();
+  await page.mouse.click(box.x + box.width * 0.5, box.y + box.height / 2);
+  await expect(page.getByTestId("transport-position")).not.toContainText("0:00.000 /");
+  expect(await leftPct(page, "stage-waveform-playhead")).toBeGreaterThan(10);
+
+  // Region drag: selecting on the spectral view paints the region everywhere,
+  // and the region survives switching to a third view.
+  await dragRegion(page, "stage-waveform", 0.3, 0.6);
+  await expect(page.getByTestId("stage-waveform-region")).toBeVisible();
+  await expect(page.getByTestId("waveform-A-region")).toBeVisible();
+  await expect(page.getByTestId("waveform-B-region")).toBeVisible();
+  await expect(page.getByTestId("loop-status")).toHaveAttribute("data-region", "true");
+  await page.getByTestId("view-loudness").click();
+  await expect(page.getByTestId("stage-waveform-region")).toBeVisible();
 });
 
 test("loop: plays into the region, loops within it, then continues out on deactivate", async ({ page }) => {
