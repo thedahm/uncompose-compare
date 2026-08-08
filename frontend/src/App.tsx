@@ -12,9 +12,9 @@
  * Transport keymap (confirmed #61): `space` play/stop, `x` switch, `←`/`→` or
  * `-`/`=` step 2 s, `home` rewind, click-to-seek on any waveform, a "stop
  * returns" toggle (default: resume), and `?` toggling the help modal. Bare keys
- * only — `ctrl` stays reserved for undo/redo (a later ticket). The SRC lane and
- * stems section are kept as empty structural slots so M4/M5 add rows rather than
- * redesign.
+ * only, except `ctrl+z` / `ctrl+shift+z` for ledger undo/redo (issue #15). The
+ * SRC lane and stems section are kept as empty structural slots so M4/M5 add
+ * rows rather than redesign.
  *
  * The `/session` fetch, the "uncompose-compare" marker, and the duration-mismatch
  * warning (issue #10) survive; the `window.__uncomposeSync` harness seam lives in
@@ -22,8 +22,22 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PlaybackEngine } from "./engine";
-import { Waveform } from "./Waveform";
+import { Waveform, type Pin } from "./Waveform";
 import { computePeaks, formatTime, otherLabel, type Label, type Region } from "./transport";
+import {
+  addObservation,
+  canRedo,
+  canUndo,
+  caretGlyph,
+  deleteObservation,
+  editObservation,
+  emptyLedger,
+  makeObservation,
+  redo,
+  undo,
+  type Ledger,
+  type Target,
+} from "./ledger";
 
 interface Candidate {
   label: string;
@@ -71,8 +85,17 @@ export function App() {
   const [region, setRegion] = useState<Region | null>(null);
   const [looping, setLooping] = useState(false);
 
+  // The observation ledger (issue #15): append-only pins with undo/redo history.
+  const [ledger, setLedger] = useState<Ledger>(emptyLedger);
+  const [composer, setComposer] = useState("");
+  // The highlighted pin — two-way between a caret and its ledger row.
+  const [activePin, setActivePin] = useState<string | null>(null);
+  // The ledger entry whose text is being edited in place (null when none).
+  const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
+
   const engineRef = useRef<PlaybackEngine | null>(null);
   const startedRef = useRef(false);
+  const composerRef = useRef<HTMLInputElement | null>(null);
 
   const syncFrom = useCallback((eng: PlaybackEngine) => {
     setLive(eng.live());
@@ -172,15 +195,82 @@ export function App() {
     [withEngine],
   );
 
-  // Keyboard transport: bare keys only, ctrl reserved for undo/redo (a later
-  // ticket), and never while typing into a future ledger/verdict field.
+  // Pin an observation at the current playhead, tagged to `candidate` (the live
+  // one for `enter`, both for `shift+enter`), carrying the active region as its
+  // loop reference. The wall-clock `at` and id are stamped here so the ledger
+  // logic stays pure and testable.
+  const pin = useCallback(
+    (candidate: Target, text: string) => {
+      const eng = engineRef.current;
+      const obs = makeObservation({
+        id: crypto.randomUUID(),
+        at: new Date().toISOString(),
+        candidate,
+        // Read the live position off the engine (pins are only creatable once
+        // the workbench — and its engine — has mounted).
+        position: eng ? eng.position() : 0,
+        region,
+        text,
+      });
+      setLedger((l) => addObservation(l, obs));
+      setActivePin(obs.id);
+    },
+    [region],
+  );
+
+  // Submit the composer's free text (issue #15): `enter` tags the live
+  // candidate, `shift+enter` tags both. Empty text is ignored so a stray key
+  // never drops a blank note.
+  const submitComposer = useCallback(
+    (both: boolean) => {
+      const text = composer.trim();
+      if (!text) return;
+      pin(both ? "both" : live, text);
+      setComposer("");
+    },
+    [composer, live, pin],
+  );
+
+  // Jump the transport to an observation's pinned position (untethered notes
+  // just highlight) and light up its caret/row pair.
+  const seekToObservation = useCallback(
+    (id: string, pos: number | null) => {
+      if (pos !== null) seek(pos);
+      setActivePin(id);
+    },
+    [seek],
+  );
+
+  // Commit the in-place ledger edit (enter or blur both land here).
+  const commitEdit = () => {
+    if (!editing) return;
+    const { id, text } = editing;
+    setLedger((l) => editObservation(l, id, text));
+    setEditing(null);
+  };
+
+  // Keyboard transport: bare keys for the transport and pins, ctrl+z /
+  // ctrl+shift+z for ledger undo/redo, and none of it while typing into the
+  // composer or a ledger edit.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
       const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) {
+      const typing =
+        target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA");
+      // Undo/redo (issue #15) are the only ctrl keys the workbench owns. They
+      // fire only when not typing into a field, so a text input keeps its
+      // native editing/undo behavior.
+      if (e.ctrlKey || e.metaKey) {
+        if (!typing && (e.key === "z" || e.key === "Z")) {
+          e.preventDefault();
+          setLedger((l) => (e.shiftKey ? redo(l) : undo(l)));
+        }
         return;
       }
+      if (e.altKey) return;
+      // While typing into the composer or a ledger edit, the field's own key
+      // handlers own the keyboard (so space, enter, etc. type normally).
+      if (typing) return;
       switch (e.key) {
         case " ":
           e.preventDefault();
@@ -212,6 +302,17 @@ export function App() {
         case "U":
           withEngine((eng) => eng.clearRegion());
           break;
+        case "Enter":
+          // Pin on the live candidate (both with shift) without interrupting
+          // listening; the empty text is filled in later in the ledger.
+          e.preventDefault();
+          pin(e.shiftKey ? "both" : live, "");
+          break;
+        case "Tab":
+          // Jump to the composer to write a free-text observation.
+          e.preventDefault();
+          composerRef.current?.focus();
+          break;
         case "?":
           e.preventDefault();
           setHelpOpen((open) => !open);
@@ -222,7 +323,12 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [stopReturns, withEngine]);
+  }, [stopReturns, withEngine, pin, live]);
+
+  // Only positioned observations get a caret on the stage waveform.
+  const pins: Pin[] = ledger.observations.flatMap((o) =>
+    o.position === null ? [] : [{ id: o.id, position: o.position, candidate: o.candidate }],
+  );
 
   return (
     <main style={{ fontFamily: "system-ui, sans-serif", color: "#eee", background: "#0a0a0a", minHeight: "100vh", padding: 16 }}>
@@ -263,6 +369,11 @@ export function App() {
               region={region}
               looping={looping}
               onSelectRegion={selectRegion}
+              pins={pins}
+              activePin={activePin}
+              onPinEnter={setActivePin}
+              onPinLeave={() => setActivePin(null)}
+              onPinClick={setActivePin}
               color={candidateColor(live)}
               height={96}
               testid="stage-waveform"
@@ -356,6 +467,118 @@ export function App() {
 
           {/* Stems section: an empty structural slot (project mode, M5). */}
           <div data-testid="stems-slot" aria-hidden="true" />
+
+          {/* Observation ledger (issue #15): composer + chronological entries. */}
+          <section data-testid="ledger" style={{ marginTop: 16 }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+              <h2 style={{ fontSize: 15, margin: 0 }}>Observations</h2>
+              <button
+                data-testid="ledger-undo"
+                disabled={!canUndo(ledger)}
+                onClick={() => setLedger(undo)}
+              >
+                Undo (⌃z)
+              </button>
+              <button
+                data-testid="ledger-redo"
+                disabled={!canRedo(ledger)}
+                onClick={() => setLedger(redo)}
+              >
+                Redo (⌃⇧z)
+              </button>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+              <input
+                ref={composerRef}
+                data-testid="composer"
+                value={composer}
+                placeholder="Note what you hear… (enter: live, shift+enter: both)"
+                onChange={(e) => setComposer(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    submitComposer(e.shiftKey);
+                  }
+                }}
+                style={{ flex: 1, padding: 4 }}
+              />
+              <button data-testid="composer-pin" onClick={() => submitComposer(false)}>
+                Pin ({live})
+              </button>
+            </div>
+            {ledger.observations.length === 0 ? (
+              <p data-testid="ledger-empty" style={{ color: "#888" }}>
+                No observations yet — press <kbd>enter</kbd> to pin one.
+              </p>
+            ) : (
+              <ol data-testid="ledger-entries" style={{ listStyle: "none", padding: 0, margin: 0 }}>
+                {ledger.observations.map((o) => {
+                  const active = activePin === o.id;
+                  return (
+                    <li
+                      key={o.id}
+                      data-testid={`ledger-entry-${o.id}`}
+                      data-active={String(active)}
+                      onMouseEnter={() => setActivePin(o.id)}
+                      onMouseLeave={() => setActivePin(null)}
+                      style={{
+                        display: "flex",
+                        gap: 8,
+                        alignItems: "center",
+                        padding: 4,
+                        background: active ? "#1d2a1d" : "transparent",
+                      }}
+                    >
+                      <button
+                        data-testid={`ledger-seek-${o.id}`}
+                        title="Seek to this observation"
+                        onClick={() => seekToObservation(o.id, o.position)}
+                        style={{ fontVariantNumeric: "tabular-nums" }}
+                      >
+                        <span data-testid={`ledger-caret-${o.id}`}>{caretGlyph(o.candidate)}</span>{" "}
+                        {o.position === null ? "—" : formatTime(o.position)}
+                        {o.loop !== null ? " ⟳" : ""}
+                      </button>
+                      {editing?.id === o.id ? (
+                        <input
+                          data-testid={`ledger-text-input-${o.id}`}
+                          autoFocus
+                          value={editing.text}
+                          onChange={(e) => setEditing({ id: o.id, text: e.target.value })}
+                          onBlur={commitEdit}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              commitEdit();
+                            } else if (e.key === "Escape") {
+                              e.preventDefault();
+                              setEditing(null);
+                            }
+                          }}
+                          style={{ flex: 1, padding: 2 }}
+                        />
+                      ) : (
+                        <span
+                          data-testid={`ledger-text-${o.id}`}
+                          onClick={() => setEditing({ id: o.id, text: o.text })}
+                          style={{ flex: 1, cursor: "text", color: o.text ? "#eee" : "#888" }}
+                        >
+                          {o.text || "(click to add a note)"}
+                        </span>
+                      )}
+                      <button
+                        data-testid={`ledger-delete-${o.id}`}
+                        title="Delete this observation"
+                        onClick={() => setLedger((l) => deleteObservation(l, o.id))}
+                      >
+                        ✕
+                      </button>
+                    </li>
+                  );
+                })}
+              </ol>
+            )}
+          </section>
         </section>
       )}
 
@@ -395,6 +618,16 @@ export function App() {
                 <li>drag a waveform — select a region</li>
                 <li><kbd>r</kbd> — loop the region (plays into it, then loops)</li>
                 <li><kbd>u</kbd> — clear the region</li>
+              </ul>
+            </section>
+            <section>
+              <h3>Observations &amp; ledger</h3>
+              <ul>
+                <li><kbd>enter</kbd> — pin an observation on the live candidate</li>
+                <li><kbd>shift</kbd>+<kbd>enter</kbd> — pin on both candidates</li>
+                <li><kbd>tab</kbd> — focus the composer to write a note</li>
+                <li>click a timestamp — seek; click text — edit; ✕ — delete</li>
+                <li><kbd>ctrl</kbd>+<kbd>z</kbd> / <kbd>ctrl</kbd>+<kbd>shift</kbd>+<kbd>z</kbd> — undo / redo</li>
               </ul>
             </section>
             <section>

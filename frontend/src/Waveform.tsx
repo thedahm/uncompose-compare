@@ -11,6 +11,14 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { clampPosition, orderedRegion, type Region } from "./transport";
+import { caretGlyph, type Target } from "./ledger";
+
+/** One observation pin drawn as a caret over the stage waveform (issue #15). */
+export interface Pin {
+  id: string;
+  position: number;
+  candidate: Target | null;
+}
 
 interface WaveformProps {
   peaks: { min: Float32Array; max: Float32Array };
@@ -22,6 +30,13 @@ interface WaveformProps {
   onSelectRegion: (a: number, b: number) => void;
   /** Fired on a genuine click (not a drag) — the lane rows use it to audition. */
   onActivate?: () => void;
+  /** Observation carets to draw over the waveform (the stage only). */
+  pins?: Pin[];
+  /** The highlighted pin (two-way with the ledger), or null. */
+  activePin?: string | null;
+  onPinEnter?: (id: string) => void;
+  onPinLeave?: () => void;
+  onPinClick?: (id: string) => void;
   color: string;
   height: number;
   testid: string;
@@ -29,6 +44,13 @@ interface WaveformProps {
 
 /** Below this many pixels of travel a press is a click (seek), not a drag. */
 const DRAG_THRESHOLD_PX = 4;
+
+/** A caret's vertical placement: ▼ A above, ▲ B below, ◆ both centered. */
+function caretPlacement(candidate: Target | null): React.CSSProperties {
+  if (candidate === "A") return { top: 0, transform: "translateX(-50%)" };
+  if (candidate === "B") return { bottom: 0, transform: "translateX(-50%)" };
+  return { top: "50%", transform: "translate(-50%, -50%)" };
+}
 
 export function Waveform({
   peaks,
@@ -39,6 +61,11 @@ export function Waveform({
   looping,
   onSelectRegion,
   onActivate,
+  pins,
+  activePin,
+  onPinEnter,
+  onPinLeave,
+  onPinClick,
   color,
   height,
   testid,
@@ -164,6 +191,44 @@ export function Waveform({
           pointerEvents: "none",
         }}
       />
+      {/* Observation carets: ▼ above for A, ◆ overlaid for both, ▲ below for B.
+          They sit above the drag/seek surface, so their pointer events are
+          stopped from reaching it (a caret click finds its ledger entry, never
+          seeks). */}
+      {duration > 0 &&
+        pins?.map((pin) => {
+          const frac = clampPosition(pin.position, duration) / duration;
+          const active = activePin === pin.id;
+          return (
+            <span
+              key={pin.id}
+              data-testid={`${testid}-caret-${pin.id}`}
+              data-caret-candidate={pin.candidate ?? "none"}
+              data-active={String(active)}
+              onPointerDown={(e) => e.stopPropagation()}
+              onPointerUp={(e) => e.stopPropagation()}
+              onMouseEnter={() => onPinEnter?.(pin.id)}
+              onMouseLeave={() => onPinLeave?.()}
+              onClick={(e) => {
+                e.stopPropagation();
+                onPinClick?.(pin.id);
+              }}
+              style={{
+                position: "absolute",
+                left: `${frac * 100}%`,
+                ...caretPlacement(pin.candidate),
+                fontSize: 12,
+                lineHeight: 1,
+                cursor: "pointer",
+                color: active ? "#fff" : "#bbb",
+                textShadow: active ? "0 0 4px #fff" : "none",
+                userSelect: "none",
+              }}
+            >
+              {caretGlyph(pin.candidate)}
+            </span>
+          );
+        })}
     </div>
   );
 }
