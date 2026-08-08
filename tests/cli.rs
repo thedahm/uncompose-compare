@@ -629,7 +629,7 @@ fn write_wav_fmt(
     bits: u16,
     float: bool,
     seed: u32,
-) -> u64 {
+) {
     let block_align = channels * bits / 8;
     let byte_rate = sample_rate * block_align as u32;
     let data_len = frames * block_align as u32;
@@ -671,7 +671,6 @@ fn write_wav_fmt(
     }
 
     std::fs::write(path, &buf).expect("write wav fixture");
-    buf.len() as u64
 }
 
 /// Write a WAVE_FORMAT_EXTENSIBLE 16-bit PCM WAV with `channels` channels — used

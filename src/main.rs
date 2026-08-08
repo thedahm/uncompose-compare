@@ -196,6 +196,9 @@ struct Proxy {
     container: Container,
 }
 
+/// FLAC's format ceiling on channel count; a wider source falls back to WAV.
+const MAX_FLAC_CHANNELS: usize = 8;
+
 /// The lossless container a proxy was written in: FLAC by default, WAV only when
 /// FLAC cannot represent the source (per #74).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -378,11 +381,7 @@ fn load_candidate(
 /// sources pass through unchanged; anything wider (32-bit int, 32/64-bit float)
 /// quantizes to 24 (#74). FLAC/WAV both top out at 24-bit here.
 fn target_bits(src_bits: u32) -> u32 {
-    if src_bits >= 25 {
-        24
-    } else {
-        src_bits.clamp(8, 24)
-    }
+    src_bits.clamp(8, 24)
 }
 
 /// Fully-decoded source PCM plus the transcode policy derived from it: the
@@ -620,9 +619,6 @@ impl Cache {
     }
 }
 
-/// FLAC's format ceiling on channel count; a wider source falls back to WAV.
-const MAX_FLAC_CHANNELS: usize = 8;
-
 /// Encode interleaved integer PCM as FLAC at the source sample rate and target
 /// bit depth (flacenc, #74).
 fn encode_flac(pcm: &DecodedPcm) -> Result<Vec<u8>, String> {
@@ -710,28 +706,18 @@ fn serve(request: Request, token: &str, session: &Session) {
     // request names a source hash we already loaded — never a filesystem path.
     // An unknown hash is a 404, not a chance to read arbitrary files.
     if let Some(hash) = path.strip_prefix("audio/") {
-        return match session.proxies.get(hash) {
+        let response = match session.proxies.get(hash) {
             Some(proxy) => match std::fs::read(&proxy.path) {
-                Ok(data) => {
-                    let response = Response::from_data(data)
-                        .with_header(header("Content-Type", proxy.container.content_type()))
-                        .with_header(header("Cache-Control", "no-store"));
-                    let _ = request.respond(response);
-                }
-                Err(_) => {
-                    let response = Response::from_string("not found")
-                        .with_status_code(404)
-                        .with_header(header("Cache-Control", "no-store"));
-                    let _ = request.respond(response);
-                }
+                Ok(data) => Response::from_data(data)
+                    .with_header(header("Content-Type", proxy.container.content_type()))
+                    .with_header(header("Cache-Control", "no-store")),
+                // A proxy pruned out from under us resolves like an unknown hash.
+                Err(_) => not_found(),
             },
-            None => {
-                let response = Response::from_string("not found")
-                    .with_status_code(404)
-                    .with_header(header("Cache-Control", "no-store"));
-                let _ = request.respond(response);
-            }
+            None => not_found(),
         };
+        let _ = request.respond(response);
+        return;
     }
 
     // Map "/" to the SPA entry point.
@@ -750,13 +736,19 @@ fn serve(request: Request, token: &str, session: &Session) {
                     &format!("token={token}; Path=/; SameSite=Strict"),
                 ))
         }
-        None => Response::from_string("not found")
-            .with_status_code(404)
-            .with_header(header("Cache-Control", "no-store")),
+        None => not_found(),
     };
 
     // A broken client connection is not our problem to recover from.
     let _ = request.respond(response);
+}
+
+/// A 404 for an unknown asset or content hash — like every other response,
+/// never cached.
+fn not_found() -> Response<std::io::Cursor<Vec<u8>>> {
+    Response::from_string("not found")
+        .with_status_code(404)
+        .with_header(header("Cache-Control", "no-store"))
 }
 
 /// Refuse a request that fails the #72 contract: 403, no body of substance, and
