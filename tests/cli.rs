@@ -10,8 +10,17 @@
 //! invocations fail with a clear message and a non-zero exit before the server
 //! ever binds.
 //!
-//! Fixtures are deterministic seeded noise written as 16-bit PCM WAV at test
-//! time (per #73 — never committed audio).
+//! Issue #11 adds the playback path (#74): the `/audio/<sha256>` endpoint serves
+//! a lossless proxy (FLAC, or WAV when FLAC cannot represent the source) that
+//! the binary transcoded into the XDG content-hash cache, guarded like every
+//! other response. These tests read the proxy bytes back and check container,
+//! bit depth, sample rate, and sample count at the boundary; that a second run
+//! reuses the cache without re-transcoding; that the LRU prune sheds the
+//! least-recently-accessed proxy at startup; and that `cache clear` empties the
+//! cache and reports what it did.
+//!
+//! Fixtures are deterministic seeded noise written as WAV at test time (per #73
+//! — never committed audio), at whatever bit depth / channel count a case needs.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -116,9 +125,24 @@ fn launch() -> Serving {
 
 /// Launch the binary against two specific files, parsing the tokened URL line.
 fn launch_with(dir: TempDir, a: &Path, b: &Path) -> Serving {
-    let mut child = Command::new(BIN)
-        .arg(a)
-        .arg(b)
+    launch_opts(dir, a, b, None, &[])
+}
+
+/// Launch with full control over the cache location (`XDG_CACHE_HOME`) and extra
+/// CLI flags, so cache-behavior tests run against an isolated, stable cache.
+fn launch_opts(
+    dir: TempDir,
+    a: &Path,
+    b: &Path,
+    cache_home: Option<&Path>,
+    extra: &[&str],
+) -> Serving {
+    let mut command = Command::new(BIN);
+    command.arg(a).arg(b).args(extra);
+    if let Some(home) = cache_home {
+        command.env("XDG_CACHE_HOME", home);
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -182,7 +206,7 @@ fn request(addr: &str, path: &str, host: &str, cookie: Option<&str>) -> (u16, St
         .position(|w| w == b"\r\n\r\n")
         .expect("response has header/body separator");
     let head = String::from_utf8_lossy(&raw[..split]).to_string();
-    let body = raw[split + 4..].to_vec();
+    let mut body = raw[split + 4..].to_vec();
 
     let status = head
         .lines()
@@ -191,7 +215,36 @@ fn request(addr: &str, path: &str, host: &str, cookie: Option<&str>) -> (u16, St
         .and_then(|c| c.parse::<u16>().ok())
         .expect("parse status code");
 
-    (status, head.to_lowercase(), body)
+    let headers = head.to_lowercase();
+    // tiny_http streams larger responses (e.g. audio proxies) with chunked
+    // transfer-encoding; de-chunk so callers see the raw payload.
+    if headers.contains("transfer-encoding: chunked") {
+        body = dechunk(&body);
+    }
+
+    (status, headers, body)
+}
+
+/// Decode an HTTP/1.1 chunked body: repeated `<hex-len>\r\n<data>\r\n`, ending
+/// with a zero-length chunk.
+fn dechunk(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        let nl = match raw[i..].windows(2).position(|w| w == b"\r\n") {
+            Some(p) => i + p,
+            None => break,
+        };
+        let size_line = std::str::from_utf8(&raw[i..nl]).unwrap_or("").trim();
+        let size = usize::from_str_radix(size_line, 16).unwrap_or(0);
+        i = nl + 2;
+        if size == 0 {
+            break;
+        }
+        out.extend_from_slice(&raw[i..i + size]);
+        i += size + 2; // skip the chunk's trailing CRLF
+    }
+    out
 }
 
 /// GET with the correct (loopback) Host header and no cookie.
@@ -561,4 +614,402 @@ fn undecodable_file_is_a_clear_error() {
         stderr.contains("cannot decode") && stderr.contains("bad.wav"),
         "an undecodable file should be reported by name: {stderr}"
     );
+}
+
+// --- Issue #11: proxy pipeline, content-hash cache, audio endpoints ---------
+
+/// Write a WAV of arbitrary bit depth and integer/float sample format, mono or
+/// stereo, filled with deterministic seeded noise. A simple `fmt ` chunk (tag 1
+/// integer, tag 3 IEEE float) — enough for symphonia to decode as a source.
+fn write_wav_fmt(
+    path: &Path,
+    frames: u32,
+    sample_rate: u32,
+    channels: u16,
+    bits: u16,
+    float: bool,
+    seed: u32,
+) -> u64 {
+    let block_align = channels * bits / 8;
+    let byte_rate = sample_rate * block_align as u32;
+    let data_len = frames * block_align as u32;
+
+    let mut buf = Vec::with_capacity(44 + data_len as usize);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&(36 + data_len).to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&(if float { 3u16 } else { 1u16 }).to_le_bytes());
+    buf.extend_from_slice(&channels.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&byte_rate.to_le_bytes());
+    buf.extend_from_slice(&block_align.to_le_bytes());
+    buf.extend_from_slice(&bits.to_le_bytes());
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_len.to_le_bytes());
+
+    let mut state = seed.wrapping_add(1);
+    let mut next = || {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        state
+    };
+    for _ in 0..frames {
+        for _ in 0..channels {
+            let s = next();
+            match (float, bits) {
+                (true, 32) => {
+                    let f = s as f32 / u32::MAX as f32 - 0.5;
+                    buf.extend_from_slice(&f.to_le_bytes());
+                }
+                (false, 16) => buf.extend_from_slice(&((s >> 16) as i16).to_le_bytes()),
+                (false, 24) => buf.extend_from_slice(&s.to_le_bytes()[0..3]),
+                (false, 32) => buf.extend_from_slice(&(s as i32).to_le_bytes()),
+                other => panic!("unsupported fixture format {other:?}"),
+            }
+        }
+    }
+
+    std::fs::write(path, &buf).expect("write wav fixture");
+    buf.len() as u64
+}
+
+/// Write a WAVE_FORMAT_EXTENSIBLE 16-bit PCM WAV with `channels` channels — used
+/// to make a source FLAC cannot represent (> 8 channels), forcing the WAV
+/// fallback proxy.
+fn write_wav_extensible(path: &Path, frames: u32, sample_rate: u32, channels: u16, seed: u32) {
+    let bits = 16u16;
+    let block_align = channels * bits / 8;
+    let byte_rate = sample_rate * block_align as u32;
+    let data_len = frames * block_align as u32;
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&(36 + 24 + data_len).to_le_bytes()); // fmt is 40 bytes (16+24)
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&40u32.to_le_bytes());
+    buf.extend_from_slice(&0xFFFEu16.to_le_bytes()); // WAVE_FORMAT_EXTENSIBLE
+    buf.extend_from_slice(&channels.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&byte_rate.to_le_bytes());
+    buf.extend_from_slice(&block_align.to_le_bytes());
+    buf.extend_from_slice(&bits.to_le_bytes());
+    buf.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+    buf.extend_from_slice(&bits.to_le_bytes()); // valid bits per sample
+    buf.extend_from_slice(&((1u32 << channels) - 1).to_le_bytes()); // channel mask
+                                                                    // PCM subformat GUID.
+    buf.extend_from_slice(&[
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B,
+        0x71,
+    ]);
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_len.to_le_bytes());
+
+    let mut state = seed.wrapping_add(1);
+    for _ in 0..frames {
+        for _ in 0..channels {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            buf.extend_from_slice(&((state >> 16) as i16).to_le_bytes());
+        }
+    }
+    std::fs::write(path, &buf).expect("write extensible wav fixture");
+}
+
+/// The first candidate's sha256 as it appears in the `/session` JSON — also the
+/// key its audio proxy resolves under (`/audio/<sha256>`).
+fn first_sha256(json: &str) -> String {
+    let chunk = json
+        .split("\"sha256\":\"")
+        .nth(1)
+        .expect("session json has a sha256");
+    chunk[..64].to_string()
+}
+
+/// FLAC STREAMINFO, the fields the proxy contract cares about: sample rate,
+/// channels, bits per sample, total sample count. Parsed straight from the bytes
+/// so the test needs no FLAC decoder.
+struct FlacInfo {
+    sample_rate: u32,
+    channels: u32,
+    bits: u32,
+    total_samples: u64,
+}
+
+fn parse_flac(bytes: &[u8]) -> FlacInfo {
+    assert_eq!(&bytes[0..4], b"fLaC", "proxy is a FLAC stream");
+    // 4-byte "fLaC" + 4-byte metadata-block header, then STREAMINFO content.
+    // The packed 64-bit field sits 10 bytes into STREAMINFO (after the block
+    // sizes and frame sizes): rate(20) | channels(3) | bps(5) | samples(36).
+    let si = 8 + 10;
+    let packed = u64::from_be_bytes(bytes[si..si + 8].try_into().unwrap());
+    FlacInfo {
+        sample_rate: ((packed >> 44) & 0xF_FFFF) as u32,
+        channels: (((packed >> 41) & 0x7) + 1) as u32,
+        bits: (((packed >> 36) & 0x1F) + 1) as u32,
+        total_samples: packed & 0xF_FFFF_FFFF,
+    }
+}
+
+/// The bit depth (and container = WAV) of a `fmt `-chunk WAV proxy, read from the
+/// header without decoding.
+fn parse_wav_bits(bytes: &[u8]) -> u16 {
+    assert_eq!(&bytes[0..4], b"RIFF", "proxy is a RIFF/WAV stream");
+    assert_eq!(&bytes[8..12], b"WAVE", "proxy is a WAVE stream");
+    // In both plain and EXTENSIBLE `fmt ` layouts, bits-per-sample is at
+    // offset 34 (12 RIFF/WAVE + 8 chunk header + 14 into the fmt body).
+    u16::from_le_bytes(bytes[34..36].try_into().unwrap())
+}
+
+/// Fetch the proxy bytes for a hash over the tokened loopback, asserting the
+/// shared response guarantees.
+fn audio_bytes(server: &Serving, hash: &str) -> (u16, String, Vec<u8>) {
+    http_get(
+        &server.addr,
+        &format!("/audio/{hash}?token={}", server.token),
+    )
+}
+
+#[test]
+fn audio_endpoint_serves_decodable_flac_proxy() {
+    let server = launch(); // two 1-second 44.1k stereo 16-bit fixtures
+    let json = session_json(&server);
+    let hash = first_sha256(&json);
+    // The session advertises the proxy under /audio/<sha256>.
+    assert!(
+        json.contains(&format!("\"audio\":\"/audio/{hash}\"")),
+        "session should point at the audio endpoint: {json}"
+    );
+
+    let (status, headers, body) = audio_bytes(&server, &hash);
+    assert_eq!(status, 200, "the audio proxy should be served to a token");
+    assert!(
+        headers.contains("cache-control: no-store"),
+        "the proxy must be uncached like every response: {headers}"
+    );
+    assert!(
+        headers.contains("content-type: audio/flac"),
+        "a FLAC proxy carries an audio/flac type: {headers}"
+    );
+
+    // Verify container, bit depth, sample rate, and sample count at the boundary.
+    let info = parse_flac(&body);
+    assert_eq!(info.sample_rate, 44_100, "sample rate is never resampled");
+    assert_eq!(info.channels, 2, "channel count is preserved");
+    assert_eq!(info.bits, 16, "a 16-bit source stays 16-bit (bit-exact)");
+    assert_eq!(
+        info.total_samples, 44_100,
+        "the proxy holds every source frame"
+    );
+}
+
+#[test]
+fn audio_endpoint_bit_depth_policy() {
+    // One case per source depth: 16/24-bit integer pass through; 32-bit int and
+    // 32-bit float quantize to 24. Sample rate is untouched throughout.
+    for (tag, bits, float, expect) in [
+        ("i16", 16u16, false, 16u32),
+        ("i24", 24, false, 24),
+        ("i32", 32, false, 24),
+        ("f32", 32, true, 24),
+    ] {
+        let dir = TempDir::new(tag);
+        let a = dir.join("a.wav");
+        let b = dir.join("b.wav");
+        write_wav_fmt(&a, 44_100, 48_000, 2, bits, float, 11);
+        write_wav_fmt(&b, 44_100, 48_000, 2, bits, float, 12);
+        let server = launch_with(dir, &a, &b);
+
+        let hash = first_sha256(&session_json(&server));
+        let (status, headers, body) = audio_bytes(&server, &hash);
+        assert_eq!(status, 200, "[{tag}] proxy served");
+        assert!(
+            headers.contains("content-type: audio/flac"),
+            "[{tag}] integer/float sources within FLAC's reach stay FLAC: {headers}"
+        );
+        let info = parse_flac(&body);
+        assert_eq!(info.bits, expect, "[{tag}] proxy bit depth");
+        assert_eq!(info.sample_rate, 48_000, "[{tag}] sample rate preserved");
+        assert_eq!(info.total_samples, 44_100, "[{tag}] sample count preserved");
+    }
+}
+
+#[test]
+fn audio_endpoint_wav_fallback_for_unrepresentable_source() {
+    // FLAC tops out at 8 channels; a 10-channel source falls back to WAV.
+    let dir = TempDir::new("wavfallback");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    write_wav_extensible(&a, 22_050, 44_100, 10, 5);
+    write_wav_extensible(&b, 22_050, 44_100, 10, 6);
+    let server = launch_with(dir, &a, &b);
+
+    let hash = first_sha256(&session_json(&server));
+    let (status, headers, body) = audio_bytes(&server, &hash);
+    assert_eq!(status, 200, "the WAV-fallback proxy should be served");
+    assert!(
+        headers.contains("content-type: audio/wav"),
+        "a 10-channel source falls back to a WAV proxy: {headers}"
+    );
+    assert_eq!(parse_wav_bits(&body), 16, "a 16-bit source stays 16-bit");
+}
+
+#[test]
+fn audio_endpoint_refuses_missing_token_and_bad_host() {
+    let server = launch();
+    let hash = first_sha256(&session_json(&server));
+
+    let (status, headers, _) = http_get(&server.addr, &format!("/audio/{hash}"));
+    assert_eq!(status, 403, "the audio endpoint needs the token too");
+    assert!(
+        headers.contains("cache-control: no-store"),
+        "even the audio refusal must be uncached: {headers}"
+    );
+
+    let (status, _, _) = request(
+        &server.addr,
+        &format!("/audio/{hash}?token={}", server.token),
+        "evil.example.com",
+        None,
+    );
+    assert_eq!(status, 403, "the audio endpoint honors the Host check too");
+}
+
+#[test]
+fn audio_endpoint_unknown_hash_is_404() {
+    let server = launch();
+    // A well-formed but unknown hash resolves to nothing — no path ever reaches
+    // the filesystem, so this is a plain 404, not a traversal foothold.
+    let (status, _, _) = audio_bytes(&server, &"a".repeat(64));
+    assert_eq!(status, 404, "an unknown content hash is not found");
+
+    // A path-traversal attempt is likewise just an unknown key.
+    let (status, _, _) = http_get(
+        &server.addr,
+        &format!("/audio/../../etc/passwd?token={}", server.token),
+    );
+    assert_eq!(status, 404, "the audio endpoint never resolves a path");
+}
+
+#[test]
+fn second_run_reuses_cache_without_retranscoding() {
+    let cache_home = TempDir::new("cache-reuse");
+    let fixtures = TempDir::new("reuse-fixtures");
+    let a = fixtures.join("a.wav");
+    let b = fixtures.join("b.wav");
+    write_wav(&a, 44_100, 44_100, 2, 21);
+    write_wav(&b, 44_100, 44_100, 2, 22);
+
+    // First run populates the cache.
+    let hash_a = {
+        let server = launch_opts(TempDir::new("reuse-1"), &a, &b, Some(&cache_home.path), &[]);
+        first_sha256(&session_json(&server))
+    };
+
+    let proxy = cache_home
+        .path
+        .join("uncompose-compare")
+        .join(format!("{hash_a}.flac"));
+    assert!(
+        proxy.exists(),
+        "first run should write the proxy: {proxy:?}"
+    );
+    let mtime_first = std::fs::metadata(&proxy).unwrap().modified().unwrap();
+
+    // Second run against the same files must not rewrite the proxy.
+    {
+        let server = launch_opts(TempDir::new("reuse-2"), &a, &b, Some(&cache_home.path), &[]);
+        let _ = session_json(&server);
+    }
+    let mtime_second = std::fs::metadata(&proxy).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime_first, mtime_second,
+        "a second run against unchanged files must not re-transcode"
+    );
+}
+
+#[test]
+fn startup_prune_evicts_least_recently_used() {
+    let cache_home = TempDir::new("cache-prune");
+    let cache_dir = cache_home.path.join("uncompose-compare");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Plant a large, old proxy that a tight cap must evict.
+    let stale = cache_dir.join("staaaaale.flac");
+    std::fs::write(&stale, vec![0u8; 5_000_000]).unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_accessed(old))
+        .unwrap();
+
+    let fixtures = TempDir::new("prune-fixtures");
+    let a = fixtures.join("a.wav");
+    let b = fixtures.join("b.wav");
+    write_wav(&a, 44_100, 44_100, 2, 31);
+    write_wav(&b, 44_100, 44_100, 2, 32);
+
+    // A 1 MB cap: the two fresh proxies fit, the 5 MB stale file cannot.
+    let server = launch_opts(
+        TempDir::new("prune-run"),
+        &a,
+        &b,
+        Some(&cache_home.path),
+        &["--cache-max-bytes", "1000000"],
+    );
+    let hash_a = first_sha256(&session_json(&server));
+    drop(server); // ensure prune (at startup) has already run
+
+    assert!(
+        !stale.exists(),
+        "the least-recently-accessed proxy should be evicted"
+    );
+    let fresh = cache_dir.join(format!("{hash_a}.flac"));
+    assert!(
+        fresh.exists(),
+        "this session's freshly-used proxy must survive the prune"
+    );
+}
+
+#[test]
+fn cache_clear_empties_and_reports() {
+    let cache_home = TempDir::new("cache-clear");
+    let fixtures = TempDir::new("clear-fixtures");
+    let a = fixtures.join("a.wav");
+    let b = fixtures.join("b.wav");
+    write_wav(&a, 44_100, 44_100, 2, 41);
+    write_wav(&b, 44_100, 44_100, 2, 42);
+
+    // Populate the cache.
+    {
+        let server = launch_opts(
+            TempDir::new("clear-run"),
+            &a,
+            &b,
+            Some(&cache_home.path),
+            &[],
+        );
+        let _ = session_json(&server);
+    }
+    let cache_dir = cache_home.path.join("uncompose-compare");
+    let before = std::fs::read_dir(&cache_dir).unwrap().count();
+    assert!(before >= 2, "two candidates should populate the cache");
+
+    // `cache clear` wipes it and reports what it did.
+    let out = Command::new(BIN)
+        .args(["cache", "clear"])
+        .env("XDG_CACHE_HOME", &cache_home.path)
+        .output()
+        .expect("run cache clear");
+    assert!(out.status.success(), "cache clear should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("cleared") && stdout.contains("proxy"),
+        "cache clear should report what it removed: {stdout}"
+    );
+
+    let after = std::fs::read_dir(&cache_dir).unwrap().count();
+    assert_eq!(after, 0, "the cache should be empty after clear");
 }
