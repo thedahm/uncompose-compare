@@ -16,7 +16,8 @@
 #   SKIP_NPM_INSTALL=1   skip `npm install` in harness/ (deps already present)
 #   SKIP_PW_INSTALL=1    skip `npx playwright install` (browsers already present)
 #   PW_WITH_DEPS=1       pass --with-deps to the browser install (needs root)
-#   FFMPEG=/path/ffmpeg  ffmpeg binary for FLAC fixtures (default: ffmpeg)
+#   FFMPEG=/path/ffmpeg  ffmpeg binary for FLAC fixtures (default: the bundled
+#                        ffmpeg-static devDependency — no system ffmpeg needed)
 
 set -euo pipefail
 

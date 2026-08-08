@@ -3,18 +3,20 @@
 // Noise (not sine) so cross-correlation has a single sharp zero-lag peak.
 //
 // ffmpeg is a build-time-only dependency of fixture generation (never shipped in
-// the wheel). Override the binary with FFMPEG=/path/to/ffmpeg if it is not on
-// PATH.
+// the wheel). It resolves in this order: the FFMPEG env var, else the bundled
+// `ffmpeg-static` binary (a devDependency, so no system ffmpeg/apt is needed on
+// a stock runner), else `ffmpeg` on PATH.
 import { writeFileSync, mkdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import ffmpegStatic from "ffmpeg-static";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const fixturesDir = path.join(dir, "fixtures");
 mkdirSync(fixturesDir, { recursive: true });
 
-const FFMPEG = process.env.FFMPEG || "ffmpeg";
+const FFMPEG = process.env.FFMPEG || ffmpegStatic || "ffmpeg";
 const SAMPLE_RATE = 44100;
 const FRAMES = 66150; // 1.5 s exactly
 const CHANNELS = 2;
