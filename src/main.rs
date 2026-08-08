@@ -1,25 +1,35 @@
-//! Spike 3: minimal server privacy contract.
+//! M3 listening slice, first cut (issue #10): the two-file compare command.
 //!
-//! Serves the Vite/React stub bundle — embedded into this binary via
-//! rust-embed — over a loopback-only HTTP server on an ephemeral port, honoring
-//! the minimal #72 privacy contract decided in `thedahm/uncompose`:
+//! `uncompose-compare <a> <b>` loads two audio files as candidates A and B (in
+//! argument order), hashing and decoding each at startup, then serves the
+//! embedded UI over the spike's guarded loopback server (#72) plus a new
+//! `/session` endpoint that reports the metadata the workbench needs: file
+//! names, sha256, size, durations in samples and ms, sample rates, and a
+//! duration-mismatch flag.
 //!
-//!   * bind 127.0.0.1 on an OS-assigned ephemeral port (never exposed off-box);
-//!   * print a URL carrying a per-session token, and refuse any request that
-//!     does not present it (via query string or the cookie the page seeds);
-//!   * refuse any request whose Host header is not 127.0.0.1 (a DNS-rebinding
-//!     guard — a malicious page can't drive this server through the browser);
-//!   * send `Cache-Control: no-store` on *every* response — served, refused, or
-//!     not-found — so nothing this server emits is ever cached.
+//! The #72 privacy contract from the spike still holds on every response —
+//! loopback bind, ephemeral port, per-session token, Host check, blanket
+//! `Cache-Control: no-store`, constant-time token compare — and now covers the
+//! `/session` endpoint too.
 //!
-//! Scope is still the packaging spike (spec #1): serve the embedded page and
-//! answer `--version`/`--help`, nothing more.
+//! Bad invocations fail before the server ever binds, with a clear message and
+//! a non-zero exit: wrong argument count (clap), a missing or unreadable file,
+//! or an undecodable format.
 
+use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use rust_embed::RustEmbed;
+use sha2::{Digest, Sha256};
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 use tiny_http::{Header, Request, Response, Server};
 
 /// The Vite/React stub bundle, embedded at compile time. `build.rs` guarantees
@@ -28,21 +38,30 @@ use tiny_http::{Header, Request, Response, Server};
 #[folder = "frontend/dist/"]
 struct Assets;
 
-/// uncompose-compare — serve the embedded UI over loopback.
+/// uncompose-compare — load two audio files and open the listening workbench.
 #[derive(Parser)]
 #[command(name = "uncompose-compare", version, about, long_about = None)]
-struct Cli {}
+struct Cli {
+    /// Candidate A: the first audio file to compare.
+    a: PathBuf,
+    /// Candidate B: the second audio file to compare.
+    b: PathBuf,
+}
 
 fn main() {
-    Cli::parse();
+    let cli = Cli::parse();
 
-    if let Err(err) = run() {
+    if let Err(err) = run(&cli) {
         eprintln!("uncompose-compare: {err}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Load both candidates before binding: a bad invocation must fail with a
+    // clear message and a non-zero exit, never a running server.
+    let session = Session::load(&cli.a, &cli.b)?;
+
     // Loopback bind on an ephemeral port: the OS hands us a free port and we
     // never expose the server beyond this machine.
     let server = Server::http("127.0.0.1:0")?;
@@ -61,15 +80,247 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::io::stdout().flush()?;
 
     for request in server.incoming_requests() {
-        serve(request, &token);
+        serve(request, &token, &session);
     }
 
     Ok(())
 }
 
-/// Resolve the request against the embedded bundle and reply, enforcing the
-/// #72 contract (Host check, then token) before serving anything.
-fn serve(request: Request, token: &str) {
+/// A loaded comparison session: the two candidates in argument order, ready to
+/// answer the `/session` endpoint.
+struct Session {
+    candidates: [Candidate; 2],
+}
+
+/// One loaded audio file, with everything the record and workbench need to
+/// identify and describe it. Decoded metadata is derived at load; the PCM
+/// itself is not retained (playback proxies are a later issue).
+struct Candidate {
+    label: &'static str,
+    name: String,
+    path: String,
+    sha256: String,
+    size: u64,
+    /// Total decoded frames (samples per channel) — the candidate's duration.
+    frames: u64,
+    sample_rate: u32,
+    channels: u16,
+}
+
+impl Candidate {
+    fn duration_ms(&self) -> f64 {
+        if self.sample_rate == 0 {
+            0.0
+        } else {
+            self.frames as f64 * 1000.0 / self.sample_rate as f64
+        }
+    }
+}
+
+impl Session {
+    fn load(a: &Path, b: &Path) -> Result<Self, LoadError> {
+        Ok(Session {
+            candidates: [load_candidate("A", a)?, load_candidate("B", b)?],
+        })
+    }
+
+    /// True when the two candidates differ in duration. Reported alongside the
+    /// deltas so the page can warn without blocking playback of either file.
+    fn duration_mismatch(&self) -> bool {
+        let [a, b] = &self.candidates;
+        a.frames != b.frames || (a.duration_ms() - b.duration_ms()).abs() > 0.5
+    }
+
+    /// Serialize the session metadata as JSON for the `/session` endpoint.
+    fn to_json(&self) -> String {
+        let [a, b] = &self.candidates;
+        let delta_samples = (a.frames as i64 - b.frames as i64).abs();
+        let delta_ms = (a.duration_ms() - b.duration_ms()).abs();
+        format!(
+            "{{\"candidates\":[{},{}],\
+             \"duration_mismatch\":{},\
+             \"duration_delta_samples\":{},\
+             \"duration_delta_ms\":{}}}",
+            a.to_json(),
+            b.to_json(),
+            self.duration_mismatch(),
+            delta_samples,
+            json_num(delta_ms),
+        )
+    }
+}
+
+impl Candidate {
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"label\":{},\"name\":{},\"path\":{},\"sha256\":{},\
+             \"size\":{},\"frames\":{},\"duration_ms\":{},\
+             \"sample_rate\":{},\"channels\":{}}}",
+            json_str(self.label),
+            json_str(&self.name),
+            json_str(&self.path),
+            json_str(&self.sha256),
+            self.size,
+            self.frames,
+            json_num(self.duration_ms()),
+            self.sample_rate,
+            self.channels,
+        )
+    }
+}
+
+/// A load failure, phrased so the message alone diagnoses it (a #28 concern):
+/// which file, and whether it could not be read or could not be decoded.
+#[derive(Debug)]
+enum LoadError {
+    Unreadable {
+        path: String,
+        source: std::io::Error,
+    },
+    Undecodable {
+        path: String,
+        reason: String,
+    },
+}
+
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoadError::Unreadable { path, source } => {
+                write!(f, "cannot read {path}: {source}")
+            }
+            LoadError::Undecodable { path, reason } => {
+                write!(f, "cannot decode {path}: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+/// Hash, size, and decode one input into a `Candidate`. The whole file is read
+/// once to hash and size it; decoding then reopens it (symphonia streams from a
+/// `File`) to count frames and read the sample rate.
+fn load_candidate(label: &'static str, path: &Path) -> Result<Candidate, LoadError> {
+    let display = path.display().to_string();
+
+    let mut file = File::open(path).map_err(|source| LoadError::Unreadable {
+        path: display.clone(),
+        source,
+    })?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| LoadError::Unreadable {
+            path: display.clone(),
+            source,
+        })?;
+
+    let size = bytes.len() as u64;
+    let sha256 = hex(&Sha256::digest(&bytes));
+
+    let decoded = decode_metadata(path).map_err(|reason| LoadError::Undecodable {
+        path: display.clone(),
+        reason,
+    })?;
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| display.clone());
+
+    Ok(Candidate {
+        label,
+        name,
+        path: display,
+        sha256,
+        size,
+        frames: decoded.frames,
+        sample_rate: decoded.sample_rate,
+        channels: decoded.channels,
+    })
+}
+
+/// The decoded shape we keep: how long, how fast, how wide.
+struct DecodedMeta {
+    frames: u64,
+    sample_rate: u32,
+    channels: u16,
+}
+
+/// Decode `path` fully with symphonia to count frames and read the format's
+/// sample rate and channel count. Decoding to the end (rather than trusting a
+/// header frame count) is what makes an undecodable or truncated file surface
+/// here as an error instead of a wrong duration later.
+fn decode_metadata(path: &Path) -> Result<DecodedMeta, String> {
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut format = probed.format;
+    let track = format
+        .default_track()
+        .ok_or_else(|| "no audio track".to_string())?
+        .clone();
+    let track_id = track.id;
+
+    let sample_rate = track
+        .codec_params
+        .sample_rate
+        .ok_or_else(|| "unknown sample rate".to_string())?;
+    let channels = track
+        .codec_params
+        .channels
+        .map(|c| c.count() as u16)
+        .unwrap_or(0);
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| e.to_string())?;
+
+    let mut frames: u64 = 0;
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            // A clean end of stream is the loop's exit, not a failure.
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        match decoder.decode(&packet) {
+            Ok(buf) => frames += buf.frames() as u64,
+            // A recoverable decode hiccup skips the packet; a fatal one fails.
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+
+    Ok(DecodedMeta {
+        frames,
+        sample_rate,
+        channels,
+    })
+}
+
+/// Resolve the request against the session endpoint and the embedded bundle,
+/// enforcing the #72 contract (Host check, then token) before serving anything.
+fn serve(request: Request, token: &str, session: &Session) {
     // DNS-rebinding guard: only a loopback Host is ever honored. A page on
     // another origin that resolves its name to 127.0.0.1 still sends its own
     // Host, so this refuses it before any asset is touched.
@@ -89,8 +340,19 @@ fn serve(request: Request, token: &str) {
         return refuse(request);
     }
 
-    // Map "/" to the SPA entry point.
     let path = path.trim_start_matches('/');
+
+    // The session endpoint: the workbench's source of truth for candidate
+    // metadata. Same no-store guarantee as every other response.
+    if path == "session" {
+        let response = Response::from_string(session.to_json())
+            .with_header(header("Content-Type", "application/json"))
+            .with_header(header("Cache-Control", "no-store"));
+        let _ = request.respond(response);
+        return;
+    }
+
+    // Map "/" to the SPA entry point.
     let path = if path.is_empty() { "index.html" } else { path };
 
     let response = match Assets::get(path) {
@@ -161,7 +423,42 @@ fn cookie_token(request: &Request) -> Option<&str> {
 fn session_token() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let mut bytes = [0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    Ok(hex(&bytes))
+}
+
+/// Lowercase hex-encode a byte slice.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// JSON-encode a string as a quoted, escaped literal. File names and paths are
+/// arbitrary bytes, so the escaping is not optional.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// JSON-encode a finite float; a non-finite value degrades to `0` rather than
+/// emitting invalid JSON (`NaN`/`Infinity`).
+fn json_num(n: f64) -> String {
+    if n.is_finite() {
+        format!("{n}")
+    } else {
+        "0".to_string()
+    }
 }
 
 /// Constant-time equality so token checking leaks no timing signal.
