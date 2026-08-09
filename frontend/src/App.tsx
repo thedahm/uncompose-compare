@@ -64,6 +64,8 @@ interface SessionMeta {
   duration_mismatch: boolean;
   duration_delta_samples: number;
   duration_delta_ms: number;
+  sample_rate_mismatch: boolean;
+  channel_count_mismatch: boolean;
 }
 
 /** Waveform/loudness envelope resolution — enough detail without paint cost. */
@@ -436,6 +438,20 @@ export function App() {
         <p role="alert" data-testid="duration-mismatch" style={{ color: "#ffcf6b" }}>
           Duration mismatch: the candidates differ by {session.duration_delta_samples}{" "}
           samples ({session.duration_delta_ms.toFixed(1)} ms). Both still load.
+        </p>
+      )}
+
+      {session?.sample_rate_mismatch && (
+        <p role="alert" data-testid="sample-rate-mismatch" style={{ color: "#ffcf6b" }}>
+          Sample-rate mismatch: A is {session.candidates[0].sample_rate} Hz, B is{" "}
+          {session.candidates[1].sample_rate} Hz. Both still load.
+        </p>
+      )}
+
+      {session?.channel_count_mismatch && (
+        <p role="alert" data-testid="channel-count-mismatch" style={{ color: "#ffcf6b" }}>
+          Channel-count mismatch: A has {session.candidates[0].channels}, B has{" "}
+          {session.candidates[1].channels}. Both still load.
         </p>
       )}
 
