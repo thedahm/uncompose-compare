@@ -17,6 +17,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import {
+  clampFraction,
   clampPosition,
   orderedRegion,
   type CandidateViews,
@@ -168,7 +169,7 @@ export function Waveform({
   const fracFromEvent = (e: React.PointerEvent<HTMLDivElement>): number => {
     const rect = e.currentTarget.getBoundingClientRect();
     if (rect.width === 0) return 0;
-    return clampPosition((e.clientX - rect.left) / rect.width, 1);
+    return clampFraction((e.clientX - rect.left) / rect.width);
   };
 
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {

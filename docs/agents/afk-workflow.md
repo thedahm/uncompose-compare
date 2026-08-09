@@ -4,20 +4,20 @@
 without a human at the keyboard. Wayfinder remains the planning flow; Sandcastle only
 executes fully specified tickets.
 
-## Shape
+What the loop actually does — its phases, models, and defaults — is described where it is
+implemented, in `.sandcastle/main.mts`. This file records the choices around it.
 
-- **Provider**: Docker. `.sandcastle/Dockerfile` documents the contributor toolchain
-  (stable Rust + Node 22 + Python/maturin). Worktrees warm `node_modules`,
-  `frontend/node_modules`, and `target` so each cycle starts with caches primed.
-- **Tracker**: GitHub Issues, filtered to the `ready-for-agent` label
-  (`docs/agents/triage-labels.md`).
-- **Template**: spec-delivery loop (`.sandcastle/main.mts`), ported from
-  `uncompose-project`'s M2. It picks the next open sub-issue of a spec, claims it by
-  assignment at pickup, implements on a named `sandcastle/issue-<n>` branch, and opens a
-  per-sub-issue PR that is merged via `gh pr merge --merge`. Once the sub-issue API reports
-  the spec's children complete, it finalizes: a spec PR against `main`, a Fable-5 review
-  comment, and an Opus-5 address round. A configurable `MAX_PARALLEL` cap (default 2)
-  bounds concurrent issue work. The agent does not close the parent spec; a human does.
+## Choices
+
+- **Provider: Docker**, not a hosted sandbox. `.sandcastle/Dockerfile` doubles as the
+  contributor toolchain record (stable Rust + Node 22 + Python/maturin), so the thing
+  agents build in is the thing a human can reproduce.
+- **Tracker: GitHub Issues**, filtered to `ready-for-agent` (`docs/agents/triage-labels.md`)
+  — the same queue a human works, not a parallel one.
+- **Branch per sub-issue, PR per sub-issue.** Every unit of agent work leaves a paper
+  trail that can be read and reverted on its own.
+- **Humans merge the spec PR and close the parent spec.** The loop opens and reviews; the
+  decision to ship stays with a person.
 
 The root `package.json` exists only to host this workflow's dependencies; the shipped
 product is the Rust binary plus its embedded `frontend/`.

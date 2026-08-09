@@ -10,11 +10,16 @@
  * that never shifts the playback position. `●` marks the live lane.
  *
  * Transport keymap (confirmed #61): `space` play/stop, `x` switch, `←`/`→` or
- * `-`/`=` step 2 s, `home` rewind, click-to-seek on any waveform, a "stop
- * returns" toggle (default: resume), and `?` toggling the help modal. Bare keys
- * only, except `ctrl+z` / `ctrl+shift+z` for ledger undo/redo (issue #15). The
- * SRC lane and stems section are kept as empty structural slots so M4/M5 add
+ * `-`/`=` step 2 s, `home` (or `0`) rewind, click-to-seek on any waveform, a
+ * "stop returns" toggle (default: resume), and `?` toggling the help modal. Bare
+ * keys only, except `ctrl+z` / `ctrl+shift+z` for ledger undo/redo (issue #15).
+ * The SRC lane and stems section are kept as empty structural slots so M4/M5 add
  * rows rather than redesign.
+ *
+ * This file is the shell: state, the transport wiring, and the stage. The parts
+ * that stand alone live beside it — the ledger (`Ledger.tsx`), the verdict modal
+ * (`VerdictModal.tsx`), the help modal (`HelpModal.tsx`) — over the pure logic in
+ * `transport.ts` / `ledger.ts` / `record.ts` and the audio graph in `engine.ts`.
  *
  * The `/session` fetch, the "uncompose-compare" marker, and the duration-mismatch
  * warning (issue #10) survive; the `window.__uncomposeSync` harness seam lives in
@@ -23,6 +28,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PlaybackEngine } from "./engine";
 import { Waveform, type Pin } from "./Waveform";
+import { HelpModal } from "./HelpModal";
+import { LedgerSection } from "./Ledger";
+import { Stars } from "./ConfidenceStars";
+import { canSave, emptyVerdict, VerdictModal } from "./VerdictModal";
 import {
   computeLoudness,
   computePeaks,
@@ -34,21 +43,8 @@ import {
   type Region,
   type ViewMode,
 } from "./transport";
-import {
-  addObservation,
-  canRedo,
-  canUndo,
-  caretGlyph,
-  deleteObservation,
-  editObservation,
-  emptyLedger,
-  makeObservation,
-  redo,
-  undo,
-  type Ledger,
-  type Target,
-} from "./ledger";
-import { buildRecordPayload, confidenceTier, type Verdict } from "./record";
+import { addObservation, emptyLedger, makeObservation, redo, undo, type Ledger, type Target } from "./ledger";
+import { buildRecordPayload, type Verdict } from "./record";
 
 interface Candidate {
   label: string;
@@ -89,21 +85,14 @@ function candidateColor(label: Label): string {
   return label === "A" ? "#4ea1ff" : "#ff8f4e";
 }
 
-/** The confidence-tier colors (red 1-2, amber 3, green 4-5) — confirmed #61. */
-const TIER_COLOR = { low: "#ff5c5c", mid: "#ffcf6b", high: "#5cd67a" } as const;
-
-/** A read-only five-star string (filled up to `confidence`). */
-function starString(confidence: number): string {
-  return "★".repeat(confidence) + "☆".repeat(5 - confidence);
+/**
+ * The engraved verdict: what Save committed, and the only thing conclude ever
+ * writes. Null until the first save.
+ */
+interface SavedVerdict {
+  verdict: Verdict;
+  context: string;
 }
-
-/** The verdict a fresh session starts with: undecided, nothing engraved. */
-const emptyVerdict: Verdict = {
-  preference: null,
-  confidence: null,
-  criterion: "",
-  summary: "",
-};
 
 /**
  * Compute all three views of a decoded channel once (issue #14). The waveform,
@@ -139,17 +128,15 @@ export function App() {
   const [composer, setComposer] = useState("");
   // The highlighted pin — two-way between a caret and its ledger row.
   const [activePin, setActivePin] = useState<string | null>(null);
-  // The ledger entry whose text is being edited in place (null when none).
-  const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
 
-  // The verdict (issue #16): a preferred candidate (or "no preference"), color-
-  // coded confidence, and optional criterion/summary + free-text session context.
-  // Save engraves it (`verdictSaved`) but everything stays editable until the
-  // session is concluded (and the record is written) — reopening the modal edits.
-  const [verdict, setVerdict] = useState<Verdict>(emptyVerdict);
-  const [context, setContext] = useState("");
+  // The verdict (issue #16). `saved` is the engraved one — what Save committed
+  // and what conclude writes. `draft`/`draftContext` are what the open modal is
+  // editing; closing without saving throws them away. Saving does not finalize:
+  // reopening seeds a fresh draft from `saved`, right up until conclude.
+  const [saved, setSaved] = useState<SavedVerdict | null>(null);
+  const [draft, setDraft] = useState<Verdict>(emptyVerdict);
+  const [draftContext, setDraftContext] = useState("");
   const [verdictOpen, setVerdictOpen] = useState(false);
-  const [verdictSaved, setVerdictSaved] = useState(false);
   // The conclude outcome: where the record landed, or why the write was refused.
   const [concludeResult, setConcludeResult] = useState<{ path?: string; error?: string } | null>(
     null,
@@ -248,9 +235,20 @@ export function App() {
     [withEngine],
   );
 
-  const togglePlay = () => withEngine((eng) => eng.togglePlay(stopReturns));
-  const toggleLoop = () => withEngine((eng) => eng.toggleLoop());
-  const clearRegion = () => withEngine((eng) => eng.clearRegion());
+  // The transport actions, shared by the buttons and the keymap so the two can
+  // never drift apart.
+  const togglePlay = useCallback(
+    () => withEngine((eng) => eng.togglePlay(stopReturns)),
+    [withEngine, stopReturns],
+  );
+  const toggleSwitch = useCallback(() => withEngine((eng) => eng.toggleSwitch()), [withEngine]);
+  const toggleLoop = useCallback(() => withEngine((eng) => eng.toggleLoop()), [withEngine]);
+  const clearRegion = useCallback(() => withEngine((eng) => eng.clearRegion()), [withEngine]);
+  const rewind = useCallback(() => withEngine((eng) => eng.rewind()), [withEngine]);
+  const step = useCallback(
+    (delta: number) => withEngine((eng) => eng.step(delta)),
+    [withEngine],
+  );
 
   const selectRegion = useCallback(
     (a: number, b: number) => withEngine((eng) => eng.setRegion(a, b)),
@@ -303,35 +301,31 @@ export function App() {
     [seek],
   );
 
-  // Commit the in-place ledger edit (enter or blur both land here).
-  const commitEdit = () => {
-    if (!editing) return;
-    const { id, text } = editing;
-    setLedger((l) => editObservation(l, id, text));
-    setEditing(null);
+  // Open the modal on a fresh draft of whatever is currently engraved, so an
+  // abandoned edit can never change what conclude writes.
+  const openVerdict = () => {
+    setDraft(saved?.verdict ?? emptyVerdict);
+    setDraftContext(saved?.context ?? "");
+    setVerdictOpen(true);
   };
 
-  // A verdict is savable once a decision is made: a chosen candidate needs a
-  // confidence (the schema requires it), while "no preference" needs nothing.
-  const preferenceChosen = verdict.preference === "A" || verdict.preference === "B";
-  const canSaveVerdict =
-    verdict.preference !== null && (!preferenceChosen || verdict.confidence !== null);
-
-  // Save engraves the verdict but never finalizes it: everything stays editable
+  // Save engraves the draft but never finalizes it: everything stays editable
   // until conclude writes the record (#61).
   const saveVerdict = () => {
-    if (!canSaveVerdict) return;
-    setVerdictSaved(true);
+    if (!canSave(draft)) return;
+    setSaved({ verdict: draft, context: draftContext });
     setVerdictOpen(false);
   };
 
-  // Conclude the session: build the session-authored record payload and POST it.
-  // The server assembles the rest, validates against the owned schema, and writes
-  // the immutable record exactly once, reporting where it landed (issue #16).
+  // Conclude the session: build the session-authored record payload from the
+  // *saved* verdict and POST it. The server assembles the rest, validates against
+  // the owned schema, and writes the immutable record exactly once, reporting
+  // where it landed (issue #16).
   const conclude = useCallback(async () => {
+    if (!saved) return;
     const payload = buildRecordPayload({
-      verdict,
-      context,
+      verdict: saved.verdict,
+      context: saved.context,
       observations: ledger.observations,
       region,
     });
@@ -348,7 +342,7 @@ export function App() {
     } catch (e) {
       setConcludeResult({ error: String(e) });
     }
-  }, [verdict, context, ledger.observations, region]);
+  }, [saved, ledger.observations, region]);
 
   // Keyboard transport: bare keys for the transport and pins, ctrl+z /
   // ctrl+shift+z for ledger undo/redo, and none of it while typing into the
@@ -375,33 +369,34 @@ export function App() {
       switch (e.key) {
         case " ":
           e.preventDefault();
-          withEngine((eng) => eng.togglePlay(stopReturns));
+          togglePlay();
           break;
         case "x":
         case "X":
-          withEngine((eng) => eng.toggleSwitch());
+          toggleSwitch();
           break;
         case "ArrowLeft":
         case "-":
           e.preventDefault();
-          withEngine((eng) => eng.step(-STEP_SECONDS));
+          step(-STEP_SECONDS);
           break;
         case "ArrowRight":
         case "=":
           e.preventDefault();
-          withEngine((eng) => eng.step(STEP_SECONDS));
+          step(STEP_SECONDS);
           break;
         case "Home":
+        case "0":
           e.preventDefault();
-          withEngine((eng) => eng.rewind());
+          rewind();
           break;
         case "r":
         case "R":
-          withEngine((eng) => eng.toggleLoop());
+          toggleLoop();
           break;
         case "u":
         case "U":
-          withEngine((eng) => eng.clearRegion());
+          clearRegion();
           break;
         case "Enter":
           // Pin on the live candidate (both with shift) without interrupting
@@ -424,7 +419,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [stopReturns, withEngine, pin, live]);
+  }, [togglePlay, toggleSwitch, toggleLoop, clearRegion, rewind, step, pin, live]);
 
   // Only positioned observations get a caret on the stage waveform.
   const pins: Pin[] = ledger.observations.flatMap((o) =>
@@ -505,7 +500,7 @@ export function App() {
               <button data-testid="switch" onClick={() => switchTo(otherLabel(live))}>
                 Switch (x)
               </button>
-              <button data-testid="rewind" onClick={() => seek(0)}>
+              <button data-testid="rewind" onClick={rewind}>
                 Rewind
               </button>
               <button data-testid="loop-toggle" disabled={!region} onClick={toggleLoop}>
@@ -562,25 +557,18 @@ export function App() {
                   {/* Clicking the label auditions; dragging the waveform selects a
                       region, while a plain click on it also auditions (onActivate). */}
                   <span style={{ width: 90, cursor: "pointer" }} onClick={() => switchTo(label)}>
-                    <span data-testid={`live-marker-${label}`}>{isLive ? "● " : "  "}</span>
+                    <span data-testid={`live-marker-${label}`}>{isLive ? "● " : "  "}</span>
                     <strong>{label}</strong> {c.name}
                   </span>
-                  {/* The saved verdict shows its color-coded confidence stars on
+                  {/* The saved verdict shows its colour-coded confidence stars on
                       the preferred lane row (issue #16). */}
-                  {verdictSaved &&
-                    verdict.preference === label &&
-                    verdict.confidence !== null && (
-                      <span
-                        data-testid={`verdict-stars-${label}`}
-                        title={`Preferred — confidence ${verdict.confidence}/5`}
-                        style={{
-                          color: TIER_COLOR[confidenceTier(verdict.confidence)],
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {starString(verdict.confidence)}
-                      </span>
-                    )}
+                  {saved?.verdict.preference === label && saved.verdict.confidence !== null && (
+                    <Stars
+                      confidence={saved.verdict.confidence}
+                      testid={`verdict-stars-${label}`}
+                      title={`Preferred — confidence ${saved.verdict.confidence}/5`}
+                    />
+                  )}
                   <div style={{ flex: 1 }}>
                     <Waveform
                       views={views[label]}
@@ -605,143 +593,40 @@ export function App() {
           {/* Stems section: an empty structural slot (project mode, M5). */}
           <div data-testid="stems-slot" aria-hidden="true" />
 
-          {/* Observation ledger (issue #15): composer + chronological entries. */}
-          <section data-testid="ledger" style={{ marginTop: 16 }}>
-            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
-              <h2 style={{ fontSize: 15, margin: 0 }}>Observations</h2>
-              <button
-                data-testid="ledger-undo"
-                disabled={!canUndo(ledger)}
-                onClick={() => setLedger(undo)}
-              >
-                Undo (⌃z)
-              </button>
-              <button
-                data-testid="ledger-redo"
-                disabled={!canRedo(ledger)}
-                onClick={() => setLedger(redo)}
-              >
-                Redo (⌃⇧z)
-              </button>
-            </div>
-            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-              <input
-                ref={composerRef}
-                data-testid="composer"
-                value={composer}
-                placeholder="Note what you hear… (enter: live, shift+enter: both)"
-                onChange={(e) => setComposer(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    submitComposer(e.shiftKey);
-                  }
-                }}
-                style={{ flex: 1, padding: 4 }}
-              />
-              <button data-testid="composer-pin" onClick={() => submitComposer(false)}>
-                Pin ({live})
-              </button>
-            </div>
-            {ledger.observations.length === 0 ? (
-              <p data-testid="ledger-empty" style={{ color: "#888" }}>
-                No observations yet — press <kbd>enter</kbd> to pin one.
-              </p>
-            ) : (
-              <ol data-testid="ledger-entries" style={{ listStyle: "none", padding: 0, margin: 0 }}>
-                {ledger.observations.map((o) => {
-                  const active = activePin === o.id;
-                  return (
-                    <li
-                      key={o.id}
-                      data-testid={`ledger-entry-${o.id}`}
-                      data-active={String(active)}
-                      onMouseEnter={() => setActivePin(o.id)}
-                      onMouseLeave={() => setActivePin(null)}
-                      style={{
-                        display: "flex",
-                        gap: 8,
-                        alignItems: "center",
-                        padding: 4,
-                        background: active ? "#1d2a1d" : "transparent",
-                      }}
-                    >
-                      <button
-                        data-testid={`ledger-seek-${o.id}`}
-                        title="Seek to this observation"
-                        onClick={() => seekToObservation(o.id, o.position)}
-                        style={{ fontVariantNumeric: "tabular-nums" }}
-                      >
-                        <span data-testid={`ledger-caret-${o.id}`}>{caretGlyph(o.candidate)}</span>{" "}
-                        {o.position === null ? "—" : formatTime(o.position)}
-                        {o.loop !== null ? " ⟳" : ""}
-                      </button>
-                      {editing?.id === o.id ? (
-                        <input
-                          data-testid={`ledger-text-input-${o.id}`}
-                          autoFocus
-                          value={editing.text}
-                          onChange={(e) => setEditing({ id: o.id, text: e.target.value })}
-                          onBlur={commitEdit}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") {
-                              e.preventDefault();
-                              commitEdit();
-                            } else if (e.key === "Escape") {
-                              e.preventDefault();
-                              setEditing(null);
-                            }
-                          }}
-                          style={{ flex: 1, padding: 2 }}
-                        />
-                      ) : (
-                        <span
-                          data-testid={`ledger-text-${o.id}`}
-                          onClick={() => setEditing({ id: o.id, text: o.text })}
-                          style={{ flex: 1, cursor: "text", color: o.text ? "#eee" : "#888" }}
-                        >
-                          {o.text || "(click to add a note)"}
-                        </span>
-                      )}
-                      <button
-                        data-testid={`ledger-delete-${o.id}`}
-                        title="Delete this observation"
-                        onClick={() => setLedger((l) => deleteObservation(l, o.id))}
-                      >
-                        ✕
-                      </button>
-                    </li>
-                  );
-                })}
-              </ol>
-            )}
-          </section>
+          <LedgerSection
+            ledger={ledger}
+            setLedger={setLedger}
+            composer={composer}
+            setComposer={setComposer}
+            submitComposer={submitComposer}
+            composerRef={composerRef}
+            live={live}
+            activePin={activePin}
+            setActivePin={setActivePin}
+            onSeek={seekToObservation}
+          />
 
           {/* Verdict & conclude (issue #16): decide a preference (or no
               preference), then write the immutable comparison record. */}
           <section data-testid="verdict" style={{ marginTop: 16 }}>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <h2 style={{ fontSize: 15, margin: 0 }}>Verdict</h2>
-              <button data-testid="open-verdict" onClick={() => setVerdictOpen(true)}>
-                {verdictSaved ? "Edit verdict…" : "Set verdict…"}
+              <button data-testid="open-verdict" onClick={openVerdict}>
+                {saved ? "Edit verdict…" : "Set verdict…"}
               </button>
-              {verdictSaved && (
+              {saved && (
                 <span data-testid="verdict-summary" style={{ color: "#bbb" }}>
-                  {verdict.preference === "none" ? (
+                  {saved.verdict.preference === "none" ? (
                     "No preference"
                   ) : (
                     <>
-                      Prefers <strong>{verdict.preference}</strong>
-                      {verdict.confidence !== null && (
-                        <span
-                          data-testid="verdict-summary-stars"
-                          style={{
-                            marginLeft: 6,
-                            color: TIER_COLOR[confidenceTier(verdict.confidence)],
-                          }}
-                        >
-                          {starString(verdict.confidence)}
-                        </span>
+                      Prefers <strong>{saved.verdict.preference}</strong>
+                      {saved.verdict.confidence !== null && (
+                        <Stars
+                          confidence={saved.verdict.confidence}
+                          testid="verdict-summary-stars"
+                          style={{ marginLeft: 6 }}
+                        />
                       )}
                     </>
                   )}
@@ -750,13 +635,9 @@ export function App() {
               <button
                 data-testid="conclude"
                 style={{ marginLeft: "auto" }}
-                disabled={!verdictSaved || !!concludeResult?.path}
+                disabled={!saved || !!concludeResult?.path}
                 onClick={conclude}
-                title={
-                  verdictSaved
-                    ? "Write the comparison record"
-                    : "Save a verdict before concluding"
-                }
+                title={saved ? "Write the comparison record" : "Save a verdict before concluding"}
               >
                 Conclude &amp; write record
               </button>
@@ -776,202 +657,17 @@ export function App() {
       )}
 
       {verdictOpen && (
-        <div
-          data-testid="verdict-modal"
-          role="dialog"
-          aria-label="Verdict"
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.8)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-          onClick={() => setVerdictOpen(false)}
-        >
-          <div
-            style={{ background: "#161616", padding: 24, maxWidth: 460, width: "90%" }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 style={{ marginTop: 0 }}>Verdict</h2>
-
-            {/* Prefer buttons select without closing the modal (#61). */}
-            <div role="group" aria-label="Preference" style={{ display: "flex", gap: 8 }}>
-              {(["A", "B", "none"] as const).map((choice) => (
-                <button
-                  key={choice}
-                  data-testid={`prefer-${choice}`}
-                  aria-pressed={verdict.preference === choice}
-                  onClick={() => setVerdict((v) => ({ ...v, preference: choice }))}
-                  style={{
-                    padding: "6px 12px",
-                    fontWeight: verdict.preference === choice ? "bold" : "normal",
-                    outline:
-                      verdict.preference === choice ? "2px solid #5cd67a" : "1px solid #444",
-                  }}
-                >
-                  {choice === "none" ? "No preference" : `Prefer ${choice}`}
-                </button>
-              ))}
-            </div>
-
-            {/* Confidence stars: required when a candidate is preferred, color
-                coded red 1-2 / amber 3 / green 4-5, and hidden for no-preference. */}
-            {preferenceChosen && (
-              <div style={{ marginTop: 12 }}>
-                <label style={{ display: "block", marginBottom: 4 }}>
-                  Confidence{" "}
-                  <span style={{ color: "#888" }}>(required)</span>
-                </label>
-                <div data-testid="confidence-stars" role="group" aria-label="Confidence">
-                  {[1, 2, 3, 4, 5].map((n) => {
-                    const filled = verdict.confidence !== null && n <= verdict.confidence;
-                    const color =
-                      verdict.confidence !== null
-                        ? TIER_COLOR[confidenceTier(verdict.confidence)]
-                        : "#888";
-                    return (
-                      <button
-                        key={n}
-                        data-testid={`confidence-${n}`}
-                        aria-pressed={filled}
-                        title={`${n} of 5`}
-                        onClick={() => setVerdict((v) => ({ ...v, confidence: n }))}
-                        style={{
-                          background: "none",
-                          border: "none",
-                          cursor: "pointer",
-                          fontSize: 22,
-                          color: filled ? color : "#555",
-                        }}
-                      >
-                        {filled ? "★" : "☆"}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            <label style={{ display: "block", marginTop: 12 }}>
-              Criterion <span style={{ color: "#888" }}>(optional)</span>
-              <input
-                data-testid="verdict-criterion"
-                value={verdict.criterion}
-                placeholder="What you judged on (e.g. clarity)"
-                onChange={(e) => setVerdict((v) => ({ ...v, criterion: e.target.value }))}
-                style={{ display: "block", width: "100%", padding: 4, marginTop: 4 }}
-              />
-            </label>
-            <label style={{ display: "block", marginTop: 12 }}>
-              Summary <span style={{ color: "#888" }}>(optional)</span>
-              <input
-                data-testid="verdict-summary-input"
-                value={verdict.summary}
-                placeholder="A one-line summary of the decision"
-                onChange={(e) => setVerdict((v) => ({ ...v, summary: e.target.value }))}
-                style={{ display: "block", width: "100%", padding: 4, marginTop: 4 }}
-              />
-            </label>
-            <label style={{ display: "block", marginTop: 12 }}>
-              Session context <span style={{ color: "#888" }}>(optional)</span>
-              <input
-                data-testid="verdict-context"
-                value={context}
-                placeholder="Why you were comparing these files"
-                onChange={(e) => setContext(e.target.value)}
-                style={{ display: "block", width: "100%", padding: 4, marginTop: 4 }}
-              />
-            </label>
-
-            <div style={{ display: "flex", gap: 8, marginTop: 16, alignItems: "center" }}>
-              <button data-testid="save-verdict" disabled={!canSaveVerdict} onClick={saveVerdict}>
-                Save verdict
-              </button>
-              <button data-testid="cancel-verdict" onClick={() => setVerdictOpen(false)}>
-                Close
-              </button>
-              {preferenceChosen && verdict.confidence === null && (
-                <span style={{ color: "#ffcf6b" }}>Pick a confidence to save.</span>
-              )}
-            </div>
-          </div>
-        </div>
+        <VerdictModal
+          verdict={draft}
+          onChange={setDraft}
+          context={draftContext}
+          onContextChange={setDraftContext}
+          onSave={saveVerdict}
+          onClose={() => setVerdictOpen(false)}
+        />
       )}
 
-      {helpOpen && (
-        <div
-          data-testid="help-modal"
-          role="dialog"
-          aria-label="Keyboard help"
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.8)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-          onClick={() => setHelpOpen(false)}
-        >
-          <div
-            style={{ background: "#161616", padding: 24, maxWidth: 420 }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 style={{ marginTop: 0 }}>Keyboard</h2>
-            <section>
-              <h3>Transport</h3>
-              <ul>
-                <li><kbd>space</kbd> — play / stop</li>
-                <li><kbd>x</kbd> — switch audible candidate</li>
-                <li><kbd>←</kbd> / <kbd>→</kbd> or <kbd>-</kbd> / <kbd>=</kbd> — step 2 s</li>
-                <li><kbd>home</kbd> — rewind to start</li>
-                <li>click a waveform — seek</li>
-              </ul>
-            </section>
-            <section>
-              <h3>Region &amp; loop</h3>
-              <ul>
-                <li>drag a waveform — select a region</li>
-                <li><kbd>r</kbd> — loop the region (plays into it, then loops)</li>
-                <li><kbd>u</kbd> — clear the region</li>
-              </ul>
-            </section>
-            <section>
-              <h3>Views</h3>
-              <ul>
-                <li>Waveform / Loudness / Spectral toggle — switches every display</li>
-              </ul>
-            </section>
-            <section>
-              <h3>Observations &amp; ledger</h3>
-              <ul>
-                <li><kbd>enter</kbd> — pin an observation on the live candidate</li>
-                <li><kbd>shift</kbd>+<kbd>enter</kbd> — pin on both candidates</li>
-                <li><kbd>tab</kbd> — focus the composer to write a note</li>
-                <li>click a timestamp — seek; click text — edit; ✕ — delete</li>
-                <li><kbd>ctrl</kbd>+<kbd>z</kbd> / <kbd>ctrl</kbd>+<kbd>shift</kbd>+<kbd>z</kbd> — undo / redo</li>
-              </ul>
-            </section>
-            <section>
-              <h3>Verdict &amp; conclude</h3>
-              <ul>
-                <li>Set verdict — prefer A, B, or no preference; stars set confidence</li>
-                <li>Save engraves the verdict but keeps it editable</li>
-                <li>Conclude — write the immutable comparison record</li>
-              </ul>
-            </section>
-            <section>
-              <h3>Help</h3>
-              <ul>
-                <li><kbd>?</kbd> — toggle this help</li>
-              </ul>
-            </section>
-            <button onClick={() => setHelpOpen(false)}>Close</button>
-          </div>
-        </div>
-      )}
+      {helpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}
     </main>
   );
 }

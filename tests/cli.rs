@@ -19,8 +19,16 @@
 //! least-recently-accessed proxy at startup; and that `cache clear` empties the
 //! cache and reports what it did.
 //!
+//! Issue #16 adds the comparison record: `/record` assembles, validates against
+//! the in-repo v0 schema, and writes it exactly once — refusing a second
+//! conclude, an existing destination, and any body outside the v0 contract
+//! (more than one loop region, unknown plain fields, a candidate reference the
+//! session never loaded).
+//!
 //! Fixtures are deterministic seeded noise written as WAV at test time (per #73
 //! — never committed audio), at whatever bit depth / channel count a case needs.
+//! Every launch runs against a throwaway `XDG_CACHE_HOME`, so the suite never
+//! writes proxies into — or prunes — the developer's real cache.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -60,50 +68,49 @@ impl Drop for TempDir {
 }
 
 /// Write a 16-bit PCM WAV of `frames` sample-frames at `sample_rate`/`channels`,
-/// filled with deterministic seeded noise. Returns the byte length written.
+/// filled with deterministic seeded noise — the default fixture shape. Returns
+/// the byte length written.
 fn write_wav(path: &Path, frames: u32, sample_rate: u32, channels: u16, seed: u32) -> u64 {
-    let bits = 16u16;
-    let block_align = channels * bits / 8;
-    let byte_rate = sample_rate * block_align as u32;
-    let data_len = frames * block_align as u32;
+    write_wav_fmt(path, frames, sample_rate, channels, 16, false, seed);
+    std::fs::metadata(path).expect("wav fixture written").len()
+}
 
-    let mut buf = Vec::with_capacity(44 + data_len as usize);
+/// The RIFF/WAVE framing every fixture shares: `RIFF` + size + `WAVE`, the
+/// caller's `fmt ` chunk body (plain or EXTENSIBLE), then the `data` header.
+/// Sample bytes are appended by the caller.
+fn riff_wave(fmt_body: &[u8], data_len: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20 + fmt_body.len() + data_len as usize);
     buf.extend_from_slice(b"RIFF");
-    buf.extend_from_slice(&(36 + data_len).to_le_bytes());
+    // Everything after this field: "WAVE" + the fmt chunk + the data chunk.
+    buf.extend_from_slice(&(4 + 8 + fmt_body.len() as u32 + 8 + data_len).to_le_bytes());
     buf.extend_from_slice(b"WAVE");
     buf.extend_from_slice(b"fmt ");
-    buf.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
-    buf.extend_from_slice(&1u16.to_le_bytes()); // audio format = PCM
-    buf.extend_from_slice(&channels.to_le_bytes());
-    buf.extend_from_slice(&sample_rate.to_le_bytes());
-    buf.extend_from_slice(&byte_rate.to_le_bytes());
-    buf.extend_from_slice(&block_align.to_le_bytes());
-    buf.extend_from_slice(&bits.to_le_bytes());
+    buf.extend_from_slice(&(fmt_body.len() as u32).to_le_bytes());
+    buf.extend_from_slice(fmt_body);
     buf.extend_from_slice(b"data");
     buf.extend_from_slice(&data_len.to_le_bytes());
+    buf
+}
 
-    // A trivial LCG keeps the noise deterministic without a dependency.
+/// A trivial LCG: deterministic fixture noise without a dependency.
+fn noise(seed: u32) -> impl FnMut() -> u32 {
     let mut state = seed.wrapping_add(1);
-    for _ in 0..frames {
-        for _ in 0..channels {
-            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-            let sample = (state >> 16) as i16;
-            buf.extend_from_slice(&sample.to_le_bytes());
-        }
+    move || {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        state
     }
-
-    std::fs::write(path, &buf).expect("write wav fixture");
-    buf.len() as u64
 }
 
 /// A launched server plus the loopback address and session token it printed.
 /// Killed on drop so a failing assertion never leaks a process. Holds the
-/// fixture dir so the files outlive the server.
+/// fixture dir (so the files outlive the server) and, unless the test pinned its
+/// own, the throwaway proxy cache this run used.
 struct Serving {
     child: Child,
     addr: String,
     token: String,
     _fixtures: TempDir,
+    _cache: Option<TempDir>,
 }
 
 impl Drop for Serving {
@@ -139,15 +146,32 @@ fn launch_opts(
 ) -> Serving {
     let mut command = Command::new(BIN);
     command.arg(a).arg(b).args(extra);
-    if let Some(home) = cache_home {
-        command.env("XDG_CACHE_HOME", home);
-    }
-    serving_from(command, dir)
+    serving_with_cache(command, dir, cache_home)
 }
 
 /// Launch the binary with a caller-built command (so record tests can set the
 /// invoking directory and `--out`), parsing the tokened URL line it prints.
-fn serving_from(mut command: Command, dir: TempDir) -> Serving {
+fn serving_from(command: Command, dir: TempDir) -> Serving {
+    serving_with_cache(command, dir, None)
+}
+
+/// As `serving_from`, isolating the proxy cache: a test that pins its own
+/// `XDG_CACHE_HOME` (the cache-behavior tests, which need two runs to share one
+/// cache) gets that; every other launch gets a throwaway cache dropped with the
+/// server. No test ever reads or prunes the developer's real `~/.cache`.
+fn serving_with_cache(mut command: Command, dir: TempDir, cache_home: Option<&Path>) -> Serving {
+    let owned_cache = match cache_home {
+        Some(home) => {
+            command.env("XDG_CACHE_HOME", home);
+            None
+        }
+        None => {
+            let cache = TempDir::new("cache");
+            command.env("XDG_CACHE_HOME", &cache.path);
+            Some(cache)
+        }
+    };
+
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -186,6 +210,7 @@ fn serving_from(mut command: Command, dir: TempDir) -> Serving {
         addr,
         token,
         _fixtures: dir,
+        _cache: owned_cache,
     }
 }
 
@@ -370,11 +395,21 @@ fn missing_token_is_refused() {
 #[test]
 fn wrong_token_is_refused() {
     let server = launch();
-    let (status, _, _) = http_get(&server.addr, "/?token=deadbeefdeadbeefdeadbeefdeadbeef");
-    assert_eq!(
-        status, 403,
-        "a request with the wrong token must be refused"
+    let hash = first_sha256(&session_json(&server));
+    let wrong = "deadbeefdeadbeefdeadbeefdeadbeef";
+
+    // Every endpoint, not just the page: presenting a wrong token is refused
+    // exactly like presenting none.
+    for path in ["/", "/session", &format!("/audio/{hash}")] {
+        let (status, _, _) = http_get(&server.addr, &format!("{path}?token={wrong}"));
+        assert_eq!(status, 403, "a wrong token must be refused at {path}");
+    }
+    let (status, _, _) = http_post(
+        &server,
+        &format!("/record?token={wrong}"),
+        r#"{"result": {"preference": null}, "observations": [], "loops": []}"#,
     );
+    assert_eq!(status, 403, "a wrong token must be refused at /record");
 }
 
 #[test]
@@ -427,6 +462,56 @@ fn help_flag_exits_zero() {
     assert!(
         text.contains("uncompose-compare"),
         "--help should name the command, got: {text}"
+    );
+}
+
+/// A port the OS just handed out and immediately released — free to bind, with
+/// the usual (accepted) race of any "find a free port" helper.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("probe a free port")
+        .local_addr()
+        .expect("probe address")
+        .port()
+}
+
+#[test]
+fn port_flag_pins_the_port() {
+    let port = free_port();
+    let dir = TempDir::new("port");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    write_wav(&a, 4_410, 44_100, 1, 61);
+    write_wav(&b, 4_410, 44_100, 1, 62);
+    let server = launch_opts(dir, &a, &b, None, &["--port", &port.to_string()]);
+
+    assert_eq!(
+        server.addr,
+        format!("127.0.0.1:{port}"),
+        "--port must pin the port the printed URL carries"
+    );
+    // …and the pinned port is really the one serving.
+    let _ = session_json(&server);
+}
+
+#[test]
+fn unbindable_port_is_a_clear_error() {
+    // Hold the port for the duration of the run so the bind cannot succeed.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let port = held.local_addr().unwrap().port().to_string();
+
+    let dir = TempDir::new("port-taken");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    write_wav(&a, 4_410, 44_100, 1, 63);
+    write_wav(&b, 4_410, 44_100, 1, 64);
+
+    let (code, stderr) =
+        run_expecting_failure(&[a.to_str().unwrap(), b.to_str().unwrap(), "--port", &port]);
+    assert_eq!(code, Some(1), "an unbindable port exits 1");
+    assert!(
+        stderr.contains("cannot bind") && stderr.contains(&port),
+        "the failure should name the port it could not bind: {stderr}"
     );
 }
 
@@ -558,7 +643,14 @@ fn session_endpoint_refuses_bad_host() {
 /// The distinct exit + message a bad invocation must produce. Returns
 /// (exit code, stderr).
 fn run_expecting_failure(args: &[&str]) -> (Option<i32>, String) {
-    let out = Command::new(BIN).args(args).output().expect("spawn binary");
+    // A throwaway cache: even a run that fails on its arguments creates the
+    // cache directory, and that must never be the developer's real one.
+    let cache = TempDir::new("fail-cache");
+    let out = Command::new(BIN)
+        .args(args)
+        .env("XDG_CACHE_HOME", &cache.path)
+        .output()
+        .expect("spawn binary");
     assert!(
         !out.status.success(),
         "expected a non-zero exit for args {args:?}"
@@ -662,26 +754,16 @@ fn write_wav_fmt(
     let byte_rate = sample_rate * block_align as u32;
     let data_len = frames * block_align as u32;
 
-    let mut buf = Vec::with_capacity(44 + data_len as usize);
-    buf.extend_from_slice(b"RIFF");
-    buf.extend_from_slice(&(36 + data_len).to_le_bytes());
-    buf.extend_from_slice(b"WAVE");
-    buf.extend_from_slice(b"fmt ");
-    buf.extend_from_slice(&16u32.to_le_bytes());
-    buf.extend_from_slice(&(if float { 3u16 } else { 1u16 }).to_le_bytes());
-    buf.extend_from_slice(&channels.to_le_bytes());
-    buf.extend_from_slice(&sample_rate.to_le_bytes());
-    buf.extend_from_slice(&byte_rate.to_le_bytes());
-    buf.extend_from_slice(&block_align.to_le_bytes());
-    buf.extend_from_slice(&bits.to_le_bytes());
-    buf.extend_from_slice(b"data");
-    buf.extend_from_slice(&data_len.to_le_bytes());
+    let mut fmt = Vec::new();
+    fmt.extend_from_slice(&(if float { 3u16 } else { 1u16 }).to_le_bytes());
+    fmt.extend_from_slice(&channels.to_le_bytes());
+    fmt.extend_from_slice(&sample_rate.to_le_bytes());
+    fmt.extend_from_slice(&byte_rate.to_le_bytes());
+    fmt.extend_from_slice(&block_align.to_le_bytes());
+    fmt.extend_from_slice(&bits.to_le_bytes());
+    let mut buf = riff_wave(&fmt, data_len);
 
-    let mut state = seed.wrapping_add(1);
-    let mut next = || {
-        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-        state
-    };
+    let mut next = noise(seed);
     for _ in 0..frames {
         for _ in 0..channels {
             let s = next();
@@ -710,34 +792,27 @@ fn write_wav_extensible(path: &Path, frames: u32, sample_rate: u32, channels: u1
     let byte_rate = sample_rate * block_align as u32;
     let data_len = frames * block_align as u32;
 
-    let mut buf = Vec::new();
-    buf.extend_from_slice(b"RIFF");
-    buf.extend_from_slice(&(36 + 24 + data_len).to_le_bytes()); // fmt is 40 bytes (16+24)
-    buf.extend_from_slice(b"WAVE");
-    buf.extend_from_slice(b"fmt ");
-    buf.extend_from_slice(&40u32.to_le_bytes());
-    buf.extend_from_slice(&0xFFFEu16.to_le_bytes()); // WAVE_FORMAT_EXTENSIBLE
-    buf.extend_from_slice(&channels.to_le_bytes());
-    buf.extend_from_slice(&sample_rate.to_le_bytes());
-    buf.extend_from_slice(&byte_rate.to_le_bytes());
-    buf.extend_from_slice(&block_align.to_le_bytes());
-    buf.extend_from_slice(&bits.to_le_bytes());
-    buf.extend_from_slice(&22u16.to_le_bytes()); // cbSize
-    buf.extend_from_slice(&bits.to_le_bytes()); // valid bits per sample
-    buf.extend_from_slice(&((1u32 << channels) - 1).to_le_bytes()); // channel mask
+    let mut fmt = Vec::new();
+    fmt.extend_from_slice(&0xFFFEu16.to_le_bytes()); // WAVE_FORMAT_EXTENSIBLE
+    fmt.extend_from_slice(&channels.to_le_bytes());
+    fmt.extend_from_slice(&sample_rate.to_le_bytes());
+    fmt.extend_from_slice(&byte_rate.to_le_bytes());
+    fmt.extend_from_slice(&block_align.to_le_bytes());
+    fmt.extend_from_slice(&bits.to_le_bytes());
+    fmt.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+    fmt.extend_from_slice(&bits.to_le_bytes()); // valid bits per sample
+    fmt.extend_from_slice(&((1u32 << channels) - 1).to_le_bytes()); // channel mask
                                                                     // PCM subformat GUID.
-    buf.extend_from_slice(&[
+    fmt.extend_from_slice(&[
         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B,
         0x71,
     ]);
-    buf.extend_from_slice(b"data");
-    buf.extend_from_slice(&data_len.to_le_bytes());
+    let mut buf = riff_wave(&fmt, data_len);
 
-    let mut state = seed.wrapping_add(1);
+    let mut next = noise(seed);
     for _ in 0..frames {
         for _ in 0..channels {
-            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-            buf.extend_from_slice(&((state >> 16) as i16).to_le_bytes());
+            buf.extend_from_slice(&((next() >> 16) as i16).to_le_bytes());
         }
     }
     std::fs::write(path, &buf).expect("write extensible wav fixture");
@@ -778,14 +853,46 @@ fn parse_flac(bytes: &[u8]) -> FlacInfo {
     }
 }
 
-/// The bit depth (and container = WAV) of a `fmt `-chunk WAV proxy, read from the
-/// header without decoding.
-fn parse_wav_bits(bytes: &[u8]) -> u16 {
+/// The fields of a WAV proxy the contract cares about — the RIFF counterpart of
+/// `FlacInfo`, walked chunk by chunk so the plain and EXTENSIBLE `fmt ` layouts
+/// both parse, and so the frame count comes from the `data` chunk rather than a
+/// fixed offset.
+struct WavInfo {
+    sample_rate: u32,
+    channels: u16,
+    bits: u16,
+    total_samples: u64,
+}
+
+fn parse_wav(bytes: &[u8]) -> WavInfo {
     assert_eq!(&bytes[0..4], b"RIFF", "proxy is a RIFF/WAV stream");
     assert_eq!(&bytes[8..12], b"WAVE", "proxy is a WAVE stream");
-    // In both plain and EXTENSIBLE `fmt ` layouts, bits-per-sample is at
-    // offset 34 (12 RIFF/WAVE + 8 chunk header + 14 into the fmt body).
-    u16::from_le_bytes(bytes[34..36].try_into().unwrap())
+
+    let (mut sample_rate, mut channels, mut bits, mut data_len) = (0u32, 0u16, 0u16, 0u32);
+    let mut i = 12;
+    while i + 8 <= bytes.len() {
+        let id = &bytes[i..i + 4];
+        let size = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap()) as usize;
+        let body = i + 8;
+        if id == b"fmt " {
+            channels = u16::from_le_bytes(bytes[body + 2..body + 4].try_into().unwrap());
+            sample_rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into().unwrap());
+            bits = u16::from_le_bytes(bytes[body + 14..body + 16].try_into().unwrap());
+        } else if id == b"data" {
+            data_len = size as u32;
+        }
+        // RIFF chunks are word-aligned: an odd body carries a pad byte.
+        i = body + size + size % 2;
+    }
+
+    let block_align = channels as u64 * (bits as u64 / 8);
+    assert!(block_align > 0, "proxy declares a usable frame size");
+    WavInfo {
+        sample_rate,
+        channels,
+        bits,
+        total_samples: data_len as u64 / block_align,
+    }
 }
 
 /// Fetch the proxy bytes for a hash over the tokened loopback, asserting the
@@ -878,7 +985,14 @@ fn audio_endpoint_wav_fallback_for_unrepresentable_source() {
         headers.contains("content-type: audio/wav"),
         "a 10-channel source falls back to a WAV proxy: {headers}"
     );
-    assert_eq!(parse_wav_bits(&body), 16, "a 16-bit source stays 16-bit");
+    let info = parse_wav(&body);
+    assert_eq!(info.bits, 16, "a 16-bit source stays 16-bit");
+    assert_eq!(info.channels, 10, "every channel survives the fallback");
+    assert_eq!(info.sample_rate, 44_100, "sample rate preserved");
+    assert_eq!(
+        info.total_samples, 22_050,
+        "the fallback proxy carries the source's sample count"
+    );
 }
 
 #[test]
@@ -1044,6 +1158,9 @@ fn cache_clear_empties_and_reports() {
 // --- Issue #16: the comparison record — conclude, validate, write once --------
 
 /// The schema's `$id`, which every written record carries in its `schema` field.
+/// Spelled out here on purpose: the binary reads this value out of the embedded
+/// schema, so an independent copy is what makes a silent change to the published
+/// id fail a test rather than pass unnoticed.
 const RECORD_SCHEMA_ID: &str =
     "https://uncompose.org/schemas/compare/v0/uncompose.compare.schema.json";
 
@@ -1302,6 +1419,78 @@ fn abandoned_session_writes_no_record() {
     assert!(
         std::fs::read_dir(&cwd.path).unwrap().next().is_none(),
         "an abandoned session leaves no record file"
+    );
+}
+
+#[test]
+fn conclude_refuses_records_outside_the_v0_contract() {
+    let cwd = TempDir::new("record-contract");
+    let server = launch_recording(&cwd.path, None);
+    let url = format!("/record?token={}", server.token);
+
+    for (case, body) in [
+        // v0.1 records the listener's one region; multiple simultaneous loop
+        // regions are out of scope, so the schema caps `loops[]` at one.
+        (
+            "two loop regions",
+            r#"{"result": {"preference": null}, "observations": [],
+                "loops": [{"start_ms": 0, "end_ms": 100}, {"start_ms": 200, "end_ms": 300}]}"#,
+        ),
+        // Unknown plain fields are invalid inside every object the body owns —
+        // `ext` is the only way through, and it is typed.
+        (
+            "an unknown result field",
+            r#"{"result": {"preference": null, "smuggled": 1}, "observations": [], "loops": []}"#,
+        ),
+        (
+            "an unknown observation field",
+            r#"{"result": {"preference": null},
+                "observations": [{"at": "2026-08-08T10:00:00Z", "text": "hi", "smuggled": 1}],
+                "loops": []}"#,
+        ),
+        // Candidate references must name a candidate this session loaded.
+        (
+            "a preference naming no loaded candidate",
+            r#"{"result": {"preference": "Z", "confidence": 3}, "observations": [], "loops": []}"#,
+        ),
+        (
+            "an observation on no loaded candidate",
+            r#"{"result": {"preference": null},
+                "observations": [{"at": "2026-08-08T10:00:00Z", "candidate": "Z", "text": "hi"}],
+                "loops": []}"#,
+        ),
+    ] {
+        let (status, _, resp) = http_post(&server, &url, body);
+        assert_eq!(
+            status,
+            400,
+            "[{case}] must be refused: {}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    // A refused conclude writes nothing — and leaves the session concludable,
+    // so the listener can fix the cause and try again.
+    assert!(
+        std::fs::read_dir(&cwd.path).unwrap().next().is_none(),
+        "a refused conclude leaves no file behind"
+    );
+    // The same body, valid — plus a stray top-level key. The server assembles
+    // the record from the fields it knows, so a top-level extra is dropped on
+    // the floor rather than engraved.
+    let good = r#"{"result": {"preference": "B", "confidence": 4}, "observations": [],
+                   "loops": [{"start_ms": 0, "end_ms": 100}], "smuggled": 1}"#;
+    let (status, _, resp) = http_post(&server, &url, good);
+    assert_eq!(
+        status,
+        200,
+        "a valid record still concludes after refusals: {}",
+        String::from_utf8_lossy(&resp)
+    );
+    let record = validate_record_file(&sole_record(&cwd.path));
+    assert!(
+        record.get("smuggled").is_none(),
+        "the server assembles the record from known fields only: {record}"
     );
 }
 

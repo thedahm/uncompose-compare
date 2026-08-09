@@ -33,3 +33,18 @@ uncompose compare a.wav b.wav
 
 That loads `a.wav` and `b.wav` as candidates A and B and opens the listening workbench in
 your browser.
+
+## Command line
+
+```
+uncompose-compare <A> <B> [--port <PORT>] [--out <PATH>] [--cache-max-bytes <BYTES>]
+uncompose-compare cache clear
+```
+
+- `--port` pins the loopback port instead of taking an ephemeral one.
+- `--out` writes the concluded comparison record to this path instead of `<ULID>.json` in
+  the directory you ran from. An existing destination is refused, never overwritten.
+- `--cache-max-bytes` caps the playback-proxy cache, pruned least-recently-used at
+  startup. It defaults to 2 GiB — the flag is here because a cache that can grow to
+  gigabytes of your disk should be yours to bound.
+- `cache clear` deletes every cached proxy and reports what it removed.

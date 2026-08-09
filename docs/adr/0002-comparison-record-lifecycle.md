@@ -13,11 +13,17 @@ overrides that path. An existing destination is refused, never overwritten.**
 - The invoking directory is where a CLI user expects an output artifact to land, and the
   record's own ULID `id` names the file, so the on-disk name and the record's identity are
   the same fact — no separate naming scheme to keep in sync.
-- Refusing an existing destination (via `create_new`, so the check and the write are atomic)
-  keeps the "written once, never mutated" promise (CONTEXT.md, uncompose#65) true even when
-  a user points two sessions at the same explicit `--out`. Overwriting would let an
+- Refusing an existing destination (via `create_new`, which tests and claims the name in one
+  step) keeps the "written once, never mutated" promise (CONTEXT.md, uncompose#65) true even
+  when a user points two sessions at the same explicit `--out`. Overwriting would let an
   evaluation be silently replaced — exactly the revision-after-the-fact the immutable record
   exists to prevent.
+- **The bytes then land atomically**: `create_new` only reserves the name; the record is
+  written to a temp sibling and renamed over the reservation, and a failure part-way through
+  removes both. Writing in place would leave a truncated record on a full disk — and, worse,
+  a reservation that makes every retry look like the overwrite case, so the session could
+  never conclude. The reserve-and-rename split keeps the existence check above *and* the
+  fix-and-retry contract below true at the same time.
 
 ## Single write per session
 
@@ -41,7 +47,9 @@ self-contained schema needs no external `$ref` resolution).
 
 - Validating against the committed schema file — rather than re-encoding its rules in Rust —
   means the published schema and the server's enforcement cannot drift (the concern
-  CLAUDE.md's documentation policy names).
+  AGENTS.md's documentation policy names). The `schema` field is pinned in the schema with
+  `const`, so the id a record claims is the id the schema declares — the server reads it out
+  of the embedded bytes rather than repeating it as a literal.
 - The server, not the browser, supplies the record's `schema`, `id`, timestamps,
   `candidates[]` (path/sha256/size), `mode`, and `playback`; the browser POSTs only the
   session-authored `result`, `observations`, `loops`, and `context`. Hashes therefore

@@ -10,7 +10,9 @@
  * the new offset (a buffer source cannot be repositioned in place).
  *
  * A drag-selected region (issue #13) drives DAW-style looping: both sources get
- * the same native `loopStart`/`loopEnd`, so looping is sample-accurate and stays
+ * the same native `loopStart`/`loopEnd` — clamped to the *shorter* candidate,
+ * because Web Audio would otherwise clamp each source to its own buffer and let
+ * a mismatched pair drift apart — so looping is sample-accurate and stays
  * sample-locked across an A/B switch (the switch only ramps the gains). A
  * playhead before the region plays into it and then loops; toggling the loop off
  * continues out. Toggling loop on/off (or seeking) while playing restarts both
@@ -26,6 +28,7 @@ import {
   clampPosition,
   equalPowerCurves,
   type Label,
+  loopBounds,
   loopedPosition,
   orderedRegion,
   otherLabel,
@@ -97,7 +100,19 @@ export class PlaybackEngine {
   position(): number {
     if (!this.playing) return this.pausePos;
     const elapsed = this.ctx.currentTime - this.startedAt;
-    return loopedPosition(this.startOffset + elapsed, this.region, this.looping, this.duration());
+    const loop = this.loop();
+    return loopedPosition(this.startOffset + elapsed, loop, loop !== null, this.duration());
+  }
+
+  /**
+   * The loop the sources are actually running, or null when nothing loops: the
+   * region clamped to the shorter candidate, so both lanes wrap over the exact
+   * same span and stay sample-locked even when the candidates differ in length.
+   * The drawn playhead reads the same bounds the audio does.
+   */
+  private loop(): Region | null {
+    if (!this.looping) return null;
+    return loopBounds(this.region, Math.min(this.buffers.A.duration, this.buffers.B.duration));
   }
 
   /** The selected region (seconds), or null. */
@@ -235,6 +250,7 @@ export class PlaybackEngine {
     this.teardownSources();
     const generation = ++this.generation;
     const now = this.ctx.currentTime;
+    const loop = this.loop();
     const sources: Record<Label, AudioBufferSourceNode> = {
       A: this.ctx.createBufferSource(),
       B: this.ctx.createBufferSource(),
@@ -245,10 +261,10 @@ export class PlaybackEngine {
       // Native sample-accurate looping: both sources loop over the same region,
       // started together, so a mid-loop A/B switch stays sample-locked. A start
       // offset before `loopStart` plays into the region first (play-into).
-      if (this.looping && this.region) {
+      if (loop) {
         src.loop = true;
-        src.loopStart = this.region.start;
-        src.loopEnd = this.region.end;
+        src.loopStart = loop.start;
+        src.loopEnd = loop.end;
       }
       src.connect(this.gains[label]);
       // Restore the steady-state gains (a mid-switch restart lands on the live

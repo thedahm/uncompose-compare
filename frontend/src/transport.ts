@@ -76,6 +76,35 @@ export function clampPosition(pos: number, duration: number): number {
   return pos;
 }
 
+/**
+ * Clamp a unitless 0–1 fraction — a pointer position across a display, a
+ * normalized magnitude. Same arithmetic as `clampPosition`, different quantity:
+ * keeping them apart is what stops "position (seconds)" from reading as a lie.
+ */
+export function clampFraction(value: number): number {
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+}
+
+/**
+ * The loop bounds actually applied to both lanes, given the shortest candidate.
+ *
+ * Web Audio clamps a source's `loopEnd` to that source's own buffer duration.
+ * With candidates of different lengths (issue #15's mismatch case) a region
+ * running past the shorter one would therefore loop over a *shorter* span on
+ * that lane — the two lanes would drift apart, and away from the drawn playhead.
+ * Clamping the loop to the shorter candidate keeps A and B sample-locked, which
+ * is the contract that matters; a region entirely past the shorter candidate's
+ * end cannot be looped in lock at all, so it returns null and playback runs
+ * through linearly.
+ */
+export function loopBounds(region: Region | null, shortest: number): Region | null {
+  if (!region) return null;
+  const end = Math.min(region.end, shortest);
+  return end > region.start ? { start: region.start, end } : null;
+}
+
 /** Step a position by `delta` seconds, clamped to the track (2 s transport step). */
 export function stepPosition(pos: number, delta: number, duration: number): number {
   return clampPosition(pos + delta, duration);
@@ -267,7 +296,7 @@ export function computeSpectrogram(
     for (let k = 0; k < bins; k++) {
       const mag = Math.hypot(re[k], im[k]) / bins;
       const db = 20 * Math.log10(mag + 1e-9);
-      out[c * bins + k] = clampPosition((db + SPECTRAL_DB_FLOOR) / SPECTRAL_DB_FLOOR, 1);
+      out[c * bins + k] = clampFraction((db + SPECTRAL_DB_FLOOR) / SPECTRAL_DB_FLOOR);
     }
   }
   return { columns, bins, data: out };

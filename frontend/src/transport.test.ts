@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  clampFraction,
   clampPosition,
+  loopBounds,
   computeLoudness,
   computePeaks,
   computeSpectrogram,
@@ -28,6 +30,33 @@ describe("clampPosition", () => {
   });
   it("clamps past the end to the duration", () => {
     expect(clampPosition(9, 3)).toBe(3);
+  });
+});
+
+describe("clampFraction", () => {
+  it("keeps a fraction inside 0-1", () => {
+    expect(clampFraction(0.25)).toBe(0.25);
+  });
+  it("clamps outside 0-1 to the ends", () => {
+    expect(clampFraction(-0.5)).toBe(0);
+    expect(clampFraction(1.5)).toBe(1);
+  });
+});
+
+describe("loopBounds", () => {
+  it("passes a region that fits both candidates through untouched", () => {
+    expect(loopBounds({ start: 1, end: 2 }, 3)).toEqual({ start: 1, end: 2 });
+  });
+  it("clamps a region running past the shorter candidate", () => {
+    // Web Audio would clamp each source to its own buffer, so the shorter lane
+    // would loop over a shorter span and drift; one shared end keeps them locked.
+    expect(loopBounds({ start: 1, end: 5 }, 3)).toEqual({ start: 1, end: 3 });
+  });
+  it("refuses to loop a region entirely past the shorter candidate", () => {
+    expect(loopBounds({ start: 4, end: 5 }, 3)).toBeNull();
+  });
+  it("has nothing to loop without a region", () => {
+    expect(loopBounds(null, 3)).toBeNull();
   });
 });
 

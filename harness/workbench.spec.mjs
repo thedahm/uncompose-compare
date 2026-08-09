@@ -65,6 +65,17 @@ test("seek: clicking the stage waveform moves the playhead without playing", asy
   expect(parseFloat(left)).toBeGreaterThan(10);
 });
 
+test("transport: home and 0 both return the playhead to the start", async ({ page }) => {
+  const stage = page.getByTestId("stage-waveform");
+  const box = await stage.boundingBox();
+  for (const key of ["Home", "0"]) {
+    await page.mouse.click(box.x + box.width * 0.6, box.y + box.height / 2);
+    await expect(page.getByTestId("transport-position")).not.toContainText("0:00.000 /");
+    await page.keyboard.press(key);
+    await expect(page.getByTestId("transport-position")).toContainText("0:00.000 /");
+  }
+});
+
 test("help: ? toggles the keymap modal and documents the region keys", async ({ page }) => {
   await expect(page.getByTestId("help-modal")).toHaveCount(0);
   await page.keyboard.press("?");
@@ -321,6 +332,25 @@ test("verdict: saved confidence shows color-coded stars on the preferred lane ro
   // Save engraves but stays editable: the modal reopens.
   await page.getByTestId("open-verdict").click();
   await expect(page.getByTestId("verdict-modal")).toBeVisible();
+  await expect(page.getByTestId("prefer-A")).toHaveAttribute("aria-pressed", "true");
+});
+
+test("verdict: closing without saving discards the edit — Save is the engrave gate", async ({ page }) => {
+  await setVerdict(page, { prefer: "A", confidence: 3 });
+  await expect(page.getByTestId("verdict-summary")).toContainText("A");
+
+  // Reopen, change the mind, and close without saving.
+  await page.getByTestId("open-verdict").click();
+  await page.getByTestId("prefer-B").click();
+  await page.getByTestId("confidence-1").click();
+  await page.getByTestId("cancel-verdict").click();
+  await expect(page.getByTestId("verdict-modal")).toHaveCount(0);
+
+  // The engraved verdict is untouched — and so is what a conclude would write.
+  await expect(page.getByTestId("verdict-summary")).toContainText("A");
+  await expect(page.getByTestId("verdict-stars-A")).toBeVisible();
+  await expect(page.getByTestId("verdict-stars-B")).toHaveCount(0);
+  await page.getByTestId("open-verdict").click();
   await expect(page.getByTestId("prefer-A")).toHaveAttribute("aria-pressed", "true");
 });
 

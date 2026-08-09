@@ -136,7 +136,8 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     // One iteration is enough: the planner just needs to read and reason,
     // not write code. (Structured output requires maxIterations: 1.)
     maxIterations: 1,
-    // Opus for planning: dependency analysis benefits from deeper reasoning.
+    // Fable for planning: dependency analysis over a read-only pass is exactly
+    // the shape it is fast and cheap at.
     agent: sandcastle.claudeCode("claude-fable-5"),
     promptFile: "./.sandcastle/plan-prompt.md",
     promptArgs: { MAX_PARALLEL: String(MAX_PARALLEL) },
