@@ -105,6 +105,18 @@ interface Registration {
 }
 
 /**
+ * The conclude outcome: where the record landed (with the revealed label→file
+ * mapping, #29, and — project mode — the registration outcome), or why the
+ * write was refused. Also the shape of the `/record` response body.
+ */
+interface ConcludeResult {
+  path?: string;
+  reveal?: RevealCandidate[];
+  registration?: Registration;
+  error?: string;
+}
+
+/**
  * One lane's loudness-match figures. Sighted (and the record) report both the
  * measured LUFS and the applied gain; a blind session (#32) conceals the measured
  * figure and carries only the `gain_db` the engine applies, so `measured_lufs` is
@@ -294,14 +306,9 @@ export function App() {
   const [draft, setDraft] = useState<Verdict>(emptyVerdict);
   const [draftContext, setDraftContext] = useState("");
   const [verdictOpen, setVerdictOpen] = useState(false);
-  // The conclude outcome: where the record landed (with the revealed label→file
-  // mapping, #29), or why the write was refused.
-  const [concludeResult, setConcludeResult] = useState<{
-    path?: string;
-    reveal?: RevealCandidate[];
-    registration?: Registration;
-    error?: string;
-  } | null>(null);
+  const [concludeResult, setConcludeResult] = useState<ConcludeResult | null>(
+    null,
+  );
 
   const engineRef = useRef<PlaybackEngine | null>(null);
   const startedRef = useRef(false);
@@ -509,12 +516,7 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const data = (await res.json().catch(() => ({}))) as {
-        path?: string;
-        reveal?: RevealCandidate[];
-        registration?: Registration;
-        error?: string;
-      };
+      const data = (await res.json().catch(() => ({}))) as ConcludeResult;
       setConcludeResult(
         res.ok
           ? { path: data.path, reveal: data.reveal, registration: data.registration }

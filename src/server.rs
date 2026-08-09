@@ -105,9 +105,10 @@ pub fn serve(
             // project mode the registration outcome rides alongside it so the
             // closing screen can show "registered" or the recovery command.
             Ok(c) => {
+                let (code, stderr) = c.lifecycle();
                 let mut payload = json!({ "path": c.path });
-                if let Some(reveal) = &c.reveal {
-                    payload["reveal"] = reveal.clone();
+                if let Some(reveal) = c.reveal {
+                    payload["reveal"] = reveal;
                 }
                 if let Some(registration) = &c.registration {
                     payload["registration"] = registration.to_json();
@@ -117,7 +118,6 @@ pub fn serve(
                 // (spec #42 slice 5, #67 res. 8). The exit code tells the truth
                 // about the save and, in project mode, the registration.
                 let _ = request.respond(json_response(200, &payload));
-                let (code, stderr) = c.lifecycle();
                 Lifecycle::Shutdown { code, stderr }
             }
             // A refused conclude wrote nothing and did not conclude: keep serving

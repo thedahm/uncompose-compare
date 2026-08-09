@@ -15,7 +15,6 @@
 import { test, expect } from "@playwright/test";
 import {
   mkdtempSync,
-  mkdirSync,
   copyFileSync,
   writeFileSync,
   readFileSync,

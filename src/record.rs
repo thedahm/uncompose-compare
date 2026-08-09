@@ -63,17 +63,6 @@ pub enum Destination {
 }
 
 impl Destination {
-    /// A standalone destination: the invoking directory, and an optional `--out`.
-    pub fn standalone(out: Option<PathBuf>, dir: PathBuf) -> Destination {
-        Destination::Standalone { out, dir }
-    }
-
-    /// A project destination rooted at (absolute) `root`: the record lands under
-    /// `root/evaluations/` and is handed to `uncompose-project import`.
-    pub fn project(root: PathBuf) -> Destination {
-        Destination::Project { root }
-    }
-
     /// The record's path for the minted `id` under this destination policy.
     fn path_for(&self, id: &str) -> PathBuf {
         match self {

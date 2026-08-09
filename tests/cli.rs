@@ -2420,15 +2420,14 @@ fn wav_asset(root: &Path, rel: &str, seed: u32, amp: f64) -> String {
     file_sha256(&path)
 }
 
-/// A stub `uncompose-project` executable on a fresh PATH: project-mode pre-flight
-/// requires the tool be installed, but this repo stubs its evaluation import
-/// (spec #42), so a no-op executable satisfies the on-PATH check. Returns the dir
-/// holding it (kept alive by the caller) and a `PATH` value that finds it.
-fn stub_project_tool() -> (TempDir, String) {
+/// Install `script` as an executable `uncompose-project` in a fresh temp dir.
+/// Returns the dir holding it (kept alive by the caller) and a `PATH` value
+/// that finds it.
+fn project_tool_from(script: &str) -> (TempDir, String) {
     use std::os::unix::fs::PermissionsExt;
     let dir = TempDir::new("project-tool");
     let tool = dir.join("uncompose-project");
-    std::fs::write(&tool, "#!/bin/sh\nexit 0\n").expect("write stub");
+    std::fs::write(&tool, script).expect("write stub");
     let mut perms = std::fs::metadata(&tool).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&tool, perms).unwrap();
@@ -2440,33 +2439,28 @@ fn stub_project_tool() -> (TempDir, String) {
     (dir, path)
 }
 
+/// A stub `uncompose-project` executable on a fresh PATH: project-mode pre-flight
+/// requires the tool be installed, but this repo stubs its evaluation import
+/// (spec #42), so a no-op executable satisfies the on-PATH check.
+fn stub_project_tool() -> (TempDir, String) {
+    project_tool_from("#!/bin/sh\nexit 0\n")
+}
+
 /// A stub `uncompose-project` that records the argv it received (one arg per
 /// line) to `argv_log`, optionally prints `stderr_msg` to stderr, and exits
 /// `code` — the fake-tool seam the slice-5 auto-import handover runs against.
-/// Returns the dir holding it (kept alive by the caller) and a `PATH` that finds
-/// it. `argv_log` is baked into the script, so the handover needs no environment
+/// `argv_log` is baked into the script, so the handover needs no environment
 /// beyond PATH.
 fn logging_project_tool(argv_log: &Path, code: i32, stderr_msg: &str) -> (TempDir, String) {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = TempDir::new("project-tool");
-    let tool = dir.join("uncompose-project");
     let log = argv_log.to_string_lossy();
     let stderr_line = if stderr_msg.is_empty() {
         String::new()
     } else {
         format!("echo {stderr_msg:?} >&2\n")
     };
-    let script = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {log:?}\n{stderr_line}exit {code}\n");
-    std::fs::write(&tool, script).expect("write stub");
-    let mut perms = std::fs::metadata(&tool).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&tool, perms).unwrap();
-    let path = format!(
-        "{}:{}",
-        dir.path.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    (dir, path)
+    project_tool_from(&format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > {log:?}\n{stderr_line}exit {code}\n"
+    ))
 }
 
 /// A project with two candidate mixes derived from one shared raw source. The two

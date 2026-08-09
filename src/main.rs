@@ -238,8 +238,13 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // built before serving so an unreadable cwd or a broken embedded schema fails
     // before a listening session, not after it.
     let destination = match &cli.project {
-        Some(project_dir) => Destination::project(absolute(project_dir)?),
-        None => Destination::standalone(cli.out.clone(), std::env::current_dir()?),
+        Some(project_dir) => Destination::Project {
+            root: absolute(project_dir)?,
+        },
+        None => Destination::Standalone {
+            out: cli.out.clone(),
+            dir: std::env::current_dir()?,
+        },
     };
     let recorder = Recorder::new(destination, SystemTime::now())?;
 
