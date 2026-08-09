@@ -181,7 +181,11 @@ export function Waveform({
 
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!dragRef.current) return;
-    setPreview((p) => (p ? { a: p.a, b: fracFromEvent(e) } : p));
+    // Read the fraction now: React nulls the event's currentTarget once the
+    // handler returns, and the setState updater runs after that, so calling
+    // fracFromEvent inside the updater crashes the whole tree mid-drag.
+    const frac = fracFromEvent(e);
+    setPreview((p) => (p ? { a: p.a, b: frac } : p));
   };
 
   const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
