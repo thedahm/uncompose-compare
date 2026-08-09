@@ -2,7 +2,7 @@
   "name": "uncompose-compare",
   "private": true,
   "scripts": {
-    "build:frontend": "npm --prefix frontend install && npm --prefix frontend run build",
+    "build:frontend": "npm --prefix frontend ci && npm --prefix frontend run build",
     "build": "npm run build:frontend && cargo build --release",
     "wheel": "bash scripts/build-wheel.sh",
     "clean-install-proof": "bash scripts/clean-install-proof.sh",
