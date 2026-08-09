@@ -82,7 +82,9 @@ pub fn serve(mut request: Request, token: &str, session: &Session, recorder: &Re
             return;
         }
         let (status, payload) = match recorder.conclude(session, &body) {
-            Ok(path) => (200, json!({ "path": path })),
+            // The reveal (label→file) rides the successful-write response and
+            // nothing before it — the browser had no identity until now (#29).
+            Ok(c) => (200, json!({ "path": c.path, "reveal": c.reveal })),
             Err(e) => (e.status(), json!({ "error": e.to_string() })),
         };
         let _ = request.respond(json_response(status, &payload));
