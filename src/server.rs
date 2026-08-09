@@ -89,11 +89,14 @@ pub fn serve(mut request: Request, token: &str, session: &Session, recorder: &Re
         return;
     }
 
-    // Audio proxy endpoint: resolve strictly through the content-hash table, so a
-    // request names a source hash we already loaded — never a filesystem path.
-    // An unknown hash is a 404, not a chance to read arbitrary files.
-    if let Some(hash) = path.strip_prefix("audio/") {
-        let response = match session.proxies.get(hash) {
+    // Audio proxy endpoint: resolve strictly through the per-session reference
+    // table, so a request names a reference we already loaded — never a
+    // filesystem path. Sighted sessions key by source hash; blind sessions key
+    // by an opaque per-session token, so a content hash is never servable (#28)
+    // and the shuffle cannot be decoded. An unknown reference is a 404, not a
+    // chance to read arbitrary files.
+    if let Some(reference) = path.strip_prefix("audio/") {
+        let response = match session.proxies.get(reference) {
             Some(proxy) => match std::fs::read(&proxy.path) {
                 Ok(data) => Response::from_data(data)
                     .with_header(header("Content-Type", proxy.container.content_type()))

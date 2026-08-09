@@ -53,6 +53,14 @@ struct Cli {
     /// baseline (#66).
     #[arg(long)]
     loudness_match: bool,
+
+    /// Blind session: shuffle the label↔file assignment by an OS coin flip at
+    /// load and conceal every identifying detail (name, path, hash, size) from
+    /// the served surface, so a preference is judged without knowing which file
+    /// is which. Refuses identical content or a duration/rate/channel mismatch
+    /// before binding. The written record still carries full identities (#28).
+    #[arg(long)]
+    blind: bool,
 }
 
 #[derive(Subcommand)]
@@ -114,7 +122,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Load both candidates before binding: a bad invocation must fail with a
     // clear message and a non-zero exit, never a running server. Loading also
     // transcodes each input into a cached playback proxy (#74).
-    let session = Session::load(a, b, &cache, cli.loudness_match)?;
+    let session = Session::load(a, b, &cache, cli.loudness_match, cli.blind)?;
 
     // Prune the cache once, at startup, never mid-session (#72). The proxies
     // this run just wrote/reused carry the freshest access time, so an LRU prune

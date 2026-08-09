@@ -146,7 +146,11 @@ impl Recorder {
             "created_at": self.created_at,
             "completed_at": rfc3339(SystemTime::now()),
             "candidates": candidates,
-            "mode": "ab",
+            // Sighted `ab`, or `ab-blind-randomized` when the labels were
+            // shuffled (#28). The candidates above already carry the shuffled
+            // label mapped to each real path/sha256/size, so the record alone
+            // reconnects what the listener saw to what was on disk.
+            "mode": session.mode(),
             // Playback is server-authoritative (issue #30): the loudness match,
             // measured and applied server-side, is recorded here — never taken
             // from the browser's posted body.

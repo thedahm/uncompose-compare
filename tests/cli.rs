@@ -1744,3 +1744,256 @@ fn record_endpoint_enforces_the_privacy_contract() {
         "a refused conclude writes no record"
     );
 }
+
+// --- Issue #28: blind sessions (shuffle, concealment, refusals, reconnection) --
+
+/// The two candidates' `{sha256, size}` as a sighted load of the same pair
+/// reports them — the identifying strings a blind session of that pair must not
+/// leak. Learned from a sighted run so the test needs no hasher of its own.
+fn sighted_identities(a: &Path, b: &Path) -> [(String, u64); 2] {
+    let server = launch_opts(TempDir::new("blind-sighted"), a, b, None, &[]);
+    let json = session_json(&server);
+    let s: serde_json::Value = serde_json::from_str(&json).expect("sighted session json");
+    let cand = |i: usize| {
+        (
+            s["candidates"][i]["sha256"]
+                .as_str()
+                .expect("sighted sha256")
+                .to_string(),
+            s["candidates"][i]["size"].as_u64().expect("sighted size"),
+        )
+    };
+    [cand(0), cand(1)]
+}
+
+#[test]
+fn blind_session_conceals_every_identifying_detail() {
+    // Files kept alive by the test across both a sighted and a blind launch.
+    let files = TempDir::new("blind-files");
+    let a = files.join("alpha.wav");
+    let b = files.join("bravo.wav");
+    write_wav(&a, 44_100, 44_100, 2, 21);
+    write_wav(&b, 44_100, 44_100, 2, 22);
+    let identities = sighted_identities(&a, &b);
+
+    let server = launch_opts(TempDir::new("blind-conceal"), &a, &b, None, &["--blind"]);
+    let json = session_json(&server);
+
+    // The blind payload states it is blind and carries only label + duration +
+    // an audio reference per candidate.
+    let s: serde_json::Value = serde_json::from_str(&json).expect("blind session json");
+    assert_eq!(s["blind"], true, "the session states it is blind: {json}");
+    for label in ["A", "B"] {
+        let has = s["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["label"] == label);
+        assert!(has, "blind session labels {label}: {json}");
+    }
+    assert!(
+        json.contains("\"duration_ms\":1000"),
+        "the shared duration is carried: {json}"
+    );
+
+    // The concealment-leak sweep: no basename, path, sha256 hex, or decimal size
+    // of either input appears anywhere in the session payload.
+    assert!(!json.contains("alpha.wav"), "basename A leaked: {json}");
+    assert!(!json.contains("bravo.wav"), "basename B leaked: {json}");
+    assert!(
+        !json.contains(&files.path.to_string_lossy().to_string()),
+        "the fixture path leaked: {json}"
+    );
+    for (sha, size) in &identities {
+        assert!(!json.contains(sha.as_str()), "a sha256 leaked: {json}");
+        assert!(
+            !json.contains(&size.to_string()),
+            "a decimal size leaked: {json}"
+        );
+    }
+
+    // The audio reference is opaque, not the content hash — and the content-hash
+    // URL is not servable in blind mode.
+    let audio = s["candidates"][0]["audio"].as_str().expect("audio url");
+    let reference = audio.strip_prefix("/audio/").expect("an /audio/ url");
+    for (sha, _) in &identities {
+        assert_ne!(reference, sha, "the audio ref must not be the content hash");
+        let (status, _, _) = http_get(
+            &server.addr,
+            &format!("/audio/{sha}?token={}", server.token),
+        );
+        assert_eq!(
+            status, 404,
+            "a content-hash URL must not serve in blind mode"
+        );
+    }
+
+    // The opaque reference still serves a proxy that decodes.
+    let (status, headers, bytes) =
+        http_get(&server.addr, &format!("{audio}?token={}", server.token));
+    assert_eq!(status, 200, "the opaque audio reference serves the proxy");
+    assert!(!bytes.is_empty(), "the served proxy is non-empty");
+    assert!(
+        headers.contains("audio/"),
+        "the proxy carries an audio content-type: {headers}"
+    );
+}
+
+/// Run a blind invocation expected to be refused pre-bind, returning
+/// (exit code, stderr). Fixtures live in `dir`, kept by the caller.
+fn blind_refusal(a: &Path, b: &Path) -> (Option<i32>, String) {
+    run_expecting_failure(&[a.to_str().unwrap(), b.to_str().unwrap(), "--blind"])
+}
+
+#[test]
+fn blind_refuses_identical_content() {
+    let dir = TempDir::new("blind-identical");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    // Same params and seed => byte-identical => equal sha256.
+    write_wav(&a, 44_100, 44_100, 2, 5);
+    write_wav(&b, 44_100, 44_100, 2, 5);
+    let (code, stderr) = blind_refusal(&a, &b);
+    assert_eq!(code, Some(1), "a blind refusal exits 1");
+    let lc = stderr.to_lowercase();
+    assert!(
+        lc.contains("blind") && lc.contains("identical"),
+        "identical content is named: {stderr}"
+    );
+}
+
+#[test]
+fn blind_refuses_duration_mismatch() {
+    let dir = TempDir::new("blind-duration");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    write_wav(&a, 44_100, 44_100, 2, 1); // 1000 ms
+    write_wav(&b, 33_075, 44_100, 2, 2); // 750 ms
+    let (code, stderr) = blind_refusal(&a, &b);
+    assert_eq!(code, Some(1), "a blind refusal exits 1");
+    let lc = stderr.to_lowercase();
+    assert!(
+        lc.contains("duration") && stderr.contains("1000") && stderr.contains("750"),
+        "duration mismatch names the property and both values: {stderr}"
+    );
+}
+
+#[test]
+fn blind_refuses_sample_rate_mismatch() {
+    let dir = TempDir::new("blind-rate");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    // Equal duration and channels, differing sample rate only.
+    write_wav(&a, 44_100, 44_100, 2, 1);
+    write_wav(&b, 48_000, 48_000, 2, 2);
+    let (code, stderr) = blind_refusal(&a, &b);
+    assert_eq!(code, Some(1), "a blind refusal exits 1");
+    let lc = stderr.to_lowercase();
+    assert!(
+        lc.contains("sample-rate") && stderr.contains("44100") && stderr.contains("48000"),
+        "sample-rate mismatch names the property and both values: {stderr}"
+    );
+}
+
+#[test]
+fn blind_refuses_channel_count_mismatch() {
+    let dir = TempDir::new("blind-channels");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    // Equal duration and sample rate, differing channel count only.
+    write_wav(&a, 44_100, 44_100, 1, 1);
+    write_wav(&b, 44_100, 44_100, 2, 2);
+    let (code, stderr) = blind_refusal(&a, &b);
+    assert_eq!(code, Some(1), "a blind refusal exits 1");
+    assert!(
+        stderr.to_lowercase().contains("channel-count"),
+        "channel-count mismatch is named: {stderr}"
+    );
+}
+
+#[test]
+fn blind_record_reconnects_labels_to_the_real_hashes() {
+    let cwd = TempDir::new("blind-record-cwd");
+    let files = TempDir::new("blind-record-files");
+    let a = files.join("alpha.wav");
+    let b = files.join("bravo.wav");
+    write_wav(&a, 44_100, 44_100, 2, 31);
+    write_wav(&b, 44_100, 44_100, 2, 32);
+    let identities = sighted_identities(&a, &b);
+    let input_hashes: std::collections::HashSet<String> =
+        identities.iter().map(|(sha, _)| sha.clone()).collect();
+
+    let mut command = Command::new(BIN);
+    command
+        .arg(&a)
+        .arg(&b)
+        .arg("--blind")
+        .current_dir(&cwd.path);
+    let server = serving_from(command, TempDir::new("blind-record-hold"));
+
+    let body =
+        r#"{"result": {"preference": "A", "confidence": 4}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(
+        status,
+        200,
+        "a blind session concludes: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let record = validate_record_file(&sole_record(&cwd.path));
+    assert_eq!(
+        record["mode"], "ab-blind-randomized",
+        "the record marks the blind, randomized session: {record}"
+    );
+
+    // Labels {A, B} map bijectively onto the two real input hashes — the record
+    // alone reconnects what the listener saw to what was on disk. (The shuffle
+    // itself is OS randomness; we assert reconnection, not distribution.)
+    let candidates = record["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2);
+    let labels: std::collections::HashSet<&str> = candidates
+        .iter()
+        .map(|c| c["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        labels,
+        std::collections::HashSet::from(["A", "B"]),
+        "both labels present exactly once: {record}"
+    );
+    let recorded: std::collections::HashSet<String> = candidates
+        .iter()
+        .map(|c| c["sha256"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        recorded, input_hashes,
+        "the recorded hashes are exactly the two inputs': {record}"
+    );
+}
+
+#[test]
+fn sighted_mode_is_unaffected_by_the_blind_flag() {
+    // A plain (no --blind) session still carries full metadata and mode "ab".
+    let dir = TempDir::new("blind-sighted-unaffected");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    write_wav(&a, 44_100, 44_100, 2, 41);
+    write_wav(&b, 44_100, 44_100, 2, 42);
+    let server = launch_with(dir, &a, &b);
+    let json = session_json(&server);
+    assert!(
+        json.contains("\"sha256\":\"") && json.contains("\"path\":\""),
+        "a sighted session still carries identities: {json}"
+    );
+    assert!(
+        !json.contains("\"blind\":true"),
+        "a sighted session is not marked blind: {json}"
+    );
+    // The audio URL is still the content-hash URL a sighted session has always
+    // served.
+    let sha = first_sha256(&json);
+    assert!(
+        json.contains(&format!("/audio/{sha}")),
+        "sighted audio is served by content hash: {json}"
+    );
+}
