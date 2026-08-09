@@ -434,6 +434,11 @@ export function App() {
     [region],
   );
 
+  // What a note made on the live lane tags: the lane itself for A/B, but
+  // nothing for SRC — auditioning the reference is not a comparison, so its
+  // note is a general observation (null candidate).
+  const liveTarget: Target | null = live === "SRC" ? null : live;
+
   // Submit the composer's free text (issue #15): `enter` tags the live
   // candidate, `shift+enter` tags both. Empty text is ignored so a stray key
   // never drops a blank note.
@@ -441,12 +446,10 @@ export function App() {
     (both: boolean) => {
       const text = composer.trim();
       if (!text) return;
-      // Auditioning the SRC reference tags nothing — it is not a comparison
-      // candidate, so a note made on it is a general observation (null).
-      pin(both ? "both" : live === "SRC" ? null : live, text);
+      pin(both ? "both" : liveTarget, text);
       setComposer("");
     },
-    [composer, live, pin],
+    [composer, liveTarget, pin],
   );
 
   // Jump the transport to an observation's pinned position (untethered notes
@@ -566,7 +569,7 @@ export function App() {
           // Pin on the live candidate (both with shift) without interrupting
           // listening; the empty text is filled in later in the ledger.
           e.preventDefault();
-          pin(e.shiftKey ? "both" : live === "SRC" ? null : live, "");
+          pin(e.shiftKey ? "both" : liveTarget, "");
           break;
         case "Tab":
           // Jump to the composer to write a free-text observation.
@@ -583,7 +586,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, toggleSwitch, toggleLoop, clearRegion, rewind, step, pin, live]);
+  }, [togglePlay, toggleSwitch, toggleLoop, clearRegion, rewind, step, pin, liveTarget]);
 
   // The two lanes keyed by label, narrowed once from the session payload: the
   // blind pair carries no identity to render, the sighted pair carries all of it.

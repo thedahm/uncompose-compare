@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
+use std::path::PathBuf;
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -153,7 +154,7 @@ impl Loudness {
 /// carries (spec #42) — the expected content hash to check integrity against, and
 /// the asset/project ids to record. A bare-file launch leaves all three `None`.
 pub struct Lane {
-    pub path: std::path::PathBuf,
+    pub path: PathBuf,
     /// The manifest's recorded sha256 for this asset, checked against the bytes on
     /// disk at load; `None` for a bare-file launch (nothing to check against).
     pub expected_sha256: Option<String>,
@@ -164,7 +165,7 @@ pub struct Lane {
 impl Lane {
     /// A bare-file lane: a path with no manifest facts (bare-file mode, and the
     /// SRC lane of `--source`).
-    pub fn bare(path: std::path::PathBuf) -> Lane {
+    pub fn bare(path: PathBuf) -> Lane {
         Lane {
             path,
             expected_sha256: None,

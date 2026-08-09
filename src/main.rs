@@ -17,7 +17,7 @@ use std::time::SystemTime;
 use clap::{Parser, Subcommand};
 
 use uncompose_compare::cache::{Cache, DEFAULT_CACHE_MAX_BYTES};
-use uncompose_compare::project::{uncompose_project_on_path, Manifest};
+use uncompose_compare::project::{uncompose_project_on_path, Manifest, Resolved};
 use uncompose_compare::record::Recorder;
 use uncompose_compare::server::{bind, serve, session_token};
 use uncompose_compare::session::{Lane, Session};
@@ -132,7 +132,7 @@ fn resolve_lanes(
     let ra = manifest.resolve(a_tok)?;
     let rb = manifest.resolve(b_tok)?;
 
-    let lane_for = |resolved: &uncompose_compare::project::Resolved| Lane {
+    let lane_for = |resolved: &Resolved| Lane {
         path: resolved.path(&manifest),
         expected_sha256: Some(resolved.asset.sha256.clone()),
         asset: Some(resolved.asset.id.clone()),

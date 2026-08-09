@@ -436,10 +436,7 @@ pub fn uncompose_project_on_path() -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join("uncompose-project");
-        candidate.is_file()
-    })
+    std::env::split_paths(&path).any(|dir| dir.join("uncompose-project").is_file())
 }
 
 #[cfg(test)]
@@ -516,13 +513,12 @@ mod tests {
 
     #[test]
     fn no_shared_source_is_absent_not_an_error() {
-        // Two bare assets with no producing derivations share nothing.
+        // `raw` has no producing derivation, so pairing it with either mix shares
+        // no producer input — the SRC lane is simply absent.
         let m = manifest();
+        let raw = m.resolve("raw").unwrap();
         let a = m.resolve("mix-a").unwrap();
         let b = m.resolve("mix-b").unwrap();
-        // mix-a/mix-b are outputs, their producers share "raw" — so this pair DOES
-        // share. Use raw vs mix-a, which have no common producer input.
-        let raw = m.resolve("raw").unwrap();
         assert!(m.shared_source(&raw, &a).unwrap().is_none());
         assert!(m.shared_source(&raw, &b).unwrap().is_none());
     }

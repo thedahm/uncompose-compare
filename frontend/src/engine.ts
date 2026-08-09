@@ -1,21 +1,23 @@
 /**
- * The sample-locked A/B playback engine for the M3 workbench (issue #12).
+ * The sample-locked playback engine for the M3 workbench (issue #12): the A/B
+ * candidates, plus the SRC lane when a shared source is present (spec #42).
  *
- * Both candidates play in ONE Web Audio graph on a shared transport: whenever
- * playback runs, an `AudioBufferSourceNode` for each candidate is started at the
- * SAME offset into a per-candidate `GainNode`, so A and B are sample-locked and
+ * Every lane plays in ONE Web Audio graph on a shared transport: whenever
+ * playback runs, an `AudioBufferSourceNode` for each lane is started at the
+ * SAME offset into a per-lane `GainNode`, so the lanes are sample-locked and
  * switching the audible one never shifts the playback position. Switching is a
- * ~10 ms equal-power crossfade on the two gains (the sources are untouched), so
- * it is instant and gap-free. Seeking/stepping restarts both sources together at
- * the new offset (a buffer source cannot be repositioned in place).
+ * ~10 ms equal-power crossfade on the two gains involved (the sources are
+ * untouched), so it is instant and gap-free. Seeking/stepping restarts all
+ * sources together at the new offset (a buffer source cannot be repositioned
+ * in place).
  *
- * A drag-selected region (issue #13) drives DAW-style looping: both sources get
- * the same native `loopStart`/`loopEnd` — clamped to the *shorter* candidate,
+ * A drag-selected region (issue #13) drives DAW-style looping: every source gets
+ * the same native `loopStart`/`loopEnd` — clamped to the *shortest* lane,
  * because Web Audio would otherwise clamp each source to its own buffer and let
- * a mismatched pair drift apart — so looping is sample-accurate and stays
- * sample-locked across an A/B switch (the switch only ramps the gains). A
+ * mismatched lanes drift apart — so looping is sample-accurate and stays
+ * sample-locked across a lane switch (the switch only ramps the gains). A
  * playhead before the region plays into it and then loops; toggling the loop off
- * continues out. Toggling loop on/off (or seeking) while playing restarts both
+ * continues out. Toggling loop on/off (or seeking) while playing restarts the
  * sources at the current position with the new loop configuration.
  *
  * Decoded PCM lives only in the `AudioBuffer`s here, in browser memory; nothing
@@ -157,14 +159,12 @@ export class PlaybackEngine {
 
   /**
    * The loop the sources are actually running, or null when nothing loops: the
-   * region clamped to the shorter candidate, so both lanes wrap over the exact
-   * same span and stay sample-locked even when the candidates differ in length.
+   * region clamped to the shortest lane, so every lane wraps over the exact
+   * same span and stays sample-locked even when the lanes differ in length.
    * The drawn playhead reads the same bounds the audio does.
    */
   private loop(): Region | null {
     if (!this.looping) return null;
-    // Clamp to the shortest lane so every lane wraps over the exact same span and
-    // stays sample-locked, even when the lanes differ in length.
     const shortest = Math.min(...this.laneIds.map((id) => this.buffers[id]!.duration));
     return loopBounds(this.region, shortest);
   }
