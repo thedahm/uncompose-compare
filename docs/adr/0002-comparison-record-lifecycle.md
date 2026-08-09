@@ -37,6 +37,11 @@ verdict (everything stays editable until a record exists, per #61) and retry. An
 session — server killed, tab closed, never concluded — writes nothing, because writing is
 the conclude action and nothing else triggers it.
 
+> **Amended by ADR-0010 (M5 slice 5).** A *successful* conclude now ends the session in both
+> modes: the response is delivered, the server shuts down, and the process exits. A second
+> conclude is therefore impossible rather than refused (409) — the write-once flag stays a
+> within-session invariant guarding the request loop. Refusal-then-retry above is unchanged.
+
 ## Validation against the embedded schema
 
 **The v0 JSON Schema lands in-repo (`schemas/compare/v0/uncompose.compare.schema.json`) as
@@ -74,7 +79,8 @@ resolution is still the normative source for everything else.
 ## Consequences
 
 - A record's filename is its ULID; downstream tools (Project's import, M5) key on the
-  record `id`, which is the same value.
+  record `id`, which is the same value. In project mode the record lands under
+  `<root>/evaluations/` and is auto-imported at conclude (ADR-0010).
 - Pointing `--out` at an existing file is a hard error with a clear message, not a clobber.
 - The schema file is now load-bearing: changing it changes what the server accepts, and the
   `schema` `$id` string is duplicated as a constant in the binary (the value written into

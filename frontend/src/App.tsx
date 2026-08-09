@@ -93,6 +93,30 @@ interface RevealCandidate {
 }
 
 /**
+ * The project-mode registration outcome the conclude response carries
+ * (spec #42 slice 5): whether `uncompose-project import` accepted the record,
+ * and — on failure — the relayed tool error and the exact recovery command. A
+ * standalone session hands the record to no one, so there is no `registration`.
+ */
+interface Registration {
+  registered: boolean;
+  error?: string;
+  recovery?: string;
+}
+
+/**
+ * The conclude outcome: where the record landed (with the revealed label→file
+ * mapping, #29, and — project mode — the registration outcome), or why the
+ * write was refused. Also the shape of the `/record` response body.
+ */
+interface ConcludeResult {
+  path?: string;
+  reveal?: RevealCandidate[];
+  registration?: Registration;
+  error?: string;
+}
+
+/**
  * One lane's loudness-match figures. Sighted (and the record) report both the
  * measured LUFS and the applied gain; a blind session (#32) conceals the measured
  * figure and carries only the `gain_db` the engine applies, so `measured_lufs` is
@@ -282,13 +306,9 @@ export function App() {
   const [draft, setDraft] = useState<Verdict>(emptyVerdict);
   const [draftContext, setDraftContext] = useState("");
   const [verdictOpen, setVerdictOpen] = useState(false);
-  // The conclude outcome: where the record landed (with the revealed label→file
-  // mapping, #29), or why the write was refused.
-  const [concludeResult, setConcludeResult] = useState<{
-    path?: string;
-    reveal?: RevealCandidate[];
-    error?: string;
-  } | null>(null);
+  const [concludeResult, setConcludeResult] = useState<ConcludeResult | null>(
+    null,
+  );
 
   const engineRef = useRef<PlaybackEngine | null>(null);
   const startedRef = useRef(false);
@@ -496,14 +516,10 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const data = (await res.json().catch(() => ({}))) as {
-        path?: string;
-        reveal?: RevealCandidate[];
-        error?: string;
-      };
+      const data = (await res.json().catch(() => ({}))) as ConcludeResult;
       setConcludeResult(
         res.ok
-          ? { path: data.path, reveal: data.reveal }
+          ? { path: data.path, reveal: data.reveal, registration: data.registration }
           : { error: data.error ?? `record ${res.status}` },
       );
     } catch (e) {
@@ -922,6 +938,38 @@ export function App() {
                 Record written to <code>{concludeResult.path}</code>
               </p>
             )}
+            {/* Registration outcome (spec #42 slice 5): a project-mode conclude
+                auto-imports the record. Success shows "registered"; a failure keeps
+                the record and offers the exact recovery command. A standalone
+                conclude carries no `registration` key to render. */}
+            {concludeResult?.registration?.registered && (
+              <p data-testid="registration-ok" style={{ color: "#5cd67a" }}>
+                Registered with the project.
+              </p>
+            )}
+            {concludeResult?.registration &&
+              !concludeResult.registration.registered && (
+                <div
+                  data-testid="registration-failed"
+                  role="alert"
+                  style={{ color: "#ffb454", marginTop: 8 }}
+                >
+                  <p>The record was saved, but could not be registered with the project.</p>
+                  {concludeResult.registration.error && (
+                    <pre data-testid="registration-error" style={{ whiteSpace: "pre-wrap" }}>
+                      {concludeResult.registration.error}
+                    </pre>
+                  )}
+                  {concludeResult.registration.recovery && (
+                    <p>
+                      Register it with:{" "}
+                      <code data-testid="registration-recovery">
+                        {concludeResult.registration.recovery}
+                      </code>
+                    </p>
+                  )}
+                </div>
+              )}
             {/* Reveal at conclude (#29): only after the record is written — the
                 one irreversible event — does the UI show which file each label
                 was. Only a blind session concealed anything, so only a blind

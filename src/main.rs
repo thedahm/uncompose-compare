@@ -18,8 +18,8 @@ use clap::{Parser, Subcommand};
 
 use uncompose_compare::cache::{Cache, DEFAULT_CACHE_MAX_BYTES};
 use uncompose_compare::project::{uncompose_project_on_path, Manifest, Resolved};
-use uncompose_compare::record::Recorder;
-use uncompose_compare::server::{bind, serve, session_token};
+use uncompose_compare::record::{Destination, Recorder};
+use uncompose_compare::server::{bind, serve, session_token, Lifecycle};
 use uncompose_compare::session::{Lane, Session};
 
 /// uncompose-compare — load two audio files and open the listening workbench.
@@ -230,22 +230,52 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // knowing the port alone is not enough to talk to the server.
     let token = session_token()?;
 
-    // The record writer: the default destination is the invoking directory
-    // (named by the record's ULID at conclude time), overridden by `--out`. The
-    // session's start is the record's `created_at`; `completed_at` is stamped at
-    // conclude. Built before serving so an unreadable cwd or a broken embedded
-    // schema fails before a listening session, not after it. Whether the
-    // destination is writable is settled at conclude (ADR-0002), where the
-    // `create_new` reservation is the existence check.
-    let recorder = Recorder::new(cli.out.clone(), std::env::current_dir()?, SystemTime::now())?;
+    // The record writer's destination: standalone mode lands the record in the
+    // invoking directory (named by the record's ULID at conclude time, or `--out`);
+    // project mode lands it in `<root>/evaluations/` and hands it to
+    // `uncompose-project import` (spec #42 slice 5). The project root is made
+    // absolute so the handover's argv carries absolute paths. The record writer is
+    // built before serving so an unreadable cwd or a broken embedded schema fails
+    // before a listening session, not after it.
+    let destination = match &cli.project {
+        Some(project_dir) => Destination::Project {
+            root: absolute(project_dir)?,
+        },
+        None => Destination::Standalone {
+            out: cli.out.clone(),
+            dir: std::env::current_dir()?,
+        },
+    };
+    let recorder = Recorder::new(destination, SystemTime::now())?;
 
     let url = format!("http://127.0.0.1:{port}/?token={token}");
     println!("{url}");
     std::io::stdout().flush()?;
 
+    // Serve until a conclude ends the session (spec #42 slice 5, #67 res. 8): the
+    // successful write is save-and-close in both modes, so the process exits when
+    // it lands — 0 when saved (and, in project mode, registered), nonzero when the
+    // auto-import failed, relaying its stderr and the recovery command first.
     for request in server.incoming_requests() {
-        serve(request, &token, &session, &recorder);
+        if let Lifecycle::Shutdown { code, stderr } = serve(request, &token, &session, &recorder) {
+            for line in stderr {
+                eprintln!("{line}");
+            }
+            std::io::stderr().flush()?;
+            std::process::exit(code);
+        }
     }
 
     Ok(())
+}
+
+/// Make a path absolute without resolving symlinks: an absolute path as-is, a
+/// relative one joined onto the invoking directory. Used for the project root so
+/// the auto-import handover's argv carries absolute paths (spec #42 slice 5).
+fn absolute(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
