@@ -20,7 +20,14 @@ export const PID_FILE = path.join(dir, ".server-pid");
 export default async function globalSetup() {
   const bin = process.env.UNCOMPOSE_BIN || "uncompose-compare";
 
-  const child = spawn(bin, [], { stdio: ["ignore", "pipe", "inherit"] });
+  // The binary is the two-file compare command (issue #10): it loads exactly
+  // two audio files as candidates A and B before serving. Point it at the
+  // seeded-noise fixtures gen-fixtures.mjs writes (run before Playwright in
+  // sync-harness.sh). The harness drives the served page's `window.__uncomposeSync`
+  // seam, not these particular candidates, but the binary needs them to launch.
+  const fixtures = path.join(dir, "fixtures");
+  const args = [path.join(fixtures, "a.wav"), path.join(fixtures, "b.wav")];
+  const child = spawn(bin, args, { stdio: ["ignore", "pipe", "inherit"] });
 
   const url = await new Promise((resolve, reject) => {
     const timer = setTimeout(

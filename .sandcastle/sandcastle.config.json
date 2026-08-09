@@ -1,0 +1,4 @@
+{
+  "repoChecks": "`npm run typecheck` and `npm run test` at the repo root — they cover the frontend typecheck/build and `cargo test`. If the touched code has other documented checks (e.g. the packaging scripts under `scripts/`), run those too.",
+  "copyToWorktree": ["node_modules", "frontend/node_modules", "target"]
+}

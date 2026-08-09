@@ -1,178 +1,143 @@
-//! Spike 3: minimal server privacy contract.
+//! The `uncompose-compare` command: parse arguments, wire the core together,
+//! format output.
 //!
-//! Serves the Vite/React stub bundle — embedded into this binary via
-//! rust-embed — over a loopback-only HTTP server on an ephemeral port, honoring
-//! the minimal #72 privacy contract decided in `thedahm/uncompose`:
+//! `uncompose-compare <a> <b>` loads two audio files as candidates A and B (in
+//! argument order), hashing and decoding each at startup, then serves the
+//! embedded UI over the guarded loopback server plus the `/session`,
+//! `/audio/<sha256>`, and `/record` endpoints (see `lib.rs` for the core).
 //!
-//!   * bind 127.0.0.1 on an OS-assigned ephemeral port (never exposed off-box);
-//!   * print a URL carrying a per-session token, and refuse any request that
-//!     does not present it (via query string or the cookie the page seeds);
-//!   * refuse any request whose Host header is not 127.0.0.1 (a DNS-rebinding
-//!     guard — a malicious page can't drive this server through the browser);
-//!   * send `Cache-Control: no-store` on *every* response — served, refused, or
-//!     not-found — so nothing this server emits is ever cached.
-//!
-//! Scope is still the packaging spike (spec #1): serve the embedded page and
-//! answer `--version`/`--help`, nothing more.
+//! Bad invocations fail before the server ever binds, with a clear message and
+//! a non-zero exit: wrong argument count (clap), a missing or unreadable file,
+//! or an undecodable format.
 
-use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::SystemTime;
 
-use clap::Parser;
-use rust_embed::RustEmbed;
-use tiny_http::{Header, Request, Response, Server};
+use clap::{Parser, Subcommand};
 
-/// The Vite/React stub bundle, embedded at compile time. `build.rs` guarantees
-/// the folder is present and non-empty, so a build that reaches here has assets.
-#[derive(RustEmbed)]
-#[folder = "frontend/dist/"]
-struct Assets;
+use uncompose_compare::cache::{Cache, DEFAULT_CACHE_MAX_BYTES};
+use uncompose_compare::record::Recorder;
+use uncompose_compare::server::{bind, serve, session_token};
+use uncompose_compare::session::Session;
 
-/// uncompose-compare — serve the embedded UI over loopback.
+/// uncompose-compare — load two audio files and open the listening workbench.
 #[derive(Parser)]
 #[command(name = "uncompose-compare", version, about, long_about = None)]
-struct Cli {}
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Candidate A: the first audio file to compare.
+    a: Option<PathBuf>,
+    /// Candidate B: the second audio file to compare.
+    b: Option<PathBuf>,
+
+    /// Bind this loopback port instead of an ephemeral one (per #72).
+    #[arg(long, value_name = "PORT")]
+    port: Option<u16>,
+
+    /// Prune the proxy cache to at most this many bytes (LRU, at startup only).
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_CACHE_MAX_BYTES)]
+    cache_max_bytes: u64,
+
+    /// Write the concluded comparison record here instead of the default
+    /// `<ULID>.json` in the invoking directory. An existing destination is
+    /// refused, never overwritten.
+    #[arg(long, value_name = "PATH")]
+    out: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Proxy-cache maintenance.
+    Cache {
+        #[command(subcommand)]
+        action: CacheCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Delete every cached playback proxy and report what was removed.
+    Clear,
+}
 
 fn main() {
-    Cli::parse();
+    let cli = Cli::parse();
 
-    if let Err(err) = run() {
+    if let Err(err) = run(&cli) {
         eprintln!("uncompose-compare: {err}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Loopback bind on an ephemeral port: the OS hands us a free port and we
-    // never expose the server beyond this machine.
-    let server = Server::http("127.0.0.1:0")?;
-    let port = server
-        .server_addr()
-        .to_ip()
-        .ok_or("server bound to a non-IP address")?
-        .port();
+fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cache = Cache::new(cli.cache_max_bytes)?;
+
+    // `cache clear` is a maintenance path that never binds a server.
+    if let Some(Command::Cache {
+        action: CacheCommand::Clear,
+    }) = &cli.command
+    {
+        let (files, bytes) = cache.clear()?;
+        if files == 0 {
+            println!("cache already empty ({})", cache.dir.display());
+        } else {
+            println!(
+                "cleared {files} proxy file{} ({bytes} bytes) from {}",
+                if files == 1 { "" } else { "s" },
+                cache.dir.display(),
+            );
+        }
+        return Ok(());
+    }
+
+    // The default form needs exactly two candidate paths. clap already rejects a
+    // third positional as "unexpected"; a zero/one-file invocation lands here.
+    let (a, b) = match (&cli.a, &cli.b) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            return Err("two audio files are required\n\n\
+                 Usage: uncompose-compare <A> <B>"
+                .into())
+        }
+    };
+
+    // Load both candidates before binding: a bad invocation must fail with a
+    // clear message and a non-zero exit, never a running server. Loading also
+    // transcodes each input into a cached playback proxy (#74).
+    let session = Session::load(a, b, &cache)?;
+
+    // Prune the cache once, at startup, never mid-session (#72). The proxies
+    // this run just wrote/reused carry the freshest access time, so an LRU prune
+    // evicts stale entries from earlier sessions before it ever touches ours.
+    cache.prune()?;
+
+    // Loopback bind: `--port` pins the port, otherwise the OS hands us a free
+    // one. Either way the server is never exposed beyond this machine.
+    let (server, port) = bind(cli.port.unwrap_or(0))?;
 
     // Per-session token: the printed URL is the only thing that carries it, so
     // knowing the port alone is not enough to talk to the server.
     let token = session_token()?;
+
+    // The record writer: the default destination is the invoking directory
+    // (named by the record's ULID at conclude time), overridden by `--out`. The
+    // session's start is the record's `created_at`; `completed_at` is stamped at
+    // conclude. Built before serving so an unreadable cwd or a broken embedded
+    // schema fails before a listening session, not after it. Whether the
+    // destination is writable is settled at conclude (ADR-0002), where the
+    // `create_new` reservation is the existence check.
+    let recorder = Recorder::new(cli.out.clone(), std::env::current_dir()?, SystemTime::now())?;
 
     let url = format!("http://127.0.0.1:{port}/?token={token}");
     println!("{url}");
     std::io::stdout().flush()?;
 
     for request in server.incoming_requests() {
-        serve(request, &token);
+        serve(request, &token, &session, &recorder);
     }
 
     Ok(())
-}
-
-/// Resolve the request against the embedded bundle and reply, enforcing the
-/// #72 contract (Host check, then token) before serving anything.
-fn serve(request: Request, token: &str) {
-    // DNS-rebinding guard: only a loopback Host is ever honored. A page on
-    // another origin that resolves its name to 127.0.0.1 still sends its own
-    // Host, so this refuses it before any asset is touched.
-    if !host_is_loopback(&request) {
-        return refuse(request);
-    }
-
-    // The token may arrive as a `?token=` query param (the printed URL) or as
-    // the cookie the page seeds for its sub-resource requests. Either presenting
-    // the right value authorizes the request; a wrong or missing one refuses it.
-    let raw = request.url().to_string();
-    let (path, query) = raw.split_once('?').unwrap_or((raw.as_str(), ""));
-    let matches = |t: &str| ct_eq(t.as_bytes(), token.as_bytes());
-    let query_ok = query_token(query).is_some_and(matches);
-    let cookie_ok = cookie_token(&request).is_some_and(matches);
-    if !query_ok && !cookie_ok {
-        return refuse(request);
-    }
-
-    // Map "/" to the SPA entry point.
-    let path = path.trim_start_matches('/');
-    let path = if path.is_empty() { "index.html" } else { path };
-
-    let response = match Assets::get(path) {
-        Some(file) => {
-            let content_type = file.metadata.mimetype();
-            Response::from_data(file.data.into_owned())
-                .with_header(header("Content-Type", content_type))
-                .with_header(header("Cache-Control", "no-store"))
-                // Seed the token so the browser can authenticate the
-                // sub-resource requests it makes without a query of its own.
-                .with_header(header(
-                    "Set-Cookie",
-                    &format!("token={token}; Path=/; SameSite=Strict"),
-                ))
-        }
-        None => Response::from_string("not found")
-            .with_status_code(404)
-            .with_header(header("Cache-Control", "no-store")),
-    };
-
-    // A broken client connection is not our problem to recover from.
-    let _ = request.respond(response);
-}
-
-/// Refuse a request that fails the #72 contract: 403, no body of substance, and
-/// — like every other response — never cached.
-fn refuse(request: Request) {
-    let response = Response::from_string("forbidden")
-        .with_status_code(403)
-        .with_header(header("Cache-Control", "no-store"));
-    let _ = request.respond(response);
-}
-
-/// True when the request's Host header names the loopback address (with or
-/// without a port). A missing Host — illegal under HTTP/1.1 — is refused.
-fn host_is_loopback(request: &Request) -> bool {
-    request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Host"))
-        .map(|h| h.value.as_str())
-        .map(|host| host.rsplit_once(':').map_or(host, |(name, _)| name) == "127.0.0.1")
-        .unwrap_or(false)
-}
-
-/// Extract the `token` value from a `&`-separated query string, if present.
-fn query_token(query: &str) -> Option<&str> {
-    query.split('&').find_map(|kv| kv.strip_prefix("token="))
-}
-
-/// Extract the `token` value from the request's Cookie header, if present.
-fn cookie_token(request: &Request) -> Option<&str> {
-    request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Cookie"))
-        .and_then(|h| {
-            h.value
-                .as_str()
-                .split(';')
-                .map(str::trim)
-                .find_map(|kv| kv.strip_prefix("token="))
-        })
-}
-
-/// A per-session token: 16 bytes of OS randomness, hex-encoded. The spike is
-/// Linux-only (spec #1), so `/dev/urandom` is a fine, dependency-free source.
-fn session_token() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let mut bytes = [0u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// Constant-time equality so token checking leaks no timing signal.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-fn header(field: &str, value: &str) -> Header {
-    Header::from_bytes(field.as_bytes(), value.as_bytes())
-        .expect("static header field/value are always valid")
 }

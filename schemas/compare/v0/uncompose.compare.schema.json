@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uncompose.org/schemas/compare/v0/uncompose.compare.schema.json",
+  "title": "uncompose comparison record (v0)",
+  "type": "object",
+  "required": ["schema", "id", "created_at", "completed_at", "candidates", "mode", "observations", "result"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "https://uncompose.org/schemas/compare/v0/uncompose.compare.schema.json",
+      "description": "This schema's $id — pinned so a record can only claim the version it was validated against"
+    },
+    "id": { "type": "string", "description": "ULID" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "completed_at": { "type": "string", "format": "date-time" },
+    "candidates": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "$ref": "#/$defs/candidate" }
+    },
+    "mode": { "enum": ["ab", "ab-blind", "ab-blind-randomized"] },
+    "playback": {
+      "type": "object",
+      "description": "Playback configuration incl. any loudness adjustment applied. Shape owned by uncompose#66."
+    },
+    "loops": {
+      "type": "array",
+      "maxItems": 1,
+      "items": { "$ref": "#/$defs/loop" },
+      "description": "The listener's region. v0.1 records at most one; multiple simultaneous loop regions are out of scope"
+    },
+    "observations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/observation" },
+      "description": "Append-only; array order is the order observations were made"
+    },
+    "result": { "$ref": "#/$defs/result" },
+    "context": { "type": "string", "description": "Listener-provided intent, free text" },
+    "ext": { "$ref": "#/$defs/ext" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "ext": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+      "additionalProperties": { "type": "object" }
+    },
+    "candidate": {
+      "type": "object",
+      "required": ["label", "path", "sha256", "size"],
+      "additionalProperties": false,
+      "properties": {
+        "label": { "type": "string", "description": "What the listener saw (e.g. \"A\"); the reference key everywhere in this record" },
+        "path": { "type": "string" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 0 },
+        "asset": { "type": "string", "description": "Manifest asset id, when project-launched" },
+        "project": { "type": "string", "description": "Project ULID, when project-launched" },
+        "ext": { "$ref": "#/$defs/ext" }
+      }
+    },
+    "loop": {
+      "type": "object",
+      "required": ["start_ms", "end_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "start_ms": { "type": "integer", "minimum": 0 },
+        "end_ms": { "type": "integer", "minimum": 0 },
+        "label": { "type": "string" }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "required": ["at", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "at": { "type": "string", "format": "date-time" },
+        "position_ms": { "type": "integer", "minimum": 0 },
+        "loop": { "type": "integer", "minimum": 0, "description": "Index into loops[]" },
+        "candidate": { "type": "string", "description": "Candidate label; absent = the comparison generally" },
+        "text": { "type": "string" },
+        "ext": { "$ref": "#/$defs/ext" }
+      }
+    },
+    "result": {
+      "type": "object",
+      "required": ["preference"],
+      "additionalProperties": false,
+      "properties": {
+        "preference": {
+          "type": ["string", "null"],
+          "description": "Candidate label, or null = no preference"
+        },
+        "confidence": {
+          "type": "integer", "minimum": 1, "maximum": 5,
+          "description": "Required when preference is non-null, absent otherwise"
+        },
+        "criterion": { "type": "string" },
+        "summary": { "type": "string" }
+      },
+      "allOf": [
+        {
+          "description": "Confidence is required exactly when a preference is chosen (uncompose#65): a non-null preference must carry a 1-5 confidence, and no preference must omit it.",
+          "if": { "properties": { "preference": { "type": "string" } } },
+          "then": { "required": ["confidence"] },
+          "else": { "not": { "required": ["confidence"] } }
+        }
+      ]
+    }
+  }
+}

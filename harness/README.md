@@ -32,6 +32,12 @@ On Chromium, Firefox, and WebKit:
 3. **Crossfade bound** — output is float-bit-identical to the live candidate
    outside the 10 ms fade window.
 
+`workbench.spec.mjs` (issue #12) drives the same served page for the DoD flow —
+both candidates load and render waveforms, `x`/lane-click switches the audible
+candidate at the current position, clicking a waveform seeks, `?` toggles the
+help modal. It runs on **Chromium only** (the flow is engine-independent; the
+sync contract above is where engines differ, so it keeps the full matrix).
+
 ## Run it locally
 
 ```sh

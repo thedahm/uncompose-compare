@@ -61,10 +61,36 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
+# The CLI takes two candidate audio files (`uncompose-compare <A> <B>`).
+# Synthesize two tiny WAVs with the venv's python (stdlib only, so nothing
+# beyond the clean PATH is required) — no binary fixtures live in the repo.
+echo ">> synthesizing two candidate WAVs with the venv's python" >&2
+PATH="$CLEAN_PATH" "$VENV/bin/python" - "$WORK/a.wav" "$WORK/b.wav" <<'PY'
+import struct, sys, wave
+
+def synth(path, seed):
+    rate, frames = 44100, 4410  # 0.1 s, stereo, 16-bit
+    state = seed & 0xFFFFFFFF
+    samples = []
+    for _ in range(frames * 2):
+        state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
+        samples.append(int((state / 0xFFFFFFFF - 0.5) * 0.5 * 32767))
+    with wave.open(path, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+
+synth(sys.argv[1], 1)
+synth(sys.argv[2], 2)
+PY
+
 echo ">> launching installed binary and verifying it serves the embedded page" >&2
-# Launch under the clean PATH; capture the URL it prints on its first stdout line.
+# Launch under the clean PATH with the two candidates; capture the URL it prints
+# on its first stdout line. XDG_CACHE_HOME keeps the proxy cache inside $WORK so
+# the proof never touches the machine's real cache.
 url_file="$WORK/url"
-PATH="$CLEAN_PATH" "$BIN" >"$url_file" 2>"$WORK/stderr" &
+PATH="$CLEAN_PATH" XDG_CACHE_HOME="$WORK/cache" "$BIN" "$WORK/a.wav" "$WORK/b.wav" >"$url_file" 2>"$WORK/stderr" &
 server_pid=$!
 stop() { kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; cleanup; }
 trap stop EXIT

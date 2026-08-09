@@ -7,8 +7,11 @@
 // `sync.ts`, exposed as `window.__uncomposeSync`), and this spec:
 //   1. navigates the wheel-installed binary's tokened URL (from global-setup),
 //   2. hands the page the seeded-noise fixtures as base64,
-//   3. asserts the three contract points on what the page renders.
-// So packaging is proven not to break the sync contract the harness certifies.
+//   3. fetches candidate A back as the proxy the *running server transcoded*
+//      (issue #11), so the #74 pipeline output sits inside the tested promise,
+//   4. asserts the contract points on what the page renders.
+// So packaging is proven not to break the sync contract the harness certifies,
+// and the proxy pipeline is certified by the same decode-count canary.
 import { test, expect } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -39,10 +42,27 @@ test.beforeAll(async ({ browser }) => {
   await page.goto(SERVED_URL, { waitUntil: "load" });
   // The bundle registers the harness seam on load; wait for it, then drive it.
   await page.waitForFunction(() => typeof window.__uncomposeSync === "function");
+
+  // Pull candidate A back as the server-transcoded proxy (issue #11): ask the
+  // session endpoint for its audio URL, fetch the bytes (the seeded cookie
+  // authorizes it), and hand them to the same decode-count canary as
+  // "a.proxy" — so a green run certifies the #74 pipeline, not just pre-made
+  // fixtures. Same-origin fetch keeps this inside the #72 contract.
+  const proxyB64 = await page.evaluate(async () => {
+    const session = await (await fetch("/session")).json();
+    const buf = new Uint8Array(
+      await (await fetch(session.candidates[0].audio)).arrayBuffer(),
+    );
+    let bin = "";
+    for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
+    return btoa(bin);
+  });
+  const fixtures = { ...FIXTURES, "a.proxy": proxyB64 };
+
   const t0 = Date.now();
   result = await page.evaluate(
     (args) => window.__uncomposeSync(args),
-    { fixtures: FIXTURES, SR, FRAMES, SWITCH_SAMPLE, FADE_SAMPLES },
+    { fixtures, SR, FRAMES, SWITCH_SAMPLE, FADE_SAMPLES },
   );
   result.elapsedMs = Date.now() - t0;
   await page.close();
@@ -50,7 +70,9 @@ test.beforeAll(async ({ browser }) => {
 
 test("decode-count canary: FLAC and WAV decode to exact sample counts", () => {
   console.log(JSON.stringify(result, null, 2));
-  for (const name of ["a.wav", "b.wav", "a.flac", "b.flac"]) {
+  // "a.proxy" is the proxy the running server transcoded from candidate A;
+  // decoding it to the same sample count certifies the #74 pipeline output.
+  for (const name of ["a.wav", "b.wav", "a.flac", "b.flac", "a.proxy"]) {
     const info = result.decodeInfo[name];
     expect(info.error, `${name} decode error`).toBeUndefined();
     expect(info.length, `${name} sample count`).toBe(FRAMES);

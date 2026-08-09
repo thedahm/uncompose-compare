@@ -1,19 +1,7 @@
 # uncompose-compare
 
-## Documentation policy
+This repo's agent instructions live in [`AGENTS.md`](AGENTS.md) — the skills, the triage
+vocabulary, the documentation policy, all of it. Read that file.
 
-Commit only documentation that code alone can't explain: decisions, tradeoffs, constraints ("we considered X, chose Y because Z" — ADRs are the canonical form). Research, findings, and spike write-ups go to issues or the wiki, never into the repo, so committed docs can't drift from or duplicate the actual implementation.
-
-## Agent skills
-
-### Issue tracker
-
-Issues live in GitHub Issues for `thedahm/uncompose-compare` (use the `gh` CLI). See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Default label vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+They are kept in one place deliberately: two copies of the same instructions drift, and
+then the copy an agent happens to read decides how it behaves.

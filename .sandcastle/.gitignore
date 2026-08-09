@@ -1,3 +1,4 @@
-.env
-logs/
-worktrees/
+*
+!.gitignore
+!CODING_STANDARDS.md
+!sandcastle.config.json
