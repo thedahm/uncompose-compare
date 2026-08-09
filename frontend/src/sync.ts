@@ -15,6 +15,13 @@
  * Keeping the plumbing in the page — not the test — is the point of #5: the
  * thing under test is what the wheel actually ships, exercised the way a
  * browser loads it.
+ *
+ * The static-gain variant (issue #31, spec #26 story 30) re-runs the identical
+ * zero-offset render with distinct per-lane *constant* attenuation applied — the
+ * shape loudness matching (#66/#30) uses. Constant gain, unchanged topology, so
+ * the zero-lag correlation peak and the crossfade bound must both survive; the
+ * variant certifies that on every push so loudness matching can never regress
+ * the sync promise unnoticed.
  */
 
 /** What the harness passes in: base64 fixtures plus the render geometry. */
@@ -49,61 +56,60 @@ interface Correlation {
   bestVal: number;
 }
 
+/** The metrics one render pass yields (unattenuated, or a static-gain variant). */
+export interface VariantResult {
+  identity: ChannelIdentity[];
+  correlation: Correlation;
+}
+
 export interface SyncResult {
   decodeInfo: Record<string, DecodeInfo>;
   identity?: ChannelIdentity[];
   correlation?: Correlation;
+  /**
+   * The static-gain variant: the same zero-offset render with distinct constant
+   * per-lane attenuation applied (issue #31). Absent when the render is skipped.
+   */
+  attenuated?: VariantResult;
   renderSkipped?: boolean;
 }
 
+/** Render geometry shared by every variant: SyncParams minus the fixtures. */
+type Geometry = Omit<SyncParams, "fixtures">;
+
+/** Distinct constant per-lane gains for the audible lanes A and B. */
+interface LaneGains {
+  a: number;
+  b: number;
+}
+
 /**
- * Decode the fixtures, render the dual-source crossfade graph, and return the
- * metrics the harness asserts over. Mirrors the reference #73 graph shape so
- * packaging is proven not to perturb the sync contract.
+ * Render the dual-source crossfade graph once with the given constant per-lane
+ * gains and compute the identity + correlation metrics. `gains.a`/`gains.b`
+ * scale the A and B lanes; `1`/`1` is the faithful unattenuated render. Powers
+ * of two keep the scaled comparison an exact float multiply, so the crossfade
+ * bound stays bit-exact under attenuation.
  */
-export async function renderSync({
-  fixtures,
-  SR,
-  FRAMES,
-  SWITCH_SAMPLE,
-  FADE_SAMPLES,
-}: SyncParams): Promise<SyncResult> {
-  const toArrayBuffer = (base64: string): ArrayBuffer => {
-    const bin = atob(base64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return bytes.buffer;
-  };
+async function renderVariant(
+  geo: Geometry,
+  decoded: Record<string, AudioBuffer>,
+  gains: LaneGains,
+): Promise<VariantResult> {
+  const { SR, FRAMES, SWITCH_SAMPLE, FADE_SAMPLES } = geo;
 
-  // decodeAudioData resamples to the context rate, so the context must be
-  // built at the fixture rate or the decode-count canary is meaningless.
+  // decodeAudioData already resampled to SR; render at the same rate.
   const ctx = new OfflineAudioContext(2, FRAMES, SR);
-  const decoded: Record<string, AudioBuffer> = {};
-  const decodeInfo: Record<string, DecodeInfo> = {};
-  for (const [name, base64] of Object.entries(fixtures)) {
-    try {
-      const buf = await ctx.decodeAudioData(toArrayBuffer(base64));
-      decoded[name] = buf;
-      decodeInfo[name] = {
-        length: buf.length,
-        sampleRate: buf.sampleRate,
-        channels: buf.numberOfChannels,
-      };
-    } catch (e) {
-      decodeInfo[name] = { error: String(e) };
-    }
-  }
-  if (!decoded["a.wav"] || !decoded["b.wav"]) {
-    return { decodeInfo, renderSkipped: true };
-  }
-
-  // Real playback-graph shape: three sample-locked sources (SRC muted) into
-  // per-lane gains, linear crossfade A→B over FADE_SAMPLES.
   const tSwitch = SWITCH_SAMPLE / SR;
   const tEnd = (SWITCH_SAMPLE + FADE_SAMPLES) / SR;
+
+  // Real playback-graph shape: three sample-locked sources (SRC muted) into
+  // per-lane gains, linear crossfade A→B over FADE_SAMPLES. The variant folds
+  // its constant attenuation into each lane's held pre/post gain — the switch
+  // curve is unchanged in shape, only scaled, exactly as loudness matching's
+  // static per-lane gain does (#66).
   const lanes = [
-    { buf: decoded["a.wav"], g0: 1, g1: 0 }, // A
-    { buf: decoded["b.wav"], g0: 0, g1: 1 }, // B
+    { buf: decoded["a.wav"], g0: gains.a, g1: 0 }, // A
+    { buf: decoded["b.wav"], g0: 0, g1: gains.b }, // B
     { buf: decoded["a.wav"], g0: 0, g1: 0 }, // SRC, muted throughout
   ];
   for (const lane of lanes) {
@@ -118,8 +124,9 @@ export async function renderSync({
   }
   const rendered = await ctx.startRendering();
 
-  // Bit-identity outside the fade window, per channel: rendered === A before
-  // the switch, rendered === B after the ramp end. Exact float compare.
+  // Bit-identity outside the fade window, per channel: before the switch the
+  // output is A scaled by gains.a, after the ramp end it is B scaled by gains.b.
+  // Exact float compare (the scale is exact for power-of-two gains).
   const identity: ChannelIdentity[] = [];
   for (let ch = 0; ch < 2; ch++) {
     const out = rendered.getChannelData(ch);
@@ -131,24 +138,28 @@ export async function renderSync({
     let firstPost = -1;
     let maxDiff = 0;
     for (let i = 0; i < SWITCH_SAMPLE; i++) {
-      if (out[i] !== a[i]) {
+      const expected = a[i] * gains.a;
+      if (out[i] !== expected) {
         preMismatch++;
         if (firstPre < 0) firstPre = i;
-        maxDiff = Math.max(maxDiff, Math.abs(out[i] - a[i]));
+        maxDiff = Math.max(maxDiff, Math.abs(out[i] - expected));
       }
     }
     for (let i = SWITCH_SAMPLE + FADE_SAMPLES; i < FRAMES; i++) {
-      if (out[i] !== b[i]) {
+      const expected = b[i] * gains.b;
+      if (out[i] !== expected) {
         postMismatch++;
         if (firstPost < 0) firstPost = i;
-        maxDiff = Math.max(maxDiff, Math.abs(out[i] - b[i]));
+        maxDiff = Math.max(maxDiff, Math.abs(out[i] - expected));
       }
     }
     identity.push({ ch, preMismatch, postMismatch, firstPre, firstPost, maxDiff });
   }
 
   // Cross-correlation of the post-switch region against expected candidate B,
-  // lags -256..256; the contract wants the peak at exactly lag 0.
+  // lags -256..256; the contract wants the peak at exactly lag 0. A constant
+  // lane gain scales every product equally, so it can move the peak's height but
+  // never its lag — which is the whole point the variant certifies.
   const out = rendered.getChannelData(0);
   const b = decoded["b.wav"].getChannelData(0);
   const start = SWITCH_SAMPLE + FADE_SAMPLES + 256;
@@ -176,7 +187,62 @@ export async function renderSync({
     bestVal,
   };
 
-  return { decodeInfo, identity, correlation };
+  return { identity, correlation };
+}
+
+/**
+ * Decode the fixtures, render the dual-source crossfade graph, and return the
+ * metrics the harness asserts over. Mirrors the reference #73 graph shape so
+ * packaging is proven not to perturb the sync contract. Runs the render twice:
+ * once faithful (unattenuated) and once with distinct constant per-lane gains
+ * (the static-gain variant, issue #31), so the same push proves attenuation
+ * leaves the zero-offset promise intact.
+ */
+export async function renderSync({
+  fixtures,
+  SR,
+  FRAMES,
+  SWITCH_SAMPLE,
+  FADE_SAMPLES,
+}: SyncParams): Promise<SyncResult> {
+  const toArrayBuffer = (base64: string): ArrayBuffer => {
+    const bin = atob(base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes.buffer;
+  };
+
+  // decodeAudioData resamples to the context rate, so the context must be
+  // built at the fixture rate or the decode-count canary is meaningless.
+  const decodeCtx = new OfflineAudioContext(2, FRAMES, SR);
+  const decoded: Record<string, AudioBuffer> = {};
+  const decodeInfo: Record<string, DecodeInfo> = {};
+  for (const [name, base64] of Object.entries(fixtures)) {
+    try {
+      const buf = await decodeCtx.decodeAudioData(toArrayBuffer(base64));
+      decoded[name] = buf;
+      decodeInfo[name] = {
+        length: buf.length,
+        sampleRate: buf.sampleRate,
+        channels: buf.numberOfChannels,
+      };
+    } catch (e) {
+      decodeInfo[name] = { error: String(e) };
+    }
+  }
+  if (!decoded["a.wav"] || !decoded["b.wav"]) {
+    return { decodeInfo, renderSkipped: true };
+  }
+
+  const geo: Geometry = { SR, FRAMES, SWITCH_SAMPLE, FADE_SAMPLES };
+  // Faithful render (the existing contract), then the static-gain variant with
+  // distinct attenuations (A −6 dB, B −12 dB): both exact powers of two so the
+  // scaled crossfade bound stays bit-identical, and both ≤ 0 dB like loudness
+  // matching, which only ever attenuates (#66).
+  const faithful = await renderVariant(geo, decoded, { a: 1, b: 1 });
+  const attenuated = await renderVariant(geo, decoded, { a: 0.5, b: 0.25 });
+
+  return { decodeInfo, ...faithful, attenuated };
 }
 
 declare global {
