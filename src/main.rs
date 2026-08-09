@@ -142,18 +142,30 @@ fn resolve_lanes(
     let b_lane = lane_for(&rb);
 
     // The SRC lane: the candidates' shared source, unless opted out. Sharing none
-    // is a stated absence, not an error.
+    // is a stated absence, not an error — so it is stated here (ADR-0009), on
+    // stderr, leaving stdout's first line the tokened URL the CLI contract
+    // promises. `--exclude-source` is the listener's own choice and says nothing.
     let source_lane = if cli.exclude_source {
         None
     } else {
-        manifest.shared_source(&ra, &rb)?.map(|asset| Lane {
-            path: project_dir.join(&asset.file),
-            expected_sha256: Some(asset.sha256.clone()),
-            // SRC is a playback lane, not a comparison candidate — it never enters
-            // the record's `candidates[]`, so it carries no recorded asset/project.
-            asset: None,
-            project: None,
-        })
+        match manifest.shared_source(&ra, &rb)? {
+            Some(asset) => Some(Lane {
+                path: project_dir.join(&asset.file),
+                expected_sha256: Some(asset.sha256.clone()),
+                // SRC is a playback lane, not a comparison candidate — it never
+                // enters the record's `candidates[]`, so it carries no recorded
+                // asset/project.
+                asset: None,
+                project: None,
+            }),
+            None => {
+                eprintln!(
+                    "uncompose-compare: note: {a_tok} and {b_tok} share no source asset \
+                     in this project — the session has no SRC lane"
+                );
+                None
+            }
+        }
     };
 
     Ok((a_lane, b_lane, source_lane))

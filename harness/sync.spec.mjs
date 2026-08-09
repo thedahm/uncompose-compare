@@ -25,6 +25,9 @@ const FIXTURES = {
   "b.wav": b64("b.wav"),
   "a.flac": b64("a.flac"),
   "b.flac": b64("b.flac"),
+  // The shared source the SRC lane plays (spec #42) — a third uncorrelated
+  // noise, so the three-lane render can be correlated against it on its own.
+  "src.wav": b64("src.wav"),
 };
 
 const SR = 44100;
@@ -72,7 +75,7 @@ test("decode-count canary: FLAC and WAV decode to exact sample counts", () => {
   console.log(JSON.stringify(result, null, 2));
   // "a.proxy" is the proxy the running server transcoded from candidate A;
   // decoding it to the same sample count certifies the #74 pipeline output.
-  for (const name of ["a.wav", "b.wav", "a.flac", "b.flac", "a.proxy"]) {
+  for (const name of ["a.wav", "b.wav", "a.flac", "b.flac", "src.wav", "a.proxy"]) {
     const info = result.decodeInfo[name];
     expect(info.error, `${name} decode error`).toBeUndefined();
     expect(info.length, `${name} sample count`).toBe(FRAMES);
@@ -123,4 +126,34 @@ test("static-gain variant: crossfade bound holds under attenuation", () => {
 test("crossfade bound: bit-identical output outside the 10 ms window", () => {
   expect(result.renderSkipped).toBeFalsy();
   expectBitIdentity(result.identity);
+});
+
+// The SRC lane (spec #42, ADR-0009): a project session plays a third lane that
+// joins the sample-locked graph and the loudness match group but is never a
+// switch target. These three assert what that costs the sync contract — nothing:
+// the live candidate still peaks at lag 0, the source itself peaks at lag 0 in
+// the same render, and the crossfade bound holds over the summed mix.
+test("SRC lane: the switching pair still renders at zero offset with the source audible", () => {
+  expect(result.renderSkipped).toBeFalsy();
+  expect(result.threeLane).toBeTruthy();
+  expect(result.threeLane.correlation.bestLag).toBe(0);
+  expect(result.threeLane.correlation.peakRatio).toBeGreaterThan(2);
+});
+
+test("SRC lane: the source lane itself renders at zero offset", () => {
+  // Correlated against the source fixture over the same post-switch region: SRC
+  // rides the one transport, started at the same offset as A and B, so its peak
+  // must land at exactly lag 0 too.
+  expect(result.renderSkipped).toBeFalsy();
+  expect(result.threeLane.sourceCorrelation.bestLag).toBe(0);
+  expect(result.threeLane.sourceCorrelation.peakRatio).toBeGreaterThan(2);
+});
+
+test("SRC lane: crossfade bound holds over the mix of candidate and source", () => {
+  // Each of the three lanes at its own static loudness-match gain (A −6 dB,
+  // B −12 dB, SRC −18 dB). Outside the fade window the output must equal the
+  // live candidate plus the source, sample for sample — a source lane off by one
+  // sample would light this up.
+  expect(result.renderSkipped).toBeFalsy();
+  expectBitIdentity(result.threeLane.identity);
 });

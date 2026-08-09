@@ -15,8 +15,9 @@
 //! filename, so the message alone tells the listener what they could have named.
 //!
 //! The SRC lane is auto-resolved: the asset that is an input of *both*
-//! candidates' producing derivations. Share none and the lane is simply absent
-//! (stated at launch, not an error); `--exclude-source` opts out entirely. The
+//! candidates' producing derivations. Share none and the lane is simply absent —
+//! not an error, and the launch states it (`main.rs`) rather than leaving the
+//! listener to notice; `--exclude-source` opts out entirely. The
 //! resolved files carry their manifest sha256, checked at load by the existing
 //! hashing pipeline (`session.rs`), so a manifest that no longer matches the
 //! bytes on disk refuses before the server binds.
@@ -148,13 +149,12 @@ impl Manifest {
                 asset,
                 derivation: None,
             }),
+            // The slug is what collided, so it names every match equally — the
+            // asset id is the field that tells them apart here.
             many => Err(ProjectError::Ambiguous(format!(
                 "slug {slug:?} names {} assets: {}",
                 many.len(),
-                many.iter()
-                    .map(|a| format!("{} ({})", a.id, a.file))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                asset_listing(many, |a| a.id.as_str())
             ))),
         }
     }
@@ -272,14 +272,22 @@ impl Manifest {
     }
 }
 
-/// Render a set of output assets as `slug (filename)` pairs, the shape both the
-/// no-match and ambiguity messages list so a listener can pick the right ref.
-fn outputs_listing(outputs: &[&Asset]) -> String {
-    outputs
+/// Render assets as `<lead> (filename)` pairs — the one listing shape every
+/// resolution error uses, so a listener reads the same thing everywhere. `lead`
+/// picks the field that actually distinguishes the entries: the slug for a
+/// derivation's outputs (the handle a ref would name), the id when the slug is
+/// what collided.
+fn asset_listing(assets: &[&Asset], lead: impl Fn(&Asset) -> &str) -> String {
+    assets
         .iter()
-        .map(|a| format!("{} ({})", a.slug, a.file))
+        .map(|a| format!("{} ({})", lead(a), a.file))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// A derivation's outputs, listed by the slug a ref would name.
+fn outputs_listing(outputs: &[&Asset]) -> String {
+    asset_listing(outputs, |a| a.slug.as_str())
 }
 
 fn parse_assets(value: &Value, display: &str) -> Result<Vec<Asset>, ProjectError> {
@@ -443,8 +451,17 @@ pub fn uncompose_project_on_path() -> bool {
 mod tests {
     use super::*;
 
+    fn from_json(value: Value) -> Manifest {
+        Manifest {
+            id: value["id"].as_str().unwrap().to_string(),
+            assets: parse_assets(&value, "test").unwrap(),
+            derivations: parse_derivations(&value, "test").unwrap(),
+            root: PathBuf::from("/proj"),
+        }
+    }
+
     fn manifest() -> Manifest {
-        let value = serde_json::json!({
+        from_json(serde_json::json!({
             "id": "01PROJECT",
             "assets": [
                 {"id": "raw", "slug": "raw", "file": "src/take.wav", "sha256": "a".repeat(64)},
@@ -455,13 +472,26 @@ mod tests {
                 {"id": "deriv-a", "inputs": ["raw"], "outputs": ["mix-a"]},
                 {"id": "deriv-b", "inputs": ["raw"], "outputs": ["mix-b"]}
             ]
-        });
-        Manifest {
-            id: value["id"].as_str().unwrap().to_string(),
-            assets: parse_assets(&value, "test").unwrap(),
-            derivations: parse_derivations(&value, "test").unwrap(),
-            root: PathBuf::from("/proj"),
-        }
+        }))
+    }
+
+    /// A manifest where each ambiguity is reachable: two assets share the slug
+    /// `raw`, one derivation outputs two files sharing the basename-stem
+    /// `vocals`, and that derivation takes *both* raws as input — so the two
+    /// mixes share two possible sources.
+    fn ambiguous_manifest() -> Manifest {
+        from_json(serde_json::json!({
+            "id": "01AMBIGUOUS",
+            "assets": [
+                {"id": "raw-1", "slug": "raw", "file": "src/take-1.wav", "sha256": "a".repeat(64)},
+                {"id": "raw-2", "slug": "raw", "file": "src/take-2.wav", "sha256": "b".repeat(64)},
+                {"id": "mix-a", "slug": "mix-a", "file": "out/a/vocals.wav", "sha256": "c".repeat(64)},
+                {"id": "mix-b", "slug": "mix-b", "file": "out/b/vocals.wav", "sha256": "d".repeat(64)}
+            ],
+            "derivations": [
+                {"id": "mix", "inputs": ["raw-1", "raw-2"], "outputs": ["mix-a", "mix-b"]}
+            ]
+        }))
     }
 
     #[test]
@@ -493,13 +523,59 @@ mod tests {
     }
 
     #[test]
-    fn no_match_and_ambiguity_are_distinct_errors() {
+    fn a_ref_matching_nothing_is_a_no_match() {
         let m = manifest();
         assert!(matches!(m.resolve("nope"), Err(ProjectError::NoMatch(_))));
         assert!(matches!(
             m.resolve("nope@deriv-a"),
             Err(ProjectError::NoMatch(_))
         ));
+        // An unknown derivation is a no-match too, named as such.
+        assert!(matches!(
+            m.resolve("vocals@nope"),
+            Err(ProjectError::NoMatch(_))
+        ));
+    }
+
+    #[test]
+    fn a_ref_matching_several_assets_is_ambiguous_and_lists_them() {
+        let m = ambiguous_manifest();
+
+        // Two assets carry the slug `raw`: the slug names them both equally, so
+        // the listing leads with the ids that tell them apart.
+        let Err(ProjectError::Ambiguous(msg)) = m.resolve("raw") else {
+            panic!("a duplicated slug is ambiguous");
+        };
+        assert!(
+            msg.contains("raw-1 (src/take-1.wav)") && msg.contains("raw-2 (src/take-2.wav)"),
+            "the colliding assets are listed: {msg}"
+        );
+
+        // Two outputs of one derivation share the basename-stem `vocals`, which
+        // the `<name>@<derivation>` form cannot tell apart.
+        let Err(ProjectError::Ambiguous(msg)) = m.resolve("vocals@mix") else {
+            panic!("two outputs sharing a basename-stem are ambiguous");
+        };
+        assert!(
+            msg.contains("mix-a (out/a/vocals.wav)") && msg.contains("mix-b (out/b/vocals.wav)"),
+            "the colliding outputs are listed by slug and filename: {msg}"
+        );
+    }
+
+    #[test]
+    fn two_shared_inputs_are_an_ambiguous_source() {
+        // Both mixes come out of the one derivation that takes both raws, so the
+        // SRC lane has two candidates — refused with the options and the way out.
+        let m = ambiguous_manifest();
+        let a = m.resolve("mix-a").unwrap();
+        let b = m.resolve("mix-b").unwrap();
+        let Err(ProjectError::SourceAmbiguous(msg)) = m.shared_source(&a, &b) else {
+            panic!("sharing two inputs is an ambiguous source");
+        };
+        assert!(
+            msg.contains("raw-1") && msg.contains("raw-2") && msg.contains("--exclude-source"),
+            "the options and the opt-out are named: {msg}"
+        );
     }
 
     #[test]

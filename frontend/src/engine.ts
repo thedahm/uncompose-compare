@@ -71,6 +71,15 @@ export class PlaybackEngine {
    */
   private laneIds: LaneId[];
   private buffers: Partial<Record<LaneId, AudioBuffer>>;
+  /**
+   * The lane with the longest buffer — the one that defines the transport
+   * length, and so the only lane whose `onended` ends playback. A shorter lane
+   * running out first is just that lane going quiet; ending the transport there
+   * would leave the longer lanes audible with `sources` already dropped, hence
+   * unreachable for teardown. ADR-0009 blesses a SRC lane of a different length,
+   * so mismatched lanes are an endorsed configuration, not an edge case.
+   */
+  private longest: LaneId;
   private gains: Partial<Record<LaneId, GainNode>>;
   /**
    * The static per-lane playback gain (linear), applied to the audible lane's
@@ -118,6 +127,9 @@ export class PlaybackEngine {
     this.ctx = ctx;
     this.buffers = source ? { A: a, B: b, SRC: source } : { A: a, B: b };
     this.laneIds = Object.keys(this.buffers) as LaneId[];
+    this.longest = this.laneIds.reduce((longest, id) =>
+      this.buffers[id]!.duration > this.buffers[longest]!.duration ? id : longest,
+    );
     // Any lane the match does not name plays at unity — faithful as-is (#66).
     this.laneGain = { A: 1, B: 1, SRC: 1, ...laneGain };
     this.gains = {};
@@ -138,7 +150,7 @@ export class PlaybackEngine {
 
   /** Transport length: the longest lane (they start locked at 0). */
   duration(): number {
-    return Math.max(...this.laneIds.map((id) => this.buffers[id]!.duration));
+    return this.buffers[this.longest]!.duration;
   }
 
   live(): LaneId {
@@ -338,15 +350,21 @@ export class PlaybackEngine {
         label === this.liveLabel ? this.laneGain[label] : 0,
         now,
       );
-      src.onended = () => {
-        // Only the freshest generation drives transport state; a stop/seek that
-        // tore these sources down has already moved on.
-        if (generation !== this.generation) return;
-        this.playing = false;
-        this.pausePos = this.duration();
-        this.sources = null;
-        this.onEnded?.();
-      };
+      // Playback has reached the end only when the *longest* lane runs out; a
+      // shorter lane ending is not the end of the transport, so it drives no
+      // transport state (it would silence the still-playing longer lanes'
+      // teardown path out from under them).
+      if (label === this.longest) {
+        src.onended = () => {
+          // Only the freshest generation drives transport state; a stop/seek that
+          // tore these sources down has already moved on.
+          if (generation !== this.generation) return;
+          this.playing = false;
+          this.pausePos = this.duration();
+          this.sources = null;
+          this.onEnded?.();
+        };
+      }
       // A source shorter than the transport is started only within its own span.
       if (offset < buffer.duration) src.start(0, offset);
     });

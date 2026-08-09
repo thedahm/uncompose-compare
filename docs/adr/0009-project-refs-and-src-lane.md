@@ -62,7 +62,10 @@ plus the A/B gains would let a listener back out A/B's measured LUFS — the ver
 because a duration/rate/channel difference *between the concealed candidates* would have to be
 displayed and would identify them. SRC is identified and is allowed to differ (a different
 master, a different rate); it joins the sample-locked graph clamped to the shortest lane like
-A/B, so a length difference degrades looping gracefully rather than refusing.
+A/B, so a length difference degrades looping gracefully rather than refusing. Playback runs to
+the *longest* lane: a shorter one falls silent at its own end, and only the longest ending ends
+the transport — otherwise the short lane would stop a transport whose other lanes are still
+sounding.
 
 ## The SRC auto-resolution rule
 
@@ -70,10 +73,12 @@ Project mode resolves the SRC lane as **the asset that is an input of both candi
 producing derivations**. A candidate resolved via `name@derivation` has that derivation as its
 producer; a bare-slug candidate's producers are every derivation that outputs it. The shared
 source is the intersection of the two candidates' producer-inputs, minus the candidates
-themselves. Share exactly one → that is SRC; share none → the lane is simply absent (a stated
-absence at launch, not an error); share more than one → ambiguous, refused with the options
-listed (pass `--exclude-source`). Bare-file mode has no manifest, so it takes an explicit
-`--source <path>`; without it there is no SRC lane.
+themselves. Share exactly one → that is SRC; share none → the lane is simply absent, and the
+launch *says so* — a note on stderr naming both refs, before the served URL goes to stdout, so
+a missing third lane is never something the listener has to infer; share more than one →
+ambiguous, refused with the options listed (pass `--exclude-source`). Bare-file mode has no
+manifest, so it takes an explicit `--source <path>`; without it there is no SRC lane.
+`--exclude-source` says nothing: the listener asked for the absence.
 
 ## Consequences
 

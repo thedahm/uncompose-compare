@@ -2499,6 +2499,39 @@ fn build_project() -> Project {
     Project { dir, id }
 }
 
+/// A project where every ambiguity is reachable: two assets share the slug
+/// `raw`, one derivation outputs two files sharing the basename-stem `vocals`,
+/// and that derivation takes *both* raws as input — so the two mixes share two
+/// possible sources. The counterpart to `build_project`, which is unambiguous
+/// throughout.
+fn build_ambiguous_project() -> Project {
+    let dir = TempDir::new("project-ambiguous");
+    let id = "01AMBIGUOUSULID0000000000000".to_string();
+    let raw1_sha = wav_asset(&dir.path, "src/take-1.wav", 21, 1.0);
+    let raw2_sha = wav_asset(&dir.path, "src/take-2.wav", 22, 1.0);
+    let a_sha = wav_asset(&dir.path, "out/a/vocals.wav", 23, 1.0);
+    let b_sha = wav_asset(&dir.path, "out/b/vocals.wav", 24, 1.0);
+    let manifest = serde_json::json!({
+        "schema": "https://uncompose.org/schemas/project/v0/uncompose.project.json",
+        "id": id,
+        "assets": [
+            {"id": "raw-1", "slug": "raw", "file": "src/take-1.wav", "sha256": raw1_sha},
+            {"id": "raw-2", "slug": "raw", "file": "src/take-2.wav", "sha256": raw2_sha},
+            {"id": "mix-a", "slug": "mix-a", "file": "out/a/vocals.wav", "sha256": a_sha},
+            {"id": "mix-b", "slug": "mix-b", "file": "out/b/vocals.wav", "sha256": b_sha}
+        ],
+        "derivations": [
+            {"id": "mix", "inputs": ["raw-1", "raw-2"], "outputs": ["mix-a", "mix-b"]}
+        ]
+    });
+    std::fs::write(
+        dir.join("uncompose.project.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .expect("write manifest");
+    Project { dir, id }
+}
+
 /// Launch a project session: `uncompose-compare --project <dir> <refs…> <extra…>`
 /// with the stub tool on PATH and a chosen invoking directory (the record's
 /// destination). Parses the tokened URL like every other launch.
@@ -2668,7 +2701,91 @@ fn project_exclude_source_drops_the_shared_lane() {
 }
 
 #[test]
-fn project_no_match_and_ambiguity_list_the_outputs() {
+fn project_states_the_absent_source_lane_at_launch() {
+    // Sharing no source is a stated absence, not an error (ADR-0009): the launch
+    // says so on stderr — stdout's first line stays the tokened URL — and then
+    // serves the two-lane session.
+    let project = build_project();
+    let (_tool, path_env) = stub_project_tool();
+    let cwd = TempDir::new("project-note-cwd");
+    let mut command = Command::new(BIN);
+    command
+        .arg("--project")
+        .arg(&project.dir.path)
+        .args(["raw", "mix-a"])
+        .env("PATH", &path_env)
+        .current_dir(&cwd.path)
+        .stderr(Stdio::piped());
+    // `serving_from` reads the URL from stdout and leaves stderr as piped here;
+    // the note is printed before the URL, so it is already readable.
+    let mut server = serving_from(command, TempDir::new("project-note-hold"));
+    let stderr = server.child.stderr.take().expect("child stderr");
+    let mut note = String::new();
+    BufReader::new(stderr)
+        .read_line(&mut note)
+        .expect("read the launch note");
+    assert!(
+        note.contains("raw") && note.contains("mix-a") && note.contains("no SRC lane"),
+        "the absent SRC lane is stated at launch, naming the pair: {note:?}"
+    );
+}
+
+#[test]
+fn project_ambiguous_refs_refuse_and_list_the_options() {
+    let project = build_ambiguous_project();
+    let (_tool, path_env) = stub_project_tool();
+
+    // A slug two assets carry: refused, listing the assets by id and filename.
+    let (code, stderr) = project_failure(&project.dir.path, &["raw", "mix-a"], &[], &path_env);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("raw-1 (src/take-1.wav)") && stderr.contains("raw-2 (src/take-2.wav)"),
+        "a duplicated slug is refused, listing the colliding assets: {stderr}"
+    );
+
+    // A basename-stem two outputs of the derivation share: refused, listing the
+    // outputs by slug and filename — the same shape the no-match message uses.
+    let (code, stderr) =
+        project_failure(&project.dir.path, &["vocals@mix", "mix-b"], &[], &path_env);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("mix-a (out/a/vocals.wav)") && stderr.contains("mix-b (out/b/vocals.wav)"),
+        "a shared basename-stem is refused, listing the derivation's outputs: {stderr}"
+    );
+}
+
+#[test]
+fn project_ambiguous_source_refuses_with_the_exclude_hint_that_works() {
+    // The two mixes come out of one derivation taking both raws, so the SRC lane
+    // has two candidates: refused before binding, with the options and the way
+    // out named — and that way out actually launches.
+    let project = build_ambiguous_project();
+    let (_tool, path_env) = stub_project_tool();
+    let (code, stderr) = project_failure(&project.dir.path, &["mix-a", "mix-b"], &[], &path_env);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("raw-1") && stderr.contains("raw-2") && stderr.contains("--exclude-source"),
+        "an ambiguous source lists the options and the opt-out: {stderr}"
+    );
+
+    let cwd = TempDir::new("project-ambiguous-source-cwd");
+    let server = launch_project(
+        &project.dir.path,
+        &cwd.path,
+        &["mix-a", "mix-b"],
+        &["--exclude-source"],
+        &path_env,
+    );
+    let json = session_json(&server);
+    let s: serde_json::Value = serde_json::from_str(&json).expect("session json");
+    assert!(
+        s.get("source").is_none(),
+        "the hinted --exclude-source opens the session without a SRC lane: {json}"
+    );
+}
+
+#[test]
+fn project_no_match_lists_the_outputs() {
     let project = build_project();
     let (_tool, path_env) = stub_project_tool();
 
