@@ -1972,6 +1972,71 @@ fn blind_record_reconnects_labels_to_the_real_hashes() {
 }
 
 #[test]
+fn blind_conclude_reveals_the_mapping_matching_the_record() {
+    // Reveal at conclude (issue #29): the successful conclude response carries the
+    // label→file mapping the UI displays, and it is identical to what the record
+    // on disk carries. The reveal is the single irreversible event's payload — the
+    // browser never received identity before it.
+    let cwd = TempDir::new("blind-reveal-cwd");
+    let files = TempDir::new("blind-reveal-files");
+    let a = files.join("alpha.wav");
+    let b = files.join("bravo.wav");
+    write_wav(&a, 44_100, 44_100, 2, 51);
+    write_wav(&b, 44_100, 44_100, 2, 52);
+
+    let mut command = Command::new(BIN);
+    command
+        .arg(&a)
+        .arg(&b)
+        .arg("--blind")
+        .current_dir(&cwd.path);
+    let server = serving_from(command, TempDir::new("blind-reveal-hold"));
+
+    let body =
+        r#"{"result": {"preference": "A", "confidence": 4}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(
+        status,
+        200,
+        "a blind session concludes: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let response: serde_json::Value =
+        serde_json::from_slice(&resp).expect("conclude response is json");
+    let reveal = response["reveal"]
+        .as_array()
+        .expect("the conclude response reveals the label→file mapping");
+    assert_eq!(reveal.len(), 2, "both labels revealed: {response}");
+
+    // The reveal reconnects each label to its real file, identical to the record.
+    let record = validate_record_file(&sole_record(&cwd.path));
+    let record_candidates = record["candidates"].as_array().unwrap();
+    for label in ["A", "B"] {
+        let r = reveal
+            .iter()
+            .find(|c| c["label"] == label)
+            .unwrap_or_else(|| panic!("reveal names label {label}: {response}"));
+        let rec = record_candidates
+            .iter()
+            .find(|c| c["label"] == label)
+            .unwrap();
+        assert_eq!(
+            r["path"], rec["path"],
+            "reveal path matches record for {label}"
+        );
+        assert_eq!(
+            r["sha256"], rec["sha256"],
+            "reveal sha256 matches record for {label}"
+        );
+        assert_eq!(
+            r["size"], rec["size"],
+            "reveal size matches record for {label}"
+        );
+    }
+}
+
+#[test]
 fn sighted_mode_is_unaffected_by_the_blind_flag() {
     // A plain (no --blind) session still carries full metadata and mode "ab".
     let dir = TempDir::new("blind-sighted-unaffected");

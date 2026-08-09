@@ -48,6 +48,14 @@ pub struct Recorder {
     concluded: Cell<bool>,
 }
 
+/// A successful conclude: where the immutable record landed, and the reveal the
+/// UI displays — the label→file mapping (`{label, path, sha256, size}` per
+/// candidate), identical to what the record carries (#29).
+pub struct Conclusion {
+    pub path: String,
+    pub reveal: Value,
+}
+
 /// Why a conclude was refused, mapped to an HTTP status the UI can act on.
 pub enum RecordError {
     /// A second conclude, or any conclude after a successful write (#65).
@@ -114,7 +122,13 @@ impl Recorder {
     /// `schema`/`id`/timestamps/`candidates`/`mode`/`playback` (so hashes and
     /// paths can't be forged from the browser); the body supplies only `result`,
     /// `observations`, `loops`, and `context`.
-    pub fn conclude(&self, session: &Session, body: &str) -> Result<String, RecordError> {
+    ///
+    /// On success returns where the record landed plus the reveal — the
+    /// label→file mapping (`{label, path, sha256, size}` per candidate, identical
+    /// to what was written). A blind session (#29) concealed identity from the
+    /// browser until now; the successful write is the one irreversible event, so
+    /// the reveal rides its response and nothing before it.
+    pub fn conclude(&self, session: &Session, body: &str) -> Result<Conclusion, RecordError> {
         // Refuse a second conclude before doing any work.
         if self.concluded.get() {
             return Err(RecordError::AlreadyConcluded);
@@ -139,6 +153,10 @@ impl Recorder {
             .collect();
 
         let id = new_ulid().map_err(|e| RecordError::Io(e.to_string()))?;
+
+        // The reveal is exactly the trusted candidates the record carries, so the
+        // mapping the UI shows post-conclude cannot diverge from what was written.
+        let reveal = Value::Array(candidates.clone());
 
         let mut record = json!({
             "schema": self.schema_id,
@@ -180,7 +198,10 @@ impl Recorder {
 
         // Only a completed write concludes the session; that write is the one.
         self.concluded.set(true);
-        Ok(dest.display().to_string())
+        Ok(Conclusion {
+            path: dest.display().to_string(),
+            reveal,
+        })
     }
 
     /// Write `record` to `dest` atomically, exactly once.

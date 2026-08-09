@@ -47,17 +47,32 @@ import {
 import { addObservation, emptyLedger, makeObservation, redo, undo, type Ledger, type Target } from "./ledger";
 import { buildRecordPayload, type Verdict } from "./record";
 
+/**
+ * A session candidate. In a sighted session every field is present; in a blind
+ * one (#28) the server conceals identity, so only `label`, `duration_ms`, and
+ * the opaque `audio` reference arrive — name, path, sha256, size, and the
+ * per-candidate technical metadata are omitted (the browser cannot leak what it
+ * does not have). Reveal comes only at conclude (#29).
+ */
 interface Candidate {
   label: string;
-  name: string;
+  name?: string;
+  path?: string;
+  sha256?: string;
+  size?: number;
+  frames?: number;
+  duration_ms: number;
+  sample_rate?: number;
+  channels?: number;
+  audio: string;
+}
+
+/** One label's revealed identity, returned by conclude and shown post-write (#29). */
+interface RevealCandidate {
+  label: Label;
   path: string;
   sha256: string;
   size: number;
-  frames: number;
-  duration_ms: number;
-  sample_rate: number;
-  channels: number;
-  audio: string;
 }
 
 /** One lane's loudness-match figures, as the session (and record) report them. */
@@ -79,12 +94,18 @@ interface LoudnessMatch {
 
 interface SessionMeta {
   candidates: Candidate[];
-  duration_mismatch: boolean;
-  duration_delta_samples: number;
-  duration_delta_ms: number;
   loudness_match: LoudnessMatch;
-  sample_rate_mismatch: boolean;
-  channel_count_mismatch: boolean;
+  /**
+   * A blind session (#28): the label↔file assignment was shuffled at load and
+   * every identifying detail is concealed. The mismatch flags below are omitted
+   * (blind mode refuses any mismatch pre-bind), so they are absent, not `false`.
+   */
+  blind?: boolean;
+  duration_mismatch?: boolean;
+  duration_delta_samples?: number;
+  duration_delta_ms?: number;
+  sample_rate_mismatch?: boolean;
+  channel_count_mismatch?: boolean;
 }
 
 /** Waveform/loudness envelope resolution — enough detail without paint cost. */
@@ -171,10 +192,13 @@ export function App() {
   const [draft, setDraft] = useState<Verdict>(emptyVerdict);
   const [draftContext, setDraftContext] = useState("");
   const [verdictOpen, setVerdictOpen] = useState(false);
-  // The conclude outcome: where the record landed, or why the write was refused.
-  const [concludeResult, setConcludeResult] = useState<{ path?: string; error?: string } | null>(
-    null,
-  );
+  // The conclude outcome: where the record landed (with the revealed label→file
+  // mapping, #29), or why the write was refused.
+  const [concludeResult, setConcludeResult] = useState<{
+    path?: string;
+    reveal?: RevealCandidate[];
+    error?: string;
+  } | null>(null);
 
   const engineRef = useRef<PlaybackEngine | null>(null);
   const startedRef = useRef(false);
@@ -373,9 +397,15 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const data = (await res.json().catch(() => ({}))) as { path?: string; error?: string };
+      const data = (await res.json().catch(() => ({}))) as {
+        path?: string;
+        reveal?: RevealCandidate[];
+        error?: string;
+      };
       setConcludeResult(
-        res.ok ? { path: data.path } : { error: data.error ?? `record ${res.status}` },
+        res.ok
+          ? { path: data.path, reveal: data.reveal }
+          : { error: data.error ?? `record ${res.status}` },
       );
     } catch (e) {
       setConcludeResult({ error: String(e) });
@@ -473,7 +503,7 @@ export function App() {
       {session?.duration_mismatch && (
         <p role="alert" data-testid="duration-mismatch" style={{ color: "#ffcf6b" }}>
           Duration mismatch: the candidates differ by {session.duration_delta_samples}{" "}
-          samples ({session.duration_delta_ms.toFixed(1)} ms). Both still load.
+          samples ({(session.duration_delta_ms ?? 0).toFixed(1)} ms). Both still load.
         </p>
       )}
 
@@ -605,60 +635,100 @@ export function App() {
           {/* SRC lane: an empty structural slot (needs --source / project mode, M5). */}
           <div data-testid="src-lane-slot" aria-hidden="true" />
 
-          {/* A/B lane rows: click to audition; ● marks the live lane. */}
-          <div data-testid="lanes">
-            {(["A", "B"] as Label[]).map((label) => {
-              const c = candidates[label];
-              const isLive = live === label;
-              return (
-                <div
-                  key={label}
-                  data-testid={`lane-${label}`}
-                  data-live={isLive}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    marginBottom: 6,
-                    padding: 4,
-                    borderLeft: `3px solid ${isLive ? "#fff" : "transparent"}`,
-                  }}
-                >
-                  {/* Clicking the label auditions; dragging the waveform selects a
-                      region, while a plain click on it also auditions (onActivate). */}
-                  <span style={{ width: 90, cursor: "pointer" }} onClick={() => switchTo(label)}>
+          {/* A blind session (#29) hides the identifying A/B lane rows and shows
+              two anonymous switch buttons in their place (per the #61 design); a
+              sighted session keeps the labelled lane rows with their waveforms.
+              Either way the live lane switches by button and by `x`. */}
+          {session?.blind ? (
+            <div data-testid="switch-buttons" role="group" aria-label="Switch candidate">
+              {(["A", "B"] as Label[]).map((label) => {
+                const isLive = live === label;
+                return (
+                  <button
+                    key={label}
+                    data-testid={`switch-${label}`}
+                    data-live={isLive}
+                    aria-pressed={isLive}
+                    onClick={() => switchTo(label)}
+                    style={{
+                      marginRight: 8,
+                      padding: "8px 16px",
+                      fontWeight: "bold",
+                      borderLeft: `3px solid ${isLive ? "#fff" : "transparent"}`,
+                    }}
+                  >
+                    {/* An anonymous button carries only the label and the live
+                        marker — no name, path, hash, or size (concealment). */}
                     <span data-testid={`live-marker-${label}`}>{isLive ? "● " : "  "}</span>
-                    <strong>{label}</strong> {c.name}
-                  </span>
-                  {/* The saved verdict shows its colour-coded confidence stars on
-                      the preferred lane row (issue #16). */}
-                  {saved?.verdict.preference === label && saved.verdict.confidence !== null && (
-                    <Stars
-                      confidence={saved.verdict.confidence}
-                      testid={`verdict-stars-${label}`}
-                      title={`Preferred — confidence ${saved.verdict.confidence}/5`}
-                    />
-                  )}
-                  <div style={{ flex: 1 }}>
-                    <Waveform
-                      views={views[label]}
-                      view={view}
-                      duration={duration}
-                      position={position}
-                      onSeek={seek}
-                      region={region}
-                      looping={looping}
-                      onSelectRegion={selectRegion}
-                      onActivate={() => switchTo(label)}
-                      color={candidateColor(label)}
-                      height={48}
-                      testid={`waveform-${label}`}
-                    />
+                    {label}
+                    {saved?.verdict.preference === label && saved.verdict.confidence !== null && (
+                      <Stars
+                        confidence={saved.verdict.confidence}
+                        testid={`verdict-stars-${label}`}
+                        title={`Preferred — confidence ${saved.verdict.confidence}/5`}
+                        style={{ marginLeft: 6 }}
+                      />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            /* A/B lane rows: click to audition; ● marks the live lane. */
+            <div data-testid="lanes">
+              {(["A", "B"] as Label[]).map((label) => {
+                const c = candidates[label];
+                const isLive = live === label;
+                return (
+                  <div
+                    key={label}
+                    data-testid={`lane-${label}`}
+                    data-live={isLive}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      marginBottom: 6,
+                      padding: 4,
+                      borderLeft: `3px solid ${isLive ? "#fff" : "transparent"}`,
+                    }}
+                  >
+                    {/* Clicking the label auditions; dragging the waveform selects a
+                        region, while a plain click on it also auditions (onActivate). */}
+                    <span style={{ width: 90, cursor: "pointer" }} onClick={() => switchTo(label)}>
+                      <span data-testid={`live-marker-${label}`}>{isLive ? "● " : "  "}</span>
+                      <strong>{label}</strong> {c.name}
+                    </span>
+                    {/* The saved verdict shows its colour-coded confidence stars on
+                        the preferred lane row (issue #16). */}
+                    {saved?.verdict.preference === label && saved.verdict.confidence !== null && (
+                      <Stars
+                        confidence={saved.verdict.confidence}
+                        testid={`verdict-stars-${label}`}
+                        title={`Preferred — confidence ${saved.verdict.confidence}/5`}
+                      />
+                    )}
+                    <div style={{ flex: 1 }}>
+                      <Waveform
+                        views={views[label]}
+                        view={view}
+                        duration={duration}
+                        position={position}
+                        onSeek={seek}
+                        region={region}
+                        looping={looping}
+                        onSelectRegion={selectRegion}
+                        onActivate={() => switchTo(label)}
+                        color={candidateColor(label)}
+                        height={48}
+                        testid={`waveform-${label}`}
+                      />
+                    </div>
                   </div>
-                </div>
-              );
-            })}
-          </div>
+                );
+              })}
+            </div>
+          )}
 
           {/* Stems section: an empty structural slot (project mode, M5). */}
           <div data-testid="stems-slot" aria-hidden="true" />
@@ -716,6 +786,20 @@ export function App() {
               <p data-testid="conclude-path" style={{ color: "#5cd67a" }}>
                 Record written to <code>{concludeResult.path}</code>
               </p>
+            )}
+            {/* Reveal at conclude (#29): only after the record is written — the
+                one irreversible event — does the UI show which file each label
+                was. Blind mode concealed this until now; sighted mode already
+                names the files, so the reveal is shown only for a blind session. */}
+            {session?.blind && concludeResult?.reveal && (
+              <div data-testid="reveal" style={{ color: "#8fd6ff", marginTop: 8 }}>
+                <strong>Revealed:</strong>{" "}
+                {concludeResult.reveal.map((c) => (
+                  <span key={c.label} data-testid={`reveal-${c.label}`} style={{ marginRight: 12 }}>
+                    <strong>{c.label}</strong> was <code>{c.path}</code>
+                  </span>
+                ))}
+              </div>
             )}
             {concludeResult?.error && (
               <p data-testid="conclude-error" role="alert" style={{ color: "#ff5c5c" }}>
