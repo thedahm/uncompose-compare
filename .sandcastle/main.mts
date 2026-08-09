@@ -1,3 +1,4 @@
+// sandcastle-kit cd27a04 — synced copy, edit in sandcastle-kit
 // Parallel Planner with Review — spec-delivery orchestration loop
 //
 // One run delivers one spec issue (label: "spec") by working its
@@ -32,6 +33,7 @@
 //   "scripts": { "sandcastle": "npx tsx .sandcastle/main.mts" }
 
 import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import * as sandcastle from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { z } from "zod";
@@ -51,15 +53,39 @@ const prSchema = z.object({ number: z.number() });
 
 // ---------------------------------------------------------------------------
 // Configuration
+//
+// Repo-specific knobs live in .sandcastle/sandcastle.config.json so this file
+// stays byte-identical across repos (synced from sandcastle-kit):
+//   repoChecks     — human-readable markdown describing the repo's check
+//                    commands; injected into the implement/merge/
+//                    address-final-review prompts as {{REPO_CHECKS}}
+//   copyToWorktree — paths copied from the host checkout into each worktree
+//                    before its sandbox starts (dependency/build caches)
+//   maxParallel    — optional, default 2
+//   maxIterations  — optional, default 10
 // ---------------------------------------------------------------------------
+
+const configSchema = z.object({
+  repoChecks: z.string(),
+  copyToWorktree: z.array(z.string()),
+  maxParallel: z.number().int().positive().default(2),
+  maxIterations: z.number().int().positive().default(10),
+});
+
+const config = configSchema.parse(
+  JSON.parse(readFileSync("./.sandcastle/sandcastle.config.json", "utf8")),
+);
 
 // Maximum number of plan→execute→merge cycles before stopping.
 // Raise this if your backlog is large; lower it for a quick smoke-test run.
-const MAX_ITERATIONS = 10;
+const MAX_ITERATIONS = config.maxIterations;
 
 // Maximum number of issues worked in parallel per cycle. The planner is asked
 // to select at most this many; the slice in the loop enforces it regardless.
-const MAX_PARALLEL = Number(process.env.SANDCASTLE_MAX_PARALLEL ?? 2);
+// The env var wins over the config file for one-off overrides.
+const MAX_PARALLEL = Number(
+  process.env.SANDCASTLE_MAX_PARALLEL ?? config.maxParallel,
+);
 
 // Hooks run inside the sandbox before the agent starts each iteration.
 // npm install ensures the sandbox always has fresh dependencies.
@@ -67,11 +93,11 @@ const hooks = {
   sandbox: { onSandboxReady: [{ command: "npm install" }] },
 };
 
-// Copy node_modules and the cargo target dir from the host into the worktree
-// before each sandbox starts. Avoids a full npm install and a cold cargo
-// build from scratch; the hook above handles platform-specific binaries and
-// any packages added since the last copy.
-const copyToWorktree = ["node_modules", "frontend/node_modules", "target"];
+// Copy dependency and build caches (e.g. node_modules, target) from the host
+// into the worktree before each sandbox starts. Avoids a full install and a
+// cold build from scratch; the hook above handles platform-specific binaries
+// and any packages added since the last copy.
+const copyToWorktree = config.copyToWorktree;
 
 // ---------------------------------------------------------------------------
 // Spec resolution
@@ -197,6 +223,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
             TASK_ID: issue.id,
             ISSUE_TITLE: issue.title,
             BRANCH: issue.branch,
+            REPO_CHECKS: config.repoChecks,
           },
         });
 
@@ -297,6 +324,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       BRANCHES: completedBranches.map((b) => `- ${b}`).join("\n"),
       // A markdown list of issue IDs and titles, one per line.
       ISSUES: completedIssues.map((i) => `- ${i.id}: ${i.title}`).join("\n"),
+      REPO_CHECKS: config.repoChecks,
     },
   });
 
@@ -388,7 +416,11 @@ if (remaining.length > 0) {
     maxIterations: 30,
     agent: sandcastle.claudeCode("claude-opus-5"),
     promptFile: "./.sandcastle/address-final-review-prompt.md",
-    promptArgs: { PR_NUMBER: prNumber, SPEC_BRANCH: specBranch },
+    promptArgs: {
+      PR_NUMBER: prNumber,
+      SPEC_BRANCH: specBranch,
+      REPO_CHECKS: config.repoChecks,
+    },
   });
   if (!addressed.completionSignal) {
     console.error(

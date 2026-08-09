@@ -1,3 +1,5 @@
+<!-- sandcastle-kit cd27a04 — synced copy, edit in sandcastle-kit -->
+
 # TASK
 
 Address the final review on PR #{{PR_NUMBER}}. The review is a PR comment headed `## Final review (fable-5)`. Work directly on `{{SPEC_BRANCH}}` — never on `main`. This is a single round: address the feedback, reply, done. Do not request or wait for a re-review.
@@ -25,7 +27,11 @@ Break the review into discrete actionable items. Classify each: **blocking** (a 
 
 # 4. ACT
 
-Apply the adopted changes on `{{SPEC_BRANCH}}`. Before pushing, run the repo checks: `npm run typecheck` and `npm run test` (the root scripts — they cover the frontend typecheck/build and `cargo test`). Commit with a message referencing the final review, then push.
+Apply the adopted changes on `{{SPEC_BRANCH}}`. Before pushing, run the repo checks:
+
+{{REPO_CHECKS}}
+
+Commit with a message referencing the final review, then push.
 
 # 5. REPLY
 

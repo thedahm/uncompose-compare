@@ -1,3 +1,4 @@
+# sandcastle-kit cd27a04 — synced copy, edit in sandcastle-kit
 FROM node:22-bookworm
 
 # Install system dependencies

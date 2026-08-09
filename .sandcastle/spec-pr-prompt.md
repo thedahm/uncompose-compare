@@ -1,3 +1,5 @@
+<!-- sandcastle-kit cd27a04 — synced copy, edit in sandcastle-kit -->
+
 # CONTEXT
 
 Every sub-issue of spec issue #{{SPEC_ISSUE}} ("{{SPEC_TITLE}}") has been implemented and merged into `{{SPEC_BRANCH}}`. Your job is to open the pull request that delivers the spec to `main`. A human will review and merge this PR — write it for them.

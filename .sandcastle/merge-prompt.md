@@ -1,3 +1,5 @@
+<!-- sandcastle-kit cd27a04 — synced copy, edit in sandcastle-kit -->
+
 # TASK
 
 Merge the following branches into `{{SPEC_BRANCH}}`, each via a pull request so the work leaves a paper trail on GitHub:
@@ -22,7 +24,7 @@ After all branches are merged, run the repo checks on `{{SPEC_BRANCH}}` one fina
 
 # REPO CHECKS
 
-`npm run typecheck` and `npm run test` at the repo root — they cover the frontend typecheck/build and `cargo test`. If the touched code has other documented checks (e.g. the packaging scripts under `scripts/`), run those too.
+{{REPO_CHECKS}}
 
 # CLOSE ISSUES
 

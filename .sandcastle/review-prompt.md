@@ -1,3 +1,5 @@
+<!-- sandcastle-kit cd27a04 — synced copy, edit in sandcastle-kit -->
+
 # TASK
 
 Review the code changes on branch `{{BRANCH}}` and improve code clarity, consistency, and maintainability while preserving exact functionality.
