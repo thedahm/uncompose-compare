@@ -2036,6 +2036,125 @@ fn blind_conclude_reveals_the_mapping_matching_the_record() {
     }
 }
 
+// --- Issue #32: blind loudness concealment (matching active, numbers hidden) --
+
+#[test]
+fn blind_loudness_conceals_measured_lufs_but_carries_applied_gains() {
+    // `--blind --loudness-match` composes into a level-fair blind test: the
+    // session payload carries no more than the gains the engine must apply. A
+    // measured LUFS figure fingerprints a candidate, so it is held back until the
+    // conclude reveal — the payload states matching is on and gives per-lane
+    // gains, but no `measured_lufs` anywhere.
+    let dir = TempDir::new("blind-loudness-session");
+    let (a, b) = loudness_pair(&dir);
+    let server = launch_opts(dir, &a, &b, None, &["--blind", "--loudness-match"]);
+
+    let json = session_json(&server);
+    let s: serde_json::Value = serde_json::from_str(&json).expect("blind session json");
+    assert_eq!(s["blind"], true, "the session states it is blind: {json}");
+
+    let lm = &s["loudness_match"];
+    assert_eq!(lm["enabled"], true, "matching is active in blind: {json}");
+    assert_eq!(
+        lm["method"], "bs1770-integrated",
+        "the method is named: {json}"
+    );
+
+    // Only the applied gains ride along — never boost, and (the shuffle hides
+    // which label is which file) the quietest lane at exactly 0.0 with the louder
+    // lane attenuated below it.
+    let ga = lm["candidates"]["A"]["gain_db"].as_f64().expect("A gain");
+    let gb = lm["candidates"]["B"]["gain_db"].as_f64().expect("B gain");
+    assert!(ga <= 0.0 && gb <= 0.0, "gains never boost: A={ga} B={gb}");
+    assert!(
+        (ga == 0.0 && gb < 0.0) || (gb == 0.0 && ga < 0.0),
+        "one lane is the 0 dB reference and the other is attenuated: A={ga} B={gb}"
+    );
+
+    // The concealment-leak sweep with matching on: no measured figure — not the
+    // key, not a value — reaches any pre-conclude response.
+    assert!(
+        !json.contains("measured_lufs"),
+        "a measured LUFS figure leaked into the blind session: {json}"
+    );
+}
+
+#[test]
+fn blind_loudness_reveal_and_record_carry_the_full_figures() {
+    // After conclude, the reveal carries the loudness figures alongside the
+    // label→file mapping, and the record's `playback.loudness_match` carries the
+    // full per-label numbers as in sighted mode. The reveal is the one
+    // irreversible event's payload; the browser saw no measured figure before it.
+    let cwd = TempDir::new("blind-loudness-reveal-cwd");
+    let files = TempDir::new("blind-loudness-reveal-files");
+    let (a, b) = loudness_pair(&files);
+
+    let mut command = Command::new(BIN);
+    command
+        .arg(&a)
+        .arg(&b)
+        .arg("--blind")
+        .arg("--loudness-match")
+        .current_dir(&cwd.path);
+    let server = serving_from(command, TempDir::new("blind-loudness-reveal-hold"));
+
+    let body =
+        r#"{"result": {"preference": "A", "confidence": 4}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(
+        status,
+        200,
+        "a blind matched session concludes: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let response: serde_json::Value =
+        serde_json::from_slice(&resp).expect("conclude response is json");
+    let reveal = response["reveal"].as_array().expect("the reveal mapping");
+
+    // The record carries the full loudness_match object, per-label measured and
+    // applied, exactly as sighted mode.
+    let record = validate_record_file(&sole_record(&cwd.path));
+    assert_eq!(
+        record["mode"], "ab-blind-randomized",
+        "blind record: {record}"
+    );
+    let lm = &record["playback"]["loudness_match"];
+    assert_eq!(
+        lm["enabled"], true,
+        "the record states matching was on: {record}"
+    );
+    assert_eq!(lm["method"], "bs1770-integrated");
+
+    // The reveal reconnects each label to its file *and* its loudness figures,
+    // matching the record on both.
+    for label in ["A", "B"] {
+        let r = reveal
+            .iter()
+            .find(|c| c["label"] == label)
+            .unwrap_or_else(|| panic!("reveal names label {label}: {response}"));
+        let rec_lm = &lm["candidates"][label];
+        assert_eq!(
+            r["measured_lufs"].as_f64(),
+            rec_lm["measured_lufs"].as_f64(),
+            "reveal measured LUFS matches record for {label}: {response}"
+        );
+        assert_eq!(
+            r["gain_db"].as_f64(),
+            rec_lm["gain_db"].as_f64(),
+            "reveal gain matches record for {label}: {response}"
+        );
+    }
+    // The blind shuffle hides which label holds the scaled file, but one lane is
+    // always the 0 dB reference and the other is attenuated below it.
+    let ga = lm["candidates"]["A"]["gain_db"].as_f64().unwrap();
+    let gb = lm["candidates"]["B"]["gain_db"].as_f64().unwrap();
+    assert!(
+        (ga == 0.0 && gb < 0.0) || (gb == 0.0 && ga < 0.0),
+        "one lane is the 0 dB reference and the other attenuated: A={ga} B={gb}"
+    );
+}
+
 #[test]
 fn sighted_mode_is_unaffected_by_the_blind_flag() {
     // A plain (no --blind) session still carries full metadata and mode "ab".

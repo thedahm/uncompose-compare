@@ -260,7 +260,7 @@ impl Session {
         json!({
             "blind": true,
             "candidates": [a.to_blind_json(), b.to_blind_json()],
-            "loudness_match": self.loudness_match_json(),
+            "loudness_match": self.blind_loudness_match_json(),
         })
     }
 
@@ -289,6 +289,39 @@ impl Session {
             }
             None => json!({ "enabled": false }),
         }
+    }
+
+    /// The `loudness_match` a *blind* session may advertise (issue #32): matching
+    /// on carries only `enabled`, the `method`, and per-label `gain_db` — the gain
+    /// the engine must apply to play the lanes level-fair. The measured LUFS is
+    /// held back: a distinctive loudness figure fingerprints a candidate, so it
+    /// stays concealed until the conclude reveal. Matching off is the same
+    /// `{"enabled": false}` as sighted — the absence stated, not implied.
+    fn blind_loudness_match_json(&self) -> Value {
+        match &self.loudness {
+            Some(figures) => {
+                let mut candidates = Map::new();
+                for (c, l) in self.candidates.iter().zip(figures) {
+                    candidates.insert(c.label.to_string(), json!({ "gain_db": finite(l.gain_db) }));
+                }
+                json!({
+                    "enabled": true,
+                    "method": "bs1770-integrated",
+                    "candidates": candidates,
+                })
+            }
+            None => json!({ "enabled": false }),
+        }
+    }
+
+    /// The per-lane loudness figures for the conclude reveal (issue #32), aligned
+    /// with `candidates` and finite-guarded: `(measured_lufs, gain_db)` when
+    /// matching ran, else `None`. A blind session holds the measured figures back
+    /// until this one irreversible event; they equal the numbers the record's
+    /// `playback.loudness_match` carries.
+    pub fn loudness_reveal(&self) -> Option<[(f64, f64); 2]> {
+        self.loudness
+            .map(|figures| figures.map(|l| (finite(l.measured_lufs), finite(l.gain_db))))
     }
 
     /// The labels this session actually loaded — the only candidate references a

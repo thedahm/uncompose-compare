@@ -67,24 +67,36 @@ interface Candidate {
   audio: string;
 }
 
-/** One label's revealed identity, returned by conclude and shown post-write (#29). */
+/**
+ * One label's revealed identity, returned by conclude and shown post-write (#29).
+ * When loudness matching ran (#32) the reveal also carries the measured LUFS and
+ * applied gain a blind session held back until this one irreversible event.
+ */
 interface RevealCandidate {
   label: Label;
   path: string;
   sha256: string;
   size: number;
+  measured_lufs?: number;
+  gain_db?: number;
 }
 
-/** One lane's loudness-match figures, as the session (and record) report them. */
+/**
+ * One lane's loudness-match figures. Sighted (and the record) report both the
+ * measured LUFS and the applied gain; a blind session (#32) conceals the measured
+ * figure and carries only the `gain_db` the engine applies, so `measured_lufs` is
+ * optional.
+ */
 interface LoudnessCandidate {
-  measured_lufs: number;
+  measured_lufs?: number;
   gain_db: number;
 }
 
 /**
  * The session's `loudness_match` (issue #30), mirroring the record's
  * `playback.loudness_match` shape (uncompose#66). Off: `{ enabled: false }`. On:
- * the method plus a per-label map of measured LUFS and the applied gain.
+ * the method plus a per-label map of the applied gain (and, sighted, the measured
+ * LUFS — a blind session hides it until reveal, #32).
  */
 interface LoudnessMatch {
   enabled: boolean;
@@ -521,20 +533,25 @@ export function App() {
       )}
 
       {/* Loudness matching (issue #30): state clearly whenever playback is not
-          at mastered levels. Sighted mode shows the per-lane figures. */}
+          at mastered levels. Sighted mode shows the per-lane figures; a blind
+          session (#32) reports only that matching is active — a per-lane LUFS
+          figure fingerprints a candidate, so the numbers stay hidden until the
+          conclude reveal. */}
       {session?.loudness_match.enabled && (
         <p data-testid="loudness-match" style={{ color: "#8fd6ff" }}>
           Loudness matching active — not mastered levels (BS.1770 integrated).{" "}
-          {(["A", "B"] as Label[]).map((label) => {
-            const c = session.loudness_match.candidates?.[label];
-            if (!c) return null;
-            return (
-              <span key={label} data-testid={`loudness-${label}`} style={{ marginRight: 10 }}>
-                <strong>{label}</strong>: {c.measured_lufs.toFixed(1)} LUFS,{" "}
-                {c.gain_db.toFixed(1)} dB
-              </span>
-            );
-          })}
+          {session.blind
+            ? "Per-lane figures are hidden until reveal."
+            : (["A", "B"] as Label[]).map((label) => {
+                const c = session.loudness_match.candidates?.[label];
+                if (c?.measured_lufs === undefined) return null;
+                return (
+                  <span key={label} data-testid={`loudness-${label}`} style={{ marginRight: 10 }}>
+                    <strong>{label}</strong>: {c.measured_lufs.toFixed(1)} LUFS,{" "}
+                    {c.gain_db.toFixed(1)} dB
+                  </span>
+                );
+              })}
         </p>
       )}
 
@@ -795,6 +812,11 @@ export function App() {
                 {concludeResult.reveal.map((c) => (
                   <span key={c.label} data-testid={`reveal-${c.label}`} style={{ marginRight: 12 }}>
                     <strong>{c.label}</strong> was <code>{c.path}</code>
+                    {/* Matching on (#32): the measured LUFS and applied gain,
+                        held back during the blind session, surface here. */}
+                    {c.measured_lufs !== undefined && c.gain_db !== undefined && (
+                      <> ({c.measured_lufs.toFixed(1)} LUFS, {c.gain_db.toFixed(1)} dB)</>
+                    )}
                   </span>
                 ))}
               </div>
