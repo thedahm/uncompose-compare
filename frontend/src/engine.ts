@@ -1,21 +1,23 @@
 /**
- * The sample-locked A/B playback engine for the M3 workbench (issue #12).
+ * The sample-locked playback engine for the M3 workbench (issue #12): the A/B
+ * candidates, plus the SRC lane when a shared source is present (spec #42).
  *
- * Both candidates play in ONE Web Audio graph on a shared transport: whenever
- * playback runs, an `AudioBufferSourceNode` for each candidate is started at the
- * SAME offset into a per-candidate `GainNode`, so A and B are sample-locked and
+ * Every lane plays in ONE Web Audio graph on a shared transport: whenever
+ * playback runs, an `AudioBufferSourceNode` for each lane is started at the
+ * SAME offset into a per-lane `GainNode`, so the lanes are sample-locked and
  * switching the audible one never shifts the playback position. Switching is a
- * ~10 ms equal-power crossfade on the two gains (the sources are untouched), so
- * it is instant and gap-free. Seeking/stepping restarts both sources together at
- * the new offset (a buffer source cannot be repositioned in place).
+ * ~10 ms equal-power crossfade on the two gains involved (the sources are
+ * untouched), so it is instant and gap-free. Seeking/stepping restarts all
+ * sources together at the new offset (a buffer source cannot be repositioned
+ * in place).
  *
- * A drag-selected region (issue #13) drives DAW-style looping: both sources get
- * the same native `loopStart`/`loopEnd` — clamped to the *shorter* candidate,
+ * A drag-selected region (issue #13) drives DAW-style looping: every source gets
+ * the same native `loopStart`/`loopEnd` — clamped to the *shortest* lane,
  * because Web Audio would otherwise clamp each source to its own buffer and let
- * a mismatched pair drift apart — so looping is sample-accurate and stays
- * sample-locked across an A/B switch (the switch only ramps the gains). A
+ * mismatched lanes drift apart — so looping is sample-accurate and stays
+ * sample-locked across a lane switch (the switch only ramps the gains). A
  * playhead before the region plays into it and then loops; toggling the loop off
- * continues out. Toggling loop on/off (or seeking) while playing restarts both
+ * continues out. Toggling loop on/off (or seeking) while playing restarts the
  * sources at the current position with the new loop configuration.
  *
  * Decoded PCM lives only in the `AudioBuffer`s here, in browser memory; nothing
@@ -28,6 +30,7 @@ import {
   clampPosition,
   equalPowerCurves,
   type Label,
+  type LaneId,
   loopBounds,
   loopedPosition,
   orderedRegion,
@@ -60,26 +63,33 @@ interface LaneFade {
 
 export class PlaybackEngine {
   private ctx: AudioContext;
-  private buffers: Record<Label, AudioBuffer>;
-  private gains: Record<Label, GainNode>;
+  /**
+   * The playback lanes present this session: A and B always, plus SRC when a
+   * shared source was resolved (spec #42). The SRC lane joins the sample-locked
+   * graph exactly like A/B — one buffer source into a per-lane gain, started at
+   * the same offset — so the zero-offset promise (#66) covers all three.
+   */
+  private laneIds: LaneId[];
+  private buffers: Partial<Record<LaneId, AudioBuffer>>;
+  private gains: Partial<Record<LaneId, GainNode>>;
   /**
    * The static per-lane playback gain (linear), applied to the audible lane's
-   * steady-state level (issue #30). {A:1, B:1} is faithful as-is playback; with
-   * `--loudness-match` on, the louder lane carries a factor < 1. It is constant
+   * steady-state level (issue #30). {A:1, B:1, SRC:1} is faithful as-is playback;
+   * with `--loudness-match` on, a louder lane carries a factor < 1. It is constant
    * for the session and never resampled or ramped except through the switch
    * crossfade, so the graph topology — and the sync contract (#66) — is
    * untouched.
    */
-  private laneGain: Record<Label, number>;
+  private laneGain: Record<LaneId, number>;
   /**
    * Each lane's crossfade curves at its static gain, built once: the gains are
    * session-constant, so scaling the shared equal-power curves per switch would
-   * allocate two arrays on every `x` press for a result that never changes.
+   * allocate arrays on every `x` press for a result that never changes.
    */
-  private laneFade: Record<Label, LaneFade>;
-  private sources: Record<Label, AudioBufferSourceNode> | null = null;
+  private laneFade: Partial<Record<LaneId, LaneFade>>;
+  private sources: Partial<Record<LaneId, AudioBufferSourceNode>> | null = null;
 
-  private liveLabel: Label = "A";
+  private liveLabel: LaneId = "A";
   private playing = false;
   /** Frozen position (seconds) while stopped; the resume/seek point. */
   private pausePos = 0;
@@ -102,34 +112,36 @@ export class PlaybackEngine {
     ctx: AudioContext,
     a: AudioBuffer,
     b: AudioBuffer,
-    laneGain: Record<Label, number> = { A: 1, B: 1 },
+    laneGain: Partial<Record<LaneId, number>> = {},
+    source?: AudioBuffer,
   ) {
     this.ctx = ctx;
-    this.buffers = { A: a, B: b };
-    this.laneGain = laneGain;
-    const fade = (label: Label): LaneFade => ({
-      up: scaled(FADE_CURVES.up, laneGain[label]),
-      down: scaled(FADE_CURVES.down, laneGain[label]),
-    });
-    this.laneFade = { A: fade("A"), B: fade("B") };
-    this.gains = {
-      A: ctx.createGain(),
-      B: ctx.createGain(),
-    };
-    // Live lane audible (at its static loudness-match gain), the other silent,
-    // until the first switch.
-    this.gains.A.gain.value = laneGain.A;
-    this.gains.B.gain.value = 0;
-    this.gains.A.connect(ctx.destination);
-    this.gains.B.connect(ctx.destination);
+    this.buffers = source ? { A: a, B: b, SRC: source } : { A: a, B: b };
+    this.laneIds = Object.keys(this.buffers) as LaneId[];
+    // Any lane the match does not name plays at unity — faithful as-is (#66).
+    this.laneGain = { A: 1, B: 1, SRC: 1, ...laneGain };
+    this.gains = {};
+    this.laneFade = {};
+    for (const id of this.laneIds) {
+      const gain = ctx.createGain();
+      // Live lane audible (at its static loudness-match gain), the others silent,
+      // until the first switch.
+      gain.gain.value = id === this.liveLabel ? this.laneGain[id] : 0;
+      gain.connect(ctx.destination);
+      this.gains[id] = gain;
+      this.laneFade[id] = {
+        up: scaled(FADE_CURVES.up, this.laneGain[id]),
+        down: scaled(FADE_CURVES.down, this.laneGain[id]),
+      };
+    }
   }
 
-  /** Transport length: the longer candidate (they start locked at 0). */
+  /** Transport length: the longest lane (they start locked at 0). */
   duration(): number {
-    return Math.max(this.buffers.A.duration, this.buffers.B.duration);
+    return Math.max(...this.laneIds.map((id) => this.buffers[id]!.duration));
   }
 
-  live(): Label {
+  live(): LaneId {
     return this.liveLabel;
   }
 
@@ -147,13 +159,14 @@ export class PlaybackEngine {
 
   /**
    * The loop the sources are actually running, or null when nothing loops: the
-   * region clamped to the shorter candidate, so both lanes wrap over the exact
-   * same span and stay sample-locked even when the candidates differ in length.
+   * region clamped to the shortest lane, so every lane wraps over the exact
+   * same span and stays sample-locked even when the lanes differ in length.
    * The drawn playhead reads the same bounds the audio does.
    */
   private loop(): Region | null {
     if (!this.looping) return null;
-    return loopBounds(this.region, Math.min(this.buffers.A.duration, this.buffers.B.duration));
+    const shortest = Math.min(...this.laneIds.map((id) => this.buffers[id]!.duration));
+    return loopBounds(this.region, shortest);
   }
 
   /** The selected region (seconds), or null. */
@@ -261,35 +274,40 @@ export class PlaybackEngine {
     this.seek(0);
   }
 
-  /** `x` / lane click: make `label` the audible candidate with a crossfade. */
-  switchTo(label: Label): void {
-    if (label === this.liveLabel) return;
+  /** `x` / lane click: make `label` the audible lane with a crossfade. */
+  switchTo(label: LaneId): void {
+    if (label === this.liveLabel || !this.buffers[label]) return;
     const outgoing = this.liveLabel;
     this.liveLabel = label;
     const now = this.ctx.currentTime;
     if (this.playing) {
-      this.gains[label].gain.cancelScheduledValues(now);
-      this.gains[outgoing].gain.cancelScheduledValues(now);
+      this.gains[label]!.gain.cancelScheduledValues(now);
+      this.gains[outgoing]!.gain.cancelScheduledValues(now);
       // Anchor the ramp at the present value so the curve starts from "now".
-      this.gains[label].gain.setValueAtTime(this.gains[label].gain.value, now);
-      this.gains[outgoing].gain.setValueAtTime(this.gains[outgoing].gain.value, now);
+      this.gains[label]!.gain.setValueAtTime(this.gains[label]!.gain.value, now);
+      this.gains[outgoing]!.gain.setValueAtTime(this.gains[outgoing]!.gain.value, now);
       // The equal-power curves at each lane's static gain: the incoming lane
-      // rises to its own loudness-match level, the outgoing falls to 0.
-      this.gains[label].gain.setValueCurveAtTime(this.laneFade[label].up, now, FADE_SECONDS);
-      this.gains[outgoing].gain.setValueCurveAtTime(
-        this.laneFade[outgoing].down,
+      // rises to its own loudness-match level, the outgoing falls to 0. Any other
+      // lane is already at 0, so it needs no ramp.
+      this.gains[label]!.gain.setValueCurveAtTime(this.laneFade[label]!.up, now, FADE_SECONDS);
+      this.gains[outgoing]!.gain.setValueCurveAtTime(
+        this.laneFade[outgoing]!.down,
         now,
         FADE_SECONDS,
       );
     } else {
-      this.gains[label].gain.value = this.laneGain[label];
-      this.gains[outgoing].gain.value = 0;
+      this.gains[label]!.gain.value = this.laneGain[label];
+      this.gains[outgoing]!.gain.value = 0;
     }
   }
 
-  /** `x`: switch to whichever candidate is not currently live. */
+  /**
+   * `x`: toggle between the two comparison candidates A and B. The SRC lane is
+   * auditioned by clicking it, not by `x`; toggling out of SRC returns to A.
+   */
   toggleSwitch(): void {
-    this.switchTo(otherLabel(this.liveLabel));
+    const target: Label = this.liveLabel === "SRC" ? "A" : otherLabel(this.liveLabel);
+    this.switchTo(target);
   }
 
   private startSources(offset: number): void {
@@ -297,27 +315,26 @@ export class PlaybackEngine {
     const generation = ++this.generation;
     const now = this.ctx.currentTime;
     const loop = this.loop();
-    const sources: Record<Label, AudioBufferSourceNode> = {
-      A: this.ctx.createBufferSource(),
-      B: this.ctx.createBufferSource(),
-    };
-    (["A", "B"] as Label[]).forEach((label) => {
-      const src = sources[label];
-      src.buffer = this.buffers[label];
-      // Native sample-accurate looping: both sources loop over the same region,
-      // started together, so a mid-loop A/B switch stays sample-locked. A start
+    const sources: Partial<Record<LaneId, AudioBufferSourceNode>> = {};
+    this.laneIds.forEach((label) => {
+      const buffer = this.buffers[label]!;
+      const src = this.ctx.createBufferSource();
+      sources[label] = src;
+      src.buffer = buffer;
+      // Native sample-accurate looping: every source loops over the same region,
+      // started together, so a mid-loop lane switch stays sample-locked. A start
       // offset before `loopStart` plays into the region first (play-into).
       if (loop) {
         src.loop = true;
         src.loopStart = loop.start;
         src.loopEnd = loop.end;
       }
-      src.connect(this.gains[label]);
+      src.connect(this.gains[label]!);
       // Restore the steady-state gains (a mid-switch restart lands on the live
-      // lane fully up, the other fully down) so a seek never leaves a fade half
+      // lane fully up, the others fully down) so a seek never leaves a fade half
       // applied.
-      this.gains[label].gain.cancelScheduledValues(now);
-      this.gains[label].gain.setValueAtTime(
+      this.gains[label]!.gain.cancelScheduledValues(now);
+      this.gains[label]!.gain.setValueAtTime(
         label === this.liveLabel ? this.laneGain[label] : 0,
         now,
       );
@@ -331,8 +348,7 @@ export class PlaybackEngine {
         this.onEnded?.();
       };
       // A source shorter than the transport is started only within its own span.
-      const bufferDur = this.buffers[label].duration;
-      if (offset < bufferDur) src.start(0, offset);
+      if (offset < buffer.duration) src.start(0, offset);
     });
     this.sources = sources;
     this.startedAt = now;
@@ -343,8 +359,9 @@ export class PlaybackEngine {
     if (!this.sources) return;
     // Bump the generation first so the stop()-triggered onended is ignored.
     this.generation++;
-    (["A", "B"] as Label[]).forEach((label) => {
-      const src = this.sources![label];
+    for (const label of this.laneIds) {
+      const src = this.sources[label];
+      if (!src) continue;
       src.onended = null;
       try {
         src.stop();
@@ -352,7 +369,7 @@ export class PlaybackEngine {
         // Already stopped / never started (offset past its buffer) — fine.
       }
       src.disconnect();
-    });
+    }
     this.sources = null;
   }
 }

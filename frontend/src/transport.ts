@@ -12,6 +12,14 @@
 export type Label = "A" | "B";
 
 /**
+ * A playback lane: the two comparison candidates plus the optional SRC lane —
+ * the shared source both candidates are compared against (spec #42). SRC joins
+ * the sample-locked graph and can be auditioned, but it is not a `Label`: it
+ * never wins a preference and never enters the record's `candidates[]`.
+ */
+export type LaneId = Label | "SRC";
+
+/**
  * Which visualization every audio display shows. The toggle applies to all
  * displays at once (stage + lanes): the raw sample envelope, the RMS loudness
  * envelope, or the FFT spectrogram.

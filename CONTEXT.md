@@ -13,6 +13,14 @@ the written record — so that concealment (blind mode, later) can shuffle label
 schema change.
 _Avoid_: file, track, version, input
 
+**Source (SRC lane)**:
+The shared origin both candidates derive from, offered as a third playback lane labeled
+`SRC` (project mode auto-resolves it; bare-file mode takes an explicit `--source`). It is
+a *lane*, not a candidate: it plays sample-locked with A/B and joins the loudness match
+group, but it never wins a preference, never enters the record's `candidates[]`, and stays
+identified in blind mode (concealment is A/B only). Absent when the pair shares no source.
+_Avoid_: reference, original, candidate C, third file
+
 **Region**:
 A single span of the timeline the listener drags out on a waveform to concentrate on and
 loop over. The UI term is "region"; the comparison record stores it as the `loops[]`

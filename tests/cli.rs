@@ -2397,3 +2397,483 @@ fn sighted_mode_is_unaffected_by_the_blind_flag() {
         "sighted audio is served by content hash: {json}"
     );
 }
+
+// --- Issue #40 / spec #42: project refs and the SRC lane ----------------------
+
+/// The sha256 of a file on disk — the figure a manifest records for an asset,
+/// computed here so the fixture manifest is a truthful oracle.
+fn file_sha256(path: &Path) -> String {
+    uncompose_compare::hex(&sha2::Sha256::digest(
+        std::fs::read(path).expect("read fixture"),
+    ))
+}
+
+/// Write a WAV asset at `rel` under `root` (creating parent dirs) and return its
+/// sha256, so the manifest can record what the loader will hash.
+fn wav_asset(root: &Path, rel: &str, seed: u32, amp: f64) -> String {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).expect("asset dir");
+    write_wav_fmt(&path, 44_100, 44_100, 2, 16, false, seed, amp);
+    file_sha256(&path)
+}
+
+/// A stub `uncompose-project` executable on a fresh PATH: project-mode pre-flight
+/// requires the tool be installed, but this repo stubs its evaluation import
+/// (spec #42), so a no-op executable satisfies the on-PATH check. Returns the dir
+/// holding it (kept alive by the caller) and a `PATH` value that finds it.
+fn stub_project_tool() -> (TempDir, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("project-tool");
+    let tool = dir.join("uncompose-project");
+    std::fs::write(&tool, "#!/bin/sh\nexit 0\n").expect("write stub");
+    let mut perms = std::fs::metadata(&tool).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&tool, perms).unwrap();
+    let path = format!(
+        "{}:{}",
+        dir.path.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (dir, path)
+}
+
+/// A project with two candidate mixes derived from one shared raw source. The two
+/// outputs share the basename-stem `vocals` (in distinct directories), so
+/// `vocals@deriv-a` / `vocals@deriv-b` disambiguate by derivation; both
+/// derivations take `raw` as input, so `raw` is the auto-resolved SRC lane.
+struct Project {
+    dir: TempDir,
+    id: String,
+}
+
+fn build_project() -> Project {
+    let dir = TempDir::new("project");
+    let id = "01PROJECTULID00000000000000".to_string();
+    let raw_sha = wav_asset(&dir.path, "src/take.wav", 1, 1.0);
+    let a_sha = wav_asset(&dir.path, "out/a/vocals.wav", 2, 1.0);
+    let b_sha = wav_asset(&dir.path, "out/b/vocals.wav", 3, 1.0);
+    let manifest = serde_json::json!({
+        "schema": "https://uncompose.org/schemas/project/v0/uncompose.project.json",
+        "id": id,
+        "assets": [
+            {"id": "raw", "slug": "raw", "file": "src/take.wav", "sha256": raw_sha},
+            {"id": "mix-a", "slug": "mix-a", "file": "out/a/vocals.wav", "sha256": a_sha},
+            {"id": "mix-b", "slug": "mix-b", "file": "out/b/vocals.wav", "sha256": b_sha}
+        ],
+        "derivations": [
+            {"id": "deriv-a", "inputs": ["raw"], "outputs": ["mix-a"]},
+            {"id": "deriv-b", "inputs": ["raw"], "outputs": ["mix-b"]}
+        ]
+    });
+    std::fs::write(
+        dir.join("uncompose.project.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .expect("write manifest");
+    Project { dir, id }
+}
+
+/// Launch a project session: `uncompose-compare --project <dir> <refs…> <extra…>`
+/// with the stub tool on PATH and a chosen invoking directory (the record's
+/// destination). Parses the tokened URL like every other launch.
+fn launch_project(
+    project: &Path,
+    cwd: &Path,
+    refs: &[&str],
+    extra: &[&str],
+    path_env: &str,
+) -> Serving {
+    let mut command = Command::new(BIN);
+    command
+        .arg("--project")
+        .arg(project)
+        .args(refs)
+        .args(extra)
+        .env("PATH", path_env)
+        .current_dir(cwd);
+    serving_from(command, TempDir::new("project-hold"))
+}
+
+/// Run a project invocation expected to fail before binding, returning
+/// (exit code, stderr). `path_env` controls whether the stub tool is findable.
+fn project_failure(
+    project: &Path,
+    refs: &[&str],
+    extra: &[&str],
+    path_env: &str,
+) -> (Option<i32>, String) {
+    let cache = TempDir::new("project-fail-cache");
+    let out = Command::new(BIN)
+        .arg("--project")
+        .arg(project)
+        .args(refs)
+        .args(extra)
+        .env("XDG_CACHE_HOME", &cache.path)
+        .env("PATH", path_env)
+        .output()
+        .expect("spawn binary");
+    assert!(!out.status.success(), "expected a non-zero exit");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into(),
+    )
+}
+
+#[test]
+fn project_opens_a_three_lane_session_and_records_asset_ids() {
+    // The DoD: `--project . vocals@deriv-a vocals@deriv-b` opens a three-lane
+    // session resolved entirely from the manifest, and the record's candidates
+    // carry their asset ids.
+    let project = build_project();
+    let (_tool, path_env) = stub_project_tool();
+    let cwd = TempDir::new("project-record-cwd");
+    let server = launch_project(
+        &project.dir.path,
+        &cwd.path,
+        &["vocals@deriv-a", "vocals@deriv-b"],
+        &[],
+        &path_env,
+    );
+
+    let json = session_json(&server);
+    let s: serde_json::Value = serde_json::from_str(&json).expect("session json");
+
+    // Two comparison candidates, plus an identified SRC lane — three lanes.
+    let candidates = s["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2, "A and B are the comparison candidates");
+    let source = &s["source"];
+    assert_eq!(
+        source["label"], "SRC",
+        "the shared source is the SRC lane: {json}"
+    );
+    assert_eq!(
+        source["name"], "take.wav",
+        "the SRC lane resolves the shared raw source: {json}"
+    );
+    assert!(source["audio"].as_str().unwrap().starts_with("/audio/"));
+
+    // Conclude and read the record: each candidate carries its manifest asset id
+    // and the project ULID.
+    let body =
+        r#"{"result": {"preference": "A", "confidence": 4}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(
+        status,
+        200,
+        "a project session concludes: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let record = validate_record_file(&sole_record(&cwd.path));
+    let rc = record["candidates"].as_array().unwrap();
+    let by_label = |label: &str| rc.iter().find(|c| c["label"] == label).unwrap();
+    assert_eq!(
+        by_label("A")["asset"],
+        "mix-a",
+        "A carries its asset id: {record}"
+    );
+    assert_eq!(
+        by_label("B")["asset"],
+        "mix-b",
+        "B carries its asset id: {record}"
+    );
+    assert_eq!(
+        by_label("A")["project"],
+        project.id,
+        "A carries the project ULID"
+    );
+    assert_eq!(
+        by_label("B")["project"],
+        project.id,
+        "B carries the project ULID"
+    );
+}
+
+#[test]
+fn project_bare_slug_resolves_and_omits_absent_source() {
+    // Bare-slug refs resolve to assets, and a pair that shares no producing-
+    // derivation input has no SRC lane — a stated absence, not an error. `raw`
+    // has no producer; `mix-a`'s producer input is `raw` (a candidate here), so
+    // the pair shares nothing.
+    let project = build_project();
+    let (_tool, path_env) = stub_project_tool();
+    let cwd = TempDir::new("project-bare-cwd");
+    let server = launch_project(
+        &project.dir.path,
+        &cwd.path,
+        &["raw", "mix-a"],
+        &[],
+        &path_env,
+    );
+
+    let json = session_json(&server);
+    let s: serde_json::Value = serde_json::from_str(&json).expect("session json");
+    assert_eq!(s["candidates"].as_array().unwrap().len(), 2);
+    assert!(
+        s.get("source").is_none(),
+        "a pair sharing no source has no SRC lane: {json}"
+    );
+}
+
+#[test]
+fn project_exclude_source_drops_the_shared_lane() {
+    // The candidates share `raw`, but `--exclude-source` opts the SRC lane out.
+    let project = build_project();
+    let (_tool, path_env) = stub_project_tool();
+    let cwd = TempDir::new("project-exclude-cwd");
+    let server = launch_project(
+        &project.dir.path,
+        &cwd.path,
+        &["vocals@deriv-a", "vocals@deriv-b"],
+        &["--exclude-source"],
+        &path_env,
+    );
+    let json = session_json(&server);
+    let s: serde_json::Value = serde_json::from_str(&json).expect("session json");
+    assert!(
+        s.get("source").is_none(),
+        "--exclude-source omits the SRC lane even when one is shared: {json}"
+    );
+}
+
+#[test]
+fn project_no_match_and_ambiguity_list_the_outputs() {
+    let project = build_project();
+    let (_tool, path_env) = stub_project_tool();
+
+    // A basename no output of the derivation carries: the message lists what the
+    // derivation does output (slug + filename) so the listener can pick.
+    let (code, stderr) = project_failure(
+        &project.dir.path,
+        &["nope@deriv-a", "vocals@deriv-b"],
+        &[],
+        &path_env,
+    );
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("nope") && stderr.contains("vocals.wav") && stderr.contains("mix-a"),
+        "no-match lists the derivation's outputs with slug and filename: {stderr}"
+    );
+
+    // An unknown slug likewise names what it could not find.
+    let (code, stderr) = project_failure(&project.dir.path, &["ghost", "mix-a"], &[], &path_env);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.to_lowercase().contains("slug") && stderr.contains("ghost"),
+        "an unknown slug is named: {stderr}"
+    );
+}
+
+#[test]
+fn project_refuses_a_raw_path() {
+    // A positional that looks like a path is refused in project mode.
+    let project = build_project();
+    let (_tool, path_env) = stub_project_tool();
+    let (code, stderr) = project_failure(
+        &project.dir.path,
+        &["out/a/vocals.wav", "mix-b"],
+        &[],
+        &path_env,
+    );
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("looks like a path") && stderr.contains("out/a/vocals.wav"),
+        "a raw path is refused, naming it: {stderr}"
+    );
+}
+
+#[test]
+fn project_and_out_conflict() {
+    // `--out` conflicts with `--project` (the project record's destination is the
+    // handover's, slice 5). clap rejects the pair.
+    let project = build_project();
+    let (_tool, path_env) = stub_project_tool();
+    let (code, stderr) = project_failure(
+        &project.dir.path,
+        &["mix-a", "mix-b"],
+        &["--out", "record.json"],
+        &path_env,
+    );
+    assert_ne!(code, Some(0));
+    assert!(
+        stderr.to_lowercase().contains("cannot be used with"),
+        "--out and --project are mutually exclusive: {stderr}"
+    );
+}
+
+#[test]
+fn project_hash_mismatch_refuses_naming_the_asset() {
+    // The manifest records each asset's sha256; a file whose bytes have drifted
+    // from that figure refuses before the server binds, naming the asset.
+    let project = build_project();
+    let (_tool, path_env) = stub_project_tool();
+    // Rewrite one asset's bytes (still a decodable WAV, different content) so it no
+    // longer hashes to what the manifest recorded.
+    write_wav_fmt(
+        &project.dir.path.join("out/a/vocals.wav"),
+        44_100,
+        44_100,
+        2,
+        16,
+        false,
+        999,
+        1.0,
+    );
+    let (code, stderr) = project_failure(&project.dir.path, &["mix-a", "mix-b"], &[], &path_env);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("mix-a") && stderr.contains("does not match the manifest"),
+        "a drifted asset is refused, named, before binding: {stderr}"
+    );
+}
+
+#[test]
+fn project_without_the_tool_installed_refuses_with_the_install_hint() {
+    // Pre-flight: `uncompose-project` must be on PATH, else the session — which
+    // cannot be registered — never starts. A PATH without the tool fails fast.
+    let project = build_project();
+    let (code, stderr) = project_failure(
+        &project.dir.path,
+        &["mix-a", "mix-b"],
+        &[],
+        "/nonexistent-path-with-no-tools",
+    );
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("uncompose-project") && stderr.to_lowercase().contains("install"),
+        "an absent project tool fails with the install hint: {stderr}"
+    );
+}
+
+#[test]
+fn project_missing_manifest_refuses() {
+    let empty = TempDir::new("project-empty");
+    let (_tool, path_env) = stub_project_tool();
+    let (code, stderr) = project_failure(&empty.path, &["a", "b"], &[], &path_env);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("no project manifest") && stderr.contains("uncompose.project.json"),
+        "an absent manifest is refused by name: {stderr}"
+    );
+}
+
+#[test]
+fn bare_file_source_adds_the_src_lane_without_project_fields() {
+    // Bare-file mode takes an explicit `--source`; the SRC lane appears, and the
+    // record's candidates carry no asset/project (there is no manifest).
+    let dir = TempDir::new("bare-source");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    let src = dir.join("source.wav");
+    write_wav(&a, 44_100, 44_100, 2, 11);
+    write_wav(&b, 44_100, 44_100, 2, 12);
+    write_wav(&src, 44_100, 44_100, 2, 13);
+    let cwd = TempDir::new("bare-source-cwd");
+    let mut command = Command::new(BIN);
+    command
+        .arg(&a)
+        .arg(&b)
+        .arg("--source")
+        .arg(&src)
+        .current_dir(&cwd.path);
+    let server = serving_from(command, dir);
+
+    let json = session_json(&server);
+    let s: serde_json::Value = serde_json::from_str(&json).expect("session json");
+    assert_eq!(
+        s["source"]["label"], "SRC",
+        "the SRC lane is present: {json}"
+    );
+    assert_eq!(s["source"]["name"], "source.wav");
+
+    let body = r#"{"result": {"preference": null}, "observations": [], "loops": []}"#;
+    let (status, _, _) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(status, 200);
+    let record = validate_record_file(&sole_record(&cwd.path));
+    for c in record["candidates"].as_array().unwrap() {
+        assert!(
+            c.get("asset").is_none() && c.get("project").is_none(),
+            "a bare-file candidate carries no manifest fields: {record}"
+        );
+    }
+}
+
+#[test]
+fn source_lane_joins_the_loudness_match_group() {
+    // The SRC lane joins the match group (attenuate-to-quietest including SRC): a
+    // source quieter than both candidates becomes the 0 dB reference, and A and B
+    // are both attenuated down to it.
+    let dir = TempDir::new("source-loudness");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    let src = dir.join("source.wav");
+    write_wav_fmt(&a, 44_100, 44_100, 2, 16, false, 1, 1.0);
+    write_wav_fmt(&b, 44_100, 44_100, 2, 16, false, 2, 1.0);
+    write_wav_fmt(&src, 44_100, 44_100, 2, 16, false, 1, 0.25);
+    let mut command = Command::new(BIN);
+    command
+        .arg(&a)
+        .arg(&b)
+        .arg("--source")
+        .arg(&src)
+        .arg("--loudness-match");
+    let server = serving_with_cache(command, dir, None);
+
+    let json = session_json(&server);
+    let s: serde_json::Value = serde_json::from_str(&json).expect("session json");
+    let lm = &s["loudness_match"];
+    assert_eq!(lm["enabled"], true, "matching is on: {json}");
+    let gain = |k: &str| lm["candidates"][k]["gain_db"].as_f64().unwrap();
+    assert_eq!(
+        gain("SRC"),
+        0.0,
+        "the quietest lane (SRC) is the reference: {json}"
+    );
+    assert!(
+        gain("A") < 0.0,
+        "A is attenuated down to the source: {json}"
+    );
+    assert!(
+        gain("B") < 0.0,
+        "B is attenuated down to the source: {json}"
+    );
+}
+
+#[test]
+fn blind_project_conceals_ab_but_keeps_src_identified() {
+    // Blind + project: the A/B candidates are concealed (no name/path/hash), while
+    // the SRC lane stays identified — concealment applies to A/B only (spec #42).
+    let project = build_project();
+    let (_tool, path_env) = stub_project_tool();
+    let cwd = TempDir::new("blind-project-cwd");
+    let server = launch_project(
+        &project.dir.path,
+        &cwd.path,
+        &["vocals@deriv-a", "vocals@deriv-b"],
+        &["--blind"],
+        &path_env,
+    );
+
+    let json = session_json(&server);
+    let s: serde_json::Value = serde_json::from_str(&json).expect("session json");
+    assert_eq!(s["blind"], true, "the session is blind: {json}");
+
+    // A/B carry only label + duration + opaque audio — no identity.
+    for c in s["candidates"].as_array().unwrap() {
+        assert!(
+            c.get("name").is_none() && c.get("path").is_none() && c.get("sha256").is_none(),
+            "a blind candidate conceals identity: {json}"
+        );
+    }
+    // The SRC lane is fully identified: name and content-hash audio present.
+    let source = &s["source"];
+    assert_eq!(source["label"], "SRC");
+    assert_eq!(
+        source["name"], "take.wav",
+        "the SRC lane names its file: {json}"
+    );
+    assert!(
+        source["sha256"].is_string() && source["path"].is_string(),
+        "the SRC lane keeps its identity in blind mode: {json}"
+    );
+}

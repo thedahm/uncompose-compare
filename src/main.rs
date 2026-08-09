@@ -11,15 +11,16 @@
 //! or an undecodable format.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use clap::{Parser, Subcommand};
 
 use uncompose_compare::cache::{Cache, DEFAULT_CACHE_MAX_BYTES};
+use uncompose_compare::project::{uncompose_project_on_path, Manifest, Resolved};
 use uncompose_compare::record::Recorder;
 use uncompose_compare::server::{bind, serve, session_token};
-use uncompose_compare::session::Session;
+use uncompose_compare::session::{Lane, Session};
 
 /// uncompose-compare — load two audio files and open the listening workbench.
 #[derive(Parser)]
@@ -43,9 +44,28 @@ struct Cli {
 
     /// Write the concluded comparison record here instead of the default
     /// `<ULID>.json` in the invoking directory. An existing destination is
-    /// refused, never overwritten.
-    #[arg(long, value_name = "PATH")]
+    /// refused, never overwritten. Conflicts with `--project` (project records'
+    /// destination is the handover's, M5 slice 5).
+    #[arg(long, value_name = "PATH", conflicts_with = "project")]
     out: Option<PathBuf>,
+
+    /// Project mode (spec #42): resolve the two positionals as manifest refs
+    /// against `<DIR>/uncompose.project.json` instead of as file paths. A ref is
+    /// an asset slug, or `<name>@<derivation>`. The candidates' shared source
+    /// becomes the SRC lane unless `--exclude-source` is passed.
+    #[arg(long, value_name = "DIR")]
+    project: Option<PathBuf>,
+
+    /// The shared source for the SRC lane in bare-file mode (spec #42): a third,
+    /// always-identified lane that joins the sample-locked graph and the loudness
+    /// match group. In project mode the source is auto-resolved instead, so this
+    /// conflicts with `--project`.
+    #[arg(long, value_name = "PATH", conflicts_with = "project")]
+    source: Option<PathBuf>,
+
+    /// Project mode: omit the SRC lane even when the candidates share a source.
+    #[arg(long, requires = "project", conflicts_with = "source")]
+    exclude_source: bool,
 
     /// Match playback loudness: measure ITU-R BS.1770 integrated loudness per
     /// candidate at load and attenuate the louder lane down to the quietest
@@ -78,6 +98,67 @@ enum CacheCommand {
     Clear,
 }
 
+/// Resolve the two operands (and any SRC lane) into loadable lanes. Bare-file
+/// mode takes the operands as paths and `--source` as the optional SRC lane;
+/// project mode (spec #42) reads the manifest, resolves each operand as a ref,
+/// auto-resolves the shared source, and pre-flights the project tool — every
+/// failure here happens before the server binds.
+fn resolve_lanes(
+    cli: &Cli,
+    a: &Path,
+    b: &Path,
+) -> Result<(Lane, Lane, Option<Lane>), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(project_dir) = &cli.project else {
+        // Bare-file mode: the operands are paths, `--source` is the SRC lane.
+        return Ok((
+            Lane::bare(a.to_path_buf()),
+            Lane::bare(b.to_path_buf()),
+            cli.source.clone().map(Lane::bare),
+        ));
+    };
+
+    // Project mode. Pre-flight so a session that cannot be registered never
+    // starts: the manifest must parse, both refs must resolve, and the project
+    // tool must be installed.
+    let manifest = Manifest::load(project_dir)?;
+    if !uncompose_project_on_path() {
+        return Err("uncompose-project is not on PATH; install it \
+             (`pip install uncompose-project`) before launching a project session"
+            .into());
+    }
+
+    let a_tok = a.to_str().ok_or("the first ref is not valid UTF-8")?;
+    let b_tok = b.to_str().ok_or("the second ref is not valid UTF-8")?;
+    let ra = manifest.resolve(a_tok)?;
+    let rb = manifest.resolve(b_tok)?;
+
+    let lane_for = |resolved: &Resolved| Lane {
+        path: resolved.path(&manifest),
+        expected_sha256: Some(resolved.asset.sha256.clone()),
+        asset: Some(resolved.asset.id.clone()),
+        project: Some(manifest.id.clone()),
+    };
+    let a_lane = lane_for(&ra);
+    let b_lane = lane_for(&rb);
+
+    // The SRC lane: the candidates' shared source, unless opted out. Sharing none
+    // is a stated absence, not an error.
+    let source_lane = if cli.exclude_source {
+        None
+    } else {
+        manifest.shared_source(&ra, &rb)?.map(|asset| Lane {
+            path: project_dir.join(&asset.file),
+            expected_sha256: Some(asset.sha256.clone()),
+            // SRC is a playback lane, not a comparison candidate — it never enters
+            // the record's `candidates[]`, so it carries no recorded asset/project.
+            asset: None,
+            project: None,
+        })
+    };
+
+    Ok((a_lane, b_lane, source_lane))
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -108,8 +189,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
-    // The default form needs exactly two candidate paths. clap already rejects a
-    // third positional as "unexpected"; a zero/one-file invocation lands here.
+    // The default form needs exactly two candidate operands (paths, or manifest
+    // refs in project mode). clap already rejects a third positional as
+    // "unexpected"; a zero/one-operand invocation lands here.
     let (a, b) = match (&cli.a, &cli.b) {
         (Some(a), Some(b)) => (a, b),
         _ => {
@@ -119,10 +201,21 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
+    // Resolve the two operands into lanes (plus an optional SRC lane): straight
+    // from disk in bare-file mode, or from the project manifest in project mode.
+    let (a_lane, b_lane, source_lane) = resolve_lanes(cli, a, b)?;
+
     // Load both candidates before binding: a bad invocation must fail with a
     // clear message and a non-zero exit, never a running server. Loading also
     // transcodes each input into a cached playback proxy (#74).
-    let session = Session::load(a, b, &cache, cli.loudness_match, cli.blind)?;
+    let session = Session::load(
+        a_lane,
+        b_lane,
+        source_lane,
+        &cache,
+        cli.loudness_match,
+        cli.blind,
+    )?;
 
     // Prune the cache once, at startup, never mid-session (#72). The proxies
     // this run just wrote/reused carry the freshest access time, so an LRU prune

@@ -44,9 +44,9 @@ import {
   computeSpectrogram,
   dbToGain,
   formatTime,
-  otherLabel,
   type CandidateViews,
   type Label,
+  type LaneId,
   type Region,
   type ViewMode,
 } from "./transport";
@@ -112,7 +112,7 @@ interface LoudnessCandidate {
 interface LoudnessMatch {
   enabled: boolean;
   method?: string;
-  candidates?: Partial<Record<Label, LoudnessCandidate>>;
+  candidates?: Partial<Record<LaneId, LoudnessCandidate>>;
 }
 
 /**
@@ -125,6 +125,12 @@ export interface BlindSession {
   blind: true;
   candidates: BlindCandidate[];
   loudness_match: LoudnessMatch;
+  /**
+   * The SRC lane (spec #42): the shared source both candidates are compared
+   * against. Always identified — concealment is A/B only — so it carries full
+   * metadata even in a blind session. Absent when the pair shares no source.
+   */
+  source?: SightedCandidate;
 }
 
 /**
@@ -146,6 +152,8 @@ export interface SightedSession {
   duration_delta_samples?: number;
   sample_rate_mismatch: boolean;
   channel_count_mismatch: boolean;
+  /** The SRC lane (spec #42), when the candidates share a source. */
+  source?: SightedCandidate;
 }
 
 /**
@@ -170,8 +178,10 @@ const VIEWS: { id: ViewMode; label: string }[] = [
   { id: "spectral", label: "Spectral" },
 ];
 
-function candidateColor(label: Label): string {
-  return label === "A" ? "#4ea1ff" : "#ff8f4e";
+function candidateColor(label: LaneId): string {
+  if (label === "A") return "#4ea1ff";
+  if (label === "B") return "#ff8f4e";
+  return "#9b8fff"; // SRC — the reference lane
 }
 
 /**
@@ -213,12 +223,12 @@ export function formatLufs(lufs: number | null | undefined): string {
  * attenuation when matching is on, unity for any lane the match does not name
  * (and for both when matching is off — faithful as-is playback, #66).
  */
-function laneGains(match: LoudnessMatch): Record<Label, number> {
-  const gain = (label: Label) => {
+function laneGains(match: LoudnessMatch): Record<LaneId, number> {
+  const gain = (label: LaneId) => {
     const db = match.enabled ? match.candidates?.[label]?.gain_db : undefined;
     return db === undefined ? 1 : dbToGain(db);
   };
-  return { A: gain("A"), B: gain("B") };
+  return { A: gain("A"), B: gain("B"), SRC: gain("SRC") };
 }
 
 /**
@@ -246,10 +256,10 @@ function computeViews(channel: Float32Array): CandidateViews {
 export function App() {
   const [session, setSession] = useState<SessionMeta | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [views, setViews] = useState<Record<Label, CandidateViews> | null>(null);
+  const [views, setViews] = useState<Partial<Record<LaneId, CandidateViews>> | null>(null);
   const [view, setView] = useState<ViewMode>("waveform");
 
-  const [live, setLive] = useState<Label>("A");
+  const [live, setLive] = useState<LaneId>("A");
   const [playing, setPlaying] = useState(false);
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -319,17 +329,22 @@ export function App() {
           decode(lanes.byLabel.A),
           decode(lanes.byLabel.B),
         ]);
+        // The SRC lane (spec #42): the shared source, decoded into the same graph
+        // so it plays sample-locked with A/B and can be auditioned. Always
+        // identified, so it decodes like a sighted candidate.
+        const bufSrc = s.source ? await decode(s.source) : undefined;
 
         // Static per-lane gains from the server's loudness match (issue #30):
         // faithful unity when off, the measured attenuation when on. Constant
         // for the session — the sync contract is untouched (#66).
         const laneGain = laneGains(s.loudness_match);
-        const eng = new PlaybackEngine(ctx, bufA, bufB, laneGain);
+        const eng = new PlaybackEngine(ctx, bufA, bufB, laneGain, bufSrc);
         eng.onEnded = () => syncFrom(eng);
         engineRef.current = eng;
         setViews({
           A: computeViews(bufA.getChannelData(0)),
           B: computeViews(bufB.getChannelData(0)),
+          ...(bufSrc ? { SRC: computeViews(bufSrc.getChannelData(0)) } : {}),
         });
         setDuration(eng.duration());
         syncFrom(eng);
@@ -372,7 +387,7 @@ export function App() {
   );
 
   const switchTo = useCallback(
-    (label: Label) => withEngine((eng) => eng.switchTo(label)),
+    (label: LaneId) => withEngine((eng) => eng.switchTo(label)),
     [withEngine],
   );
 
@@ -401,7 +416,7 @@ export function App() {
   // loop reference. The wall-clock `at` and id are stamped here so the ledger
   // logic stays pure and testable.
   const pin = useCallback(
-    (candidate: Target, text: string) => {
+    (candidate: Target | null, text: string) => {
       const eng = engineRef.current;
       const obs = makeObservation({
         id: crypto.randomUUID(),
@@ -419,6 +434,11 @@ export function App() {
     [region],
   );
 
+  // What a note made on the live lane tags: the lane itself for A/B, but
+  // nothing for SRC — auditioning the reference is not a comparison, so its
+  // note is a general observation (null candidate).
+  const liveTarget: Target | null = live === "SRC" ? null : live;
+
   // Submit the composer's free text (issue #15): `enter` tags the live
   // candidate, `shift+enter` tags both. Empty text is ignored so a stray key
   // never drops a blank note.
@@ -426,10 +446,10 @@ export function App() {
     (both: boolean) => {
       const text = composer.trim();
       if (!text) return;
-      pin(both ? "both" : live, text);
+      pin(both ? "both" : liveTarget, text);
       setComposer("");
     },
-    [composer, live, pin],
+    [composer, liveTarget, pin],
   );
 
   // Jump the transport to an observation's pinned position (untethered notes
@@ -549,7 +569,7 @@ export function App() {
           // Pin on the live candidate (both with shift) without interrupting
           // listening; the empty text is filled in later in the ledger.
           e.preventDefault();
-          pin(e.shiftKey ? "both" : live, "");
+          pin(e.shiftKey ? "both" : liveTarget, "");
           break;
         case "Tab":
           // Jump to the composer to write a free-text observation.
@@ -566,7 +586,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, toggleSwitch, toggleLoop, clearRegion, rewind, step, pin, live]);
+  }, [togglePlay, toggleSwitch, toggleLoop, clearRegion, rewind, step, pin, liveTarget]);
 
   // The two lanes keyed by label, narrowed once from the session payload: the
   // blind pair carries no identity to render, the sighted pair carries all of it.
@@ -594,12 +614,14 @@ export function App() {
   // the engraved verdict's stars. The blind switch button and the sighted lane
   // row then differ only in their wrapper and in whether a filename follows the
   // label — so the live marker and the stars cannot drift between them.
-  const laneHeader = (label: Label, name?: string) => (
+  const laneHeader = (label: LaneId, name?: string) => (
     <>
       <span data-testid={`live-marker-${label}`}>{live === label ? "● " : "  "}</span>
       <strong>{label}</strong>
       {name ? ` ${name}` : null}
-      {preferredStars(label, { marginLeft: 6 })}
+      {/* Only a comparison candidate (A/B) can carry a preferred verdict; the SRC
+          reference never wins, so it never shows stars. */}
+      {label !== "SRC" && preferredStars(label, { marginLeft: 6 })}
     </>
   );
 
@@ -624,7 +646,7 @@ export function App() {
           Loudness matching active — not mastered levels (BS.1770 integrated).{" "}
           {session.blind
             ? "Per-lane figures are hidden until reveal."
-            : (["A", "B"] as Label[]).map((label) => {
+            : (["A", "B", "SRC"] as LaneId[]).map((label) => {
                 const c = session.loudness_match.candidates?.[label];
                 if (!c) return null;
                 return (
@@ -674,7 +696,9 @@ export function App() {
               </span>
             </div>
             <Waveform
-              views={views[live]}
+              // `live` always names a lane whose views were computed above (A/B
+              // always, SRC only when it exists and can be switched to).
+              views={views[live]!}
               view={view}
               duration={duration}
               position={position}
@@ -695,7 +719,7 @@ export function App() {
               <button data-testid="play-toggle" onClick={togglePlay}>
                 {playing ? "Stop" : "Play"}
               </button>
-              <button data-testid="switch" onClick={() => switchTo(otherLabel(live))}>
+              <button data-testid="switch" onClick={toggleSwitch}>
                 Switch (x)
               </button>
               <button data-testid="rewind" onClick={rewind}>
@@ -730,8 +754,44 @@ export function App() {
             </div>
           </div>
 
-          {/* SRC lane: an empty structural slot (needs --source / project mode, M5). */}
-          <div data-testid="src-lane-slot" aria-hidden="true" />
+          {/* SRC lane (spec #42): the shared source, an always-identified third
+              lane that plays sample-locked with A/B and can be auditioned by
+              click. It never wins a preference, so it carries no verdict stars
+              and is not an `x` switch target. Absent when the pair shares none. */}
+          {session?.source && views.SRC && (
+            <div
+              data-testid="lane-SRC"
+              data-live={live === "SRC"}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                marginBottom: 6,
+                padding: 4,
+                borderLeft: `3px solid ${live === "SRC" ? "#fff" : "transparent"}`,
+              }}
+            >
+              <span style={{ width: 90, cursor: "pointer" }} onClick={() => switchTo("SRC")}>
+                {laneHeader("SRC", session.source.name)}
+              </span>
+              <div style={{ flex: 1 }}>
+                <Waveform
+                  views={views.SRC}
+                  view={view}
+                  duration={duration}
+                  position={position}
+                  onSeek={seek}
+                  region={region}
+                  looping={looping}
+                  onSelectRegion={selectRegion}
+                  onActivate={() => switchTo("SRC")}
+                  color={candidateColor("SRC")}
+                  height={48}
+                  testid="waveform-SRC"
+                />
+              </div>
+            </div>
+          )}
 
           {/* A blind session (#29) hides the identifying A/B lane rows and shows
               two anonymous switch buttons in their place (per the #61 design); a
@@ -785,7 +845,7 @@ export function App() {
                     </span>
                     <div style={{ flex: 1 }}>
                       <Waveform
-                        views={views[label]}
+                        views={views[label]!}
                         view={view}
                         duration={duration}
                         position={position}

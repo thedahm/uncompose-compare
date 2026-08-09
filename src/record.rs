@@ -150,12 +150,22 @@ impl Recorder {
             .candidates
             .iter()
             .map(|c| {
-                json!({
+                let mut candidate = json!({
                     "label": c.label,
                     "path": c.path,
                     "sha256": c.sha256,
                     "size": c.size,
-                })
+                });
+                // Project mode (spec #42): a candidate resolved from the manifest
+                // carries its asset id and the project ULID, in the slots the v0
+                // schema already declares. A bare-file candidate carries neither.
+                if let Some(asset) = &c.asset {
+                    candidate["asset"] = json!(asset);
+                }
+                if let Some(project) = &c.project {
+                    candidate["project"] = json!(project);
+                }
+                candidate
             })
             .collect();
 
