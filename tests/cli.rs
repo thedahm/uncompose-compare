@@ -1840,7 +1840,7 @@ fn blind_session_conceals_every_identifying_detail() {
 }
 
 /// Run a blind invocation expected to be refused pre-bind, returning
-/// (exit code, stderr). Fixtures live in `dir`, kept by the caller.
+/// (exit code, stderr). The caller keeps the fixture files alive.
 fn blind_refusal(a: &Path, b: &Path) -> (Option<i32>, String) {
     run_expecting_failure(&[a.to_str().unwrap(), b.to_str().unwrap(), "--blind"])
 }

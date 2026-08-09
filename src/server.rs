@@ -2,7 +2,7 @@
 //!
 //! The privacy contract holds on every response — loopback bind, per-session
 //! token, Host check, blanket `Cache-Control: no-store`, constant-time token
-//! compare — and covers the `/session`, `/audio/<sha256>`, and `/record`
+//! compare — and covers the `/session`, `/audio/<reference>`, and `/record`
 //! endpoints as well as the embedded bundle.
 
 use std::fs::File;
@@ -92,16 +92,17 @@ pub fn serve(mut request: Request, token: &str, session: &Session, recorder: &Re
     // Audio proxy endpoint: resolve strictly through the per-session reference
     // table, so a request names a reference we already loaded — never a
     // filesystem path. Sighted sessions key by source hash; blind sessions key
-    // by an opaque per-session token, so a content hash is never servable (#28)
-    // and the shuffle cannot be decoded. An unknown reference is a 404, not a
-    // chance to read arbitrary files.
+    // by an opaque per-session reference, so a content hash is never servable
+    // (#28) and the shuffle cannot be decoded. An unknown reference is a 404,
+    // not a chance to read arbitrary files.
     if let Some(reference) = path.strip_prefix("audio/") {
         let response = match session.proxies.get(reference) {
             Some(proxy) => match std::fs::read(&proxy.path) {
                 Ok(data) => Response::from_data(data)
                     .with_header(header("Content-Type", proxy.container.content_type()))
                     .with_header(header("Cache-Control", "no-store")),
-                // A proxy pruned out from under us resolves like an unknown hash.
+                // A proxy pruned out from under us resolves like an unknown
+                // reference.
                 Err(_) => not_found(),
             },
             None => not_found(),
@@ -141,7 +142,7 @@ fn json_response(status: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>
         .with_header(header("Cache-Control", "no-store"))
 }
 
-/// A 404 for an unknown asset or content hash — like every other response,
+/// A 404 for an unknown asset or audio reference — like every other response,
 /// never cached.
 fn not_found() -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_string("not found")

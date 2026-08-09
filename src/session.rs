@@ -1,16 +1,17 @@
 //! The loaded comparison session: the two candidates in argument order, plus
-//! the content-hash → proxy table the audio endpoint resolves through (#10,
+//! the audio-reference → proxy table the audio endpoint resolves through (#10,
 //! #11).
 //!
-//! Requests name a source hash, never a filesystem path, so path traversal is
-//! impossible. Bad invocations fail here — before the server ever binds — with a
-//! clear message and a non-zero exit: a missing or unreadable file, or an
-//! undecodable format.
+//! Requests name a per-session audio reference — the source hash in a sighted
+//! session, an opaque token in a blind one (#28) — never a filesystem path, so
+//! path traversal is impossible. Bad invocations fail here — before the server
+//! ever binds — with a clear message and a non-zero exit: a missing or
+//! unreadable file, an undecodable format, or a pair blind mode refuses.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Result as IoResult};
+use std::io::Read;
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
@@ -23,7 +24,7 @@ use crate::hex;
 /// One loaded audio file, with everything the record and workbench need to
 /// identify and describe it. Decoded metadata is derived at load; the PCM
 /// itself is not retained — it lives in the cached playback proxy (#74), which
-/// the workbench fetches from `/audio/<sha256>`.
+/// the workbench fetches from `/audio/<audio_ref>`.
 pub struct Candidate {
     pub label: &'static str,
     pub name: String,
@@ -63,8 +64,7 @@ impl Candidate {
             "channels": self.channels,
             // The audio endpoint resolves purely by the per-session reference
             // (#72): the page never asks for a path, only for the proxy of a
-            // content it knows. In sighted mode that reference is the source
-            // hash; the value is unchanged from before.
+            // content it knows — in sighted mode, the source hash.
             "audio": self.audio_url(),
         })
     }
@@ -178,8 +178,8 @@ impl Session {
             )));
         }
         // Sample rate and channel count are checked before duration: a rate
-        // difference always shows up as a frame-count (hence duration) mismatch
-        // too, so the more specific property is named first.
+        // difference drags a duration mismatch along with it, so the more
+        // specific property is named first.
         if self.sample_rate_mismatch() {
             return Err(LoadError::BlindRefused(format!(
                 "cannot blind-compare {} and {}: sample-rate mismatch ({} Hz vs {} Hz)",
@@ -453,7 +453,7 @@ fn load_candidate(
 /// fine, dependency-free source — the same one the session token draws from.
 fn coin_flip() -> Result<bool, LoadError> {
     let mut byte = [0u8; 1];
-    fill_random(&mut byte).map_err(LoadError::Randomness)?;
+    fill_random(&mut byte)?;
     Ok(byte[0] & 1 == 1)
 }
 
@@ -463,12 +463,14 @@ fn coin_flip() -> Result<bool, LoadError> {
 /// own inputs.
 fn opaque_ref() -> Result<String, LoadError> {
     let mut bytes = [0u8; 16];
-    fill_random(&mut bytes).map_err(LoadError::Randomness)?;
+    fill_random(&mut bytes)?;
     Ok(hex(&bytes))
 }
 
-fn fill_random(buf: &mut [u8]) -> IoResult<()> {
-    File::open("/dev/urandom")?.read_exact(buf)
+fn fill_random(buf: &mut [u8]) -> Result<(), LoadError> {
+    File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(buf))
+        .map_err(LoadError::Randomness)
 }
 
 #[cfg(test)]
