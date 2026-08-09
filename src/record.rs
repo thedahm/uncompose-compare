@@ -20,6 +20,7 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -39,26 +40,128 @@ pub struct Recorder {
     /// The schema's `$id`, read from the embedded schema: the value every
     /// written record carries in its `schema` field.
     schema_id: String,
-    /// The `--out` override, if any; otherwise the record lands in `dir`.
-    out: Option<PathBuf>,
-    /// The invoking directory: the default destination and the base a relative
-    /// `--out` resolves against.
-    dir: PathBuf,
+    /// Where a concluded record lands, and — in project mode — the handover that
+    /// registers it (ADR-0002, spec #42 slice 5).
+    destination: Destination,
     /// The session's `created_at`, stamped once at startup (RFC 3339, UTC).
     created_at: String,
     concluded: Cell<bool>,
 }
 
-/// A successful conclude: where the immutable record landed, and — for a blind
-/// session — the reveal the UI displays: the label→file mapping
-/// (`{label, path, sha256, size}` per candidate), identical to what the record
-/// carries (#29), each lane also carrying its `{measured_lufs, gain_db}` when
-/// loudness matching ran (#32). A sighted session reveals nothing: it never
-/// concealed anything, so `reveal` is `None` and the response omits the key
-/// (ADR-0006 — the reveal is the blind session's payload).
+/// Where a concluded record lands (ADR-0002, spec #42 slice 5). A standalone
+/// session writes into the invoking directory and hands the record to no one; a
+/// project session writes into the manifest's `evaluations/` and auto-imports it.
+pub enum Destination {
+    /// Standalone: `<ULID>.json` in the invoking directory `dir`, or the `--out`
+    /// override (resolved against `dir` when relative). No handover.
+    Standalone { out: Option<PathBuf>, dir: PathBuf },
+    /// Project mode: `<root>/evaluations/<ULID>.json` (the directory created if
+    /// needed), followed by the auto-import handover
+    /// `uncompose-project import --project <root> <record>`. `root` is absolute so
+    /// the handover's argv carries absolute paths.
+    Project { root: PathBuf },
+}
+
+impl Destination {
+    /// The record's path for the minted `id` under this destination policy.
+    fn path_for(&self, id: &str) -> PathBuf {
+        match self {
+            // `join` keeps an absolute `--out` as-is and resolves a relative one
+            // against the invoking directory.
+            Destination::Standalone {
+                out: Some(out),
+                dir,
+            } => dir.join(out),
+            Destination::Standalone { out: None, dir } => dir.join(format!("{id}.json")),
+            Destination::Project { root } => root.join("evaluations").join(format!("{id}.json")),
+        }
+    }
+
+    /// Create the parent directory this policy owns before the write. Project
+    /// mode's `evaluations/` is the handover's directory, created if needed;
+    /// a standalone session writes into a directory that already exists (the
+    /// invoking cwd, or the `--out` parent the caller chose).
+    fn prepare(&self, dest: &Path) -> Result<(), RecordError> {
+        if let Destination::Project { .. } = self {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    RecordError::Io(format!("cannot create {}: {e}", parent.display()))
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A successful conclude: where the immutable record landed, the reveal a blind
+/// session's UI displays, and — in project mode — how registration went.
+///
+/// The reveal is the label→file mapping (`{label, path, sha256, size}` per
+/// candidate), identical to what the record carries (#29), each lane also
+/// carrying its `{measured_lufs, gain_db}` when loudness matching ran (#32). A
+/// sighted session reveals nothing: it never concealed anything, so `reveal` is
+/// `None` and the response omits the key (ADR-0006).
+///
+/// `registration` is the project-mode auto-import outcome (spec #42 slice 5); a
+/// standalone session hands the record to no one, so it is `None`.
 pub struct Conclusion {
     pub path: String,
     pub reveal: Option<Value>,
+    pub registration: Option<Registration>,
+}
+
+/// The project-mode registration outcome that rides the conclude response
+/// (spec #42 slice 5, #67 res. 7), so the closing screen can show "registered"
+/// or the recovery command.
+pub enum Registration {
+    /// `uncompose-project import` accepted the record.
+    Registered,
+    /// The import failed. The record is kept — it is never the casualty — so the
+    /// tool's stderr is relayed and the exact recovery command is offered; no
+    /// retry, no rollback.
+    Failed { stderr: String, recovery: String },
+}
+
+impl Registration {
+    /// The registration outcome as JSON for the conclude response.
+    pub fn to_json(&self) -> Value {
+        match self {
+            Registration::Registered => json!({ "registered": true }),
+            Registration::Failed { stderr, recovery } => json!({
+                "registered": false,
+                "error": stderr,
+                "recovery": recovery,
+            }),
+        }
+    }
+}
+
+impl Conclusion {
+    /// The process lifecycle after this (successful) conclude: the exit code and
+    /// the stderr lines to relay before exiting. Save-and-close is one act
+    /// (#67 res. 8) — the process exits either way. It exits 0 when the record was
+    /// saved (standalone) and, in project mode, registered; nonzero when the
+    /// auto-import failed, relaying the tool's stderr and printing the exact
+    /// recovery command last (#67 res. 7).
+    pub fn lifecycle(&self) -> (i32, Vec<String>) {
+        match &self.registration {
+            None | Some(Registration::Registered) => (0, Vec::new()),
+            Some(Registration::Failed { stderr, recovery }) => {
+                let mut lines = vec![format!(
+                    "uncompose-compare: the record was saved to {} but could not be \
+                     registered with the project:",
+                    self.path
+                )];
+                let relayed = stderr.trim_end();
+                if !relayed.is_empty() {
+                    lines.push(relayed.to_string());
+                }
+                // The exact recovery command, printed last.
+                lines.push(recovery.clone());
+                (1, lines)
+            }
+        }
+    }
 }
 
 /// Why a conclude was refused, mapped to an HTTP status the UI can act on.
@@ -101,8 +204,7 @@ impl fmt::Display for RecordError {
 
 impl Recorder {
     pub fn new(
-        out: Option<PathBuf>,
-        dir: PathBuf,
+        destination: Destination,
         created_at: SystemTime,
     ) -> Result<Recorder, Box<dyn std::error::Error + Send + Sync>> {
         let schema: Value = serde_json::from_str(SCHEMA_STR)?;
@@ -115,8 +217,7 @@ impl Recorder {
         Ok(Recorder {
             validator,
             schema_id,
-            out,
-            dir,
+            destination,
             created_at: rfc3339(created_at),
             concluded: Cell::new(false),
         })
@@ -150,12 +251,22 @@ impl Recorder {
             .candidates
             .iter()
             .map(|c| {
-                json!({
+                let mut candidate = json!({
                     "label": c.label,
                     "path": c.path,
                     "sha256": c.sha256,
                     "size": c.size,
-                })
+                });
+                // Project mode (spec #42): a candidate resolved from the manifest
+                // carries its asset id and the project ULID, in the slots the v0
+                // schema already declares. A bare-file candidate carries neither.
+                if let Some(asset) = &c.asset {
+                    candidate["asset"] = json!(asset);
+                }
+                if let Some(project) = &c.project {
+                    candidate["project"] = json!(project);
+                }
+                candidate
             })
             .collect();
 
@@ -213,14 +324,27 @@ impl Recorder {
         // be caught before it is engraved.
         check_candidate_references(&record, &session.labels())?;
 
-        let dest = self.destination(&id);
+        let dest = self.destination.path_for(&id);
+        self.destination.prepare(&dest)?;
         self.write_once(&dest, &record)?;
 
-        // Only a completed write concludes the session; that write is the one.
+        // Only a completed write concludes the session; that write is the one,
+        // and it stands whatever the handover does next — the record is never the
+        // casualty (#67 res. 7).
         self.concluded.set(true);
+
+        // Project mode: hand the written record to `uncompose-project import`. Its
+        // outcome rides the conclude response; a failure keeps the record and is
+        // relayed, never rolled back.
+        let registration = match &self.destination {
+            Destination::Project { root } => Some(import(root, &dest)),
+            Destination::Standalone { .. } => None,
+        };
+
         Ok(Conclusion {
             path: dest.display().to_string(),
             reveal,
+            registration,
         })
     }
 
@@ -268,16 +392,30 @@ impl Recorder {
             }
         }
     }
+}
 
-    /// The record destination: `--out` when set (resolved against the invoking
-    /// directory if relative), else `<ULID>.json` in the invoking directory.
-    fn destination(&self, id: &str) -> PathBuf {
-        match &self.out {
-            // `join` keeps an absolute `--out` as-is and resolves a relative
-            // one against the invoking directory.
-            Some(out) => self.dir.join(out),
-            None => self.dir.join(format!("{id}.json")),
-        }
+/// Hand the written record to `uncompose-project import --project <root>
+/// <record>` (the pinned argv, spec #42 slice 5). Both paths are absolute. A
+/// clean exit registers; any nonzero exit — or a tool that would not run —
+/// relays the failure and offers the exact recovery command, the record kept.
+fn import(root: &Path, record: &Path) -> Registration {
+    let recovery = format!("uncompose project import {}", record.display());
+    match Command::new("uncompose-project")
+        .arg("import")
+        .arg("--project")
+        .arg(root)
+        .arg(record)
+        .output()
+    {
+        Ok(out) if out.status.success() => Registration::Registered,
+        Ok(out) => Registration::Failed {
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            recovery,
+        },
+        Err(e) => Registration::Failed {
+            stderr: format!("could not run `uncompose-project import`: {e}"),
+            recovery,
+        },
     }
 }
 

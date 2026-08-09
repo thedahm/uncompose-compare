@@ -34,15 +34,31 @@ pub fn bind(port: u16) -> Result<(Server, u16), Box<dyn std::error::Error + Send
     Ok((server, bound))
 }
 
+/// What the request loop should do after a request is served: keep serving, or
+/// shut down and exit. A successful conclude is the one act that ends a session
+/// (spec #42 slice 5, #67 res. 8) — save-and-close, in both modes — carrying the
+/// process exit code and any stderr lines to relay first.
+pub enum Lifecycle {
+    Continue,
+    Shutdown { code: i32, stderr: Vec<String> },
+}
+
 /// Resolve the request against the session, record, and audio endpoints and the
 /// embedded bundle, enforcing the #72 contract (Host check, then token) before
-/// serving anything.
-pub fn serve(mut request: Request, token: &str, session: &Session, recorder: &Recorder) {
+/// serving anything. Returns whether the request loop should keep serving or —
+/// after a successful conclude — shut down and exit.
+pub fn serve(
+    mut request: Request,
+    token: &str,
+    session: &Session,
+    recorder: &Recorder,
+) -> Lifecycle {
     // DNS-rebinding guard: only a loopback Host is ever honored. A page on
     // another origin that resolves its name to 127.0.0.1 still sends its own
     // Host, so this refuses it before any asset is touched.
     if !host_is_loopback(&request) {
-        return refuse(request);
+        refuse(request);
+        return Lifecycle::Continue;
     }
 
     // The token may arrive as a `?token=` query param (the printed URL) or as
@@ -54,7 +70,8 @@ pub fn serve(mut request: Request, token: &str, session: &Session, recorder: &Re
     let query_ok = query_token(query).is_some_and(matches);
     let cookie_ok = cookie_token(&request).is_some_and(matches);
     if !query_ok && !cookie_ok {
-        return refuse(request);
+        refuse(request);
+        return Lifecycle::Continue;
     }
 
     let path = path.trim_start_matches('/');
@@ -63,13 +80,15 @@ pub fn serve(mut request: Request, token: &str, session: &Session, recorder: &Re
     // metadata. Same no-store guarantee as every other response.
     if path == "session" {
         let _ = request.respond(json_response(200, &session.to_json()));
-        return;
+        return Lifecycle::Continue;
     }
 
     // The record endpoint: an explicit conclude POSTs the concluded session
     // here. The server validates it against the owned schema, stamps completion,
-    // and writes the immutable record exactly once (issue #16). A second conclude
-    // — or any conclude after a successful write — is refused.
+    // and writes the immutable record exactly once (issue #16). A successful write
+    // is save-and-close — the response is delivered, then the session ends
+    // (spec #42 slice 5). A refused conclude wrote nothing and keeps serving, so
+    // the listener can fix the cause and conclude again.
     if path == "record" && *request.method() == Method::Post {
         let mut body = String::new();
         if request.as_reader().read_to_string(&mut body).is_err() {
@@ -77,25 +96,48 @@ pub fn serve(mut request: Request, token: &str, session: &Session, recorder: &Re
                 400,
                 &json!({"error": "unreadable request body"}),
             ));
-            return;
+            return Lifecycle::Continue;
         }
-        let (status, payload) = match recorder.conclude(session, &body) {
+        match recorder.conclude(session, &body) {
             // The reveal (label→file) rides the successful-write response and
             // nothing before it — the browser had no identity until now (#29).
-            // A sighted conclude carries no reveal: nothing was concealed.
+            // A sighted conclude carries no reveal: nothing was concealed. In
+            // project mode the registration outcome rides alongside it so the
+            // closing screen can show "registered" or the recovery command.
             Ok(c) => {
+                let (code, stderr) = c.lifecycle();
                 let mut payload = json!({ "path": c.path });
                 if let Some(reveal) = c.reveal {
                     payload["reveal"] = reveal;
                 }
-                (200, payload)
+                if let Some(registration) = &c.registration {
+                    payload["registration"] = registration.to_json();
+                }
+                // Deliver the response before shutting down, then end the session:
+                // the successful write is save-and-close, one act, in both modes
+                // (spec #42 slice 5, #67 res. 8). The exit code tells the truth
+                // about the save and, in project mode, the registration.
+                let _ = request.respond(json_response(200, &payload));
+                Lifecycle::Shutdown { code, stderr }
             }
-            Err(e) => (e.status(), json!({ "error": e.to_string() })),
-        };
-        let _ = request.respond(json_response(status, &payload));
-        return;
+            // A refused conclude wrote nothing and did not conclude: keep serving
+            // so the listener can fix the cause and try again.
+            Err(e) => {
+                let _ = request.respond(json_response(
+                    e.status(),
+                    &json!({ "error": e.to_string() }),
+                ));
+                Lifecycle::Continue
+            }
+        }
+    } else {
+        serve_static(request, path, token, session)
     }
+}
 
+/// The audio proxy, the embedded bundle, and the 404 for anything else — every
+/// path that never ends the session, so it always keeps the loop serving.
+fn serve_static(request: Request, path: &str, token: &str, session: &Session) -> Lifecycle {
     // Audio proxy endpoint: resolve strictly through the per-session reference
     // table, so a request names a reference we already loaded — never a
     // filesystem path. Sighted sessions key by source hash; blind sessions key
@@ -115,7 +157,7 @@ pub fn serve(mut request: Request, token: &str, session: &Session, recorder: &Re
             None => not_found(),
         };
         let _ = request.respond(response);
-        return;
+        return Lifecycle::Continue;
     }
 
     // Map "/" to the SPA entry point.
@@ -139,6 +181,7 @@ pub fn serve(mut request: Request, token: &str, session: &Session, recorder: &Re
 
     // A broken client connection is not our problem to recover from.
     let _ = request.respond(response);
+    Lifecycle::Continue
 }
 
 /// A JSON response, uncached like every other response.

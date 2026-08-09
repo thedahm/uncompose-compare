@@ -58,12 +58,19 @@ function wavBytes(pcm) {
   return buf;
 }
 
-for (const [name, seed] of [
-  ["a", 1],
-  ["b", 2],
+// `a`/`b` are the comparison candidates; `src` is the shared source the SRC lane
+// plays (spec #42) — a third uncorrelated noise, so a three-lane render's
+// cross-correlation still has one sharp zero-lag peak per lane. Only the
+// candidates get a FLAC twin: the decode canary's format coverage is about the
+// candidate pipeline, and SRC decodes through the same path.
+for (const [name, seed, flac] of [
+  ["a", 1, true],
+  ["b", 2, true],
+  ["src", 3, false],
 ]) {
   const wav = wavBytes(makeNoise(seed));
   writeFileSync(path.join(fixturesDir, `${name}.wav`), wav);
+  if (!flac) continue;
   execFileSync(FFMPEG, [
     "-y",
     "-loglevel",

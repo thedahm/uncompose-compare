@@ -19,6 +19,7 @@
 
 pub mod audio;
 pub mod cache;
+pub mod project;
 pub mod record;
 pub mod server;
 pub mod session;

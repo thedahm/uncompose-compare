@@ -7,10 +7,10 @@
  * targets the packaged binary's served page: it hands this function the
  * seeded-noise fixtures as base64, this page decodes them and renders the real
  * playback-graph shape (three sample-locked buffer sources into per-lane gains,
- * SRC muted, a mid-render 10 ms linear crossfade A→B) in an
- * `OfflineAudioContext`, and returns compact metrics. The Playwright side
- * asserts the three contract points (zero-lag correlation peak, exact decode
- * sample counts, bit-identical output outside the fade window).
+ * a mid-render 10 ms linear crossfade A→B) in an `OfflineAudioContext`, and
+ * returns compact metrics. The Playwright side asserts the three contract points
+ * (zero-lag correlation peak, exact decode sample counts, bit-identical output
+ * outside the fade window).
  *
  * Keeping the plumbing in the page — not the test — is the point of #5: the
  * thing under test is what the wheel actually ships, exercised the way a
@@ -22,6 +22,14 @@
  * the zero-lag correlation peak and the crossfade bound must both survive; the
  * variant certifies that on every push so loudness matching can never regress
  * the sync promise unnoticed.
+ *
+ * The three-lane variant (spec #42, ADR-0009) re-runs the same render with the
+ * SRC lane audible at its own static gain beside the switching pair — the shape
+ * a project session plays. The source is a playback lane on the one transport
+ * and a member of the loudness match group, so both contract points have to hold
+ * with it sounding: the post-switch region must still peak at lag 0 against the
+ * live candidate *and* against the source, and the output outside the fade
+ * window must be bit-identical to the two-lane mix.
  */
 
 /** What the harness passes in: base64 fixtures plus the render geometry. */
@@ -60,6 +68,8 @@ interface Correlation {
 export interface VariantResult {
   identity: ChannelIdentity[];
   correlation: Correlation;
+  /** The same region correlated against the source lane; absent when SRC is silent. */
+  sourceCorrelation?: Correlation;
 }
 
 export interface SyncResult {
@@ -71,24 +81,39 @@ export interface SyncResult {
    * per-lane attenuation applied (issue #31). Absent when the render is skipped.
    */
   attenuated?: VariantResult;
+  /**
+   * The three-lane variant (spec #42): the same render with the SRC lane audible
+   * beside the switching pair, each of the three at its own static loudness-match
+   * gain. Absent when the render is skipped.
+   */
+  threeLane?: VariantResult;
   renderSkipped?: boolean;
 }
 
 /** Render geometry shared by every variant: SyncParams minus the fixtures. */
 type Geometry = Omit<SyncParams, "fixtures">;
 
-/** Distinct constant per-lane gains for the audible lanes A and B. */
+/**
+ * Distinct constant per-lane gains. A and B crossfade; SRC holds its gain for
+ * the whole render — it is a reference lane, never a switch target (ADR-0009) —
+ * so `src: 0` is the two-lane contract and a non-zero `src` is a session whose
+ * source is audible alongside the live candidate.
+ */
 interface LaneGains {
   a: number;
   b: number;
+  src: number;
 }
 
 /**
- * Render the dual-source crossfade graph once with the given constant per-lane
- * gains and compute the identity + correlation metrics. `gains.a`/`gains.b`
- * scale the A and B lanes; `1`/`1` is the faithful unattenuated render. Powers
- * of two keep the scaled comparison an exact float multiply, so the crossfade
- * bound stays bit-exact under attenuation.
+ * Render the crossfade graph once with the given constant per-lane gains and
+ * compute the identity + correlation metrics. `gains.a`/`gains.b` scale the A
+ * and B lanes and `gains.src` the source lane; `1`/`1`/`0` is the faithful
+ * unattenuated two-lane render. Powers of two keep the scaled comparison an
+ * exact float multiply, so the crossfade bound stays bit-exact under
+ * attenuation — and outside the fade window at most two lanes are ever non-zero,
+ * so the expected mix is a single correctly-rounded float32 add whatever order
+ * the engine sums in.
  */
 async function renderVariant(
   geo: Geometry,
@@ -102,15 +127,15 @@ async function renderVariant(
   const tSwitch = SWITCH_SAMPLE / SR;
   const tEnd = (SWITCH_SAMPLE + FADE_SAMPLES) / SR;
 
-  // Real playback-graph shape: three sample-locked sources (SRC muted) into
-  // per-lane gains, linear crossfade A→B over FADE_SAMPLES. The variant folds
-  // its constant attenuation into each lane's held pre/post gain — the switch
-  // curve is unchanged in shape, only scaled, exactly as loudness matching's
-  // static per-lane gain does (#66).
+  // Real playback-graph shape: three sample-locked sources into per-lane gains,
+  // linear crossfade A→B over FADE_SAMPLES, SRC held at a constant gain. The
+  // variant folds its constant attenuation into each lane's held pre/post gain —
+  // the switch curve is unchanged in shape, only scaled, exactly as loudness
+  // matching's static per-lane gain does (#66), SRC included (ADR-0009).
   const lanes = [
     { buf: decoded["a.wav"], g0: gains.a, g1: 0 }, // A
     { buf: decoded["b.wav"], g0: 0, g1: gains.b }, // B
-    { buf: decoded["a.wav"], g0: 0, g1: 0 }, // SRC, muted throughout
+    { buf: decoded["src.wav"], g0: gains.src, g1: gains.src }, // SRC, never switched
   ];
   for (const lane of lanes) {
     const src = ctx.createBufferSource();
@@ -125,20 +150,26 @@ async function renderVariant(
   const rendered = await ctx.startRendering();
 
   // Bit-identity outside the fade window, per channel: before the switch the
-  // output is A scaled by gains.a, after the ramp end it is B scaled by gains.b.
-  // Exact float compare (the scale is exact for power-of-two gains).
+  // output is A scaled by gains.a, after the ramp end it is B scaled by gains.b,
+  // in both cases summed with the source lane at its held gain. Exact float
+  // compare (the scale is exact for power-of-two gains, and the mix is one
+  // correctly-rounded float32 add — a sample-shifted SRC lane would show up here
+  // as a wall of mismatches).
   const identity: ChannelIdentity[] = [];
   for (let ch = 0; ch < 2; ch++) {
     const out = rendered.getChannelData(ch);
     const a = decoded["a.wav"].getChannelData(ch);
     const b = decoded["b.wav"].getChannelData(ch);
+    const s = decoded["src.wav"].getChannelData(ch);
+    const mixed = (live: number, gain: number, i: number) =>
+      Math.fround(live * gain + s[i] * gains.src);
     let preMismatch = 0;
     let postMismatch = 0;
     let firstPre = -1;
     let firstPost = -1;
     let maxDiff = 0;
     for (let i = 0; i < SWITCH_SAMPLE; i++) {
-      const expected = a[i] * gains.a;
+      const expected = mixed(a[i], gains.a, i);
       if (out[i] !== expected) {
         preMismatch++;
         if (firstPre < 0) firstPre = i;
@@ -146,7 +177,7 @@ async function renderVariant(
       }
     }
     for (let i = SWITCH_SAMPLE + FADE_SAMPLES; i < FRAMES; i++) {
-      const expected = b[i] * gains.b;
+      const expected = mixed(b[i], gains.b, i);
       if (out[i] !== expected) {
         postMismatch++;
         if (firstPost < 0) firstPost = i;
@@ -159,35 +190,38 @@ async function renderVariant(
   // Cross-correlation of the post-switch region against expected candidate B,
   // lags -256..256; the contract wants the peak at exactly lag 0. A constant
   // lane gain scales every product equally, so it can move the peak's height but
-  // never its lag — which is the whole point the variant certifies.
+  // never its lag — which is the whole point the variant certifies. When the
+  // source lane is audible the same region is correlated against it too: SRC
+  // rides the one transport, so it must peak at lag 0 in the same render (#66,
+  // ADR-0009).
   const out = rendered.getChannelData(0);
-  const b = decoded["b.wav"].getChannelData(0);
   const start = SWITCH_SAMPLE + FADE_SAMPLES + 256;
   const len = FRAMES - start - 256;
-  let bestLag: number | null = null;
-  let bestVal = -Infinity;
-  let zeroVal: number | null = null;
-  let secondVal = -Infinity;
-  for (let lag = -256; lag <= 256; lag++) {
-    let sum = 0;
-    for (let i = 0; i < len; i++) sum += out[start + i] * b[start + i + lag];
-    if (lag === 0) zeroVal = sum;
-    if (sum > bestVal) {
-      secondVal = bestVal;
-      bestVal = sum;
-      bestLag = lag;
-    } else if (sum > secondVal) {
-      secondVal = sum;
+  const correlate = (reference: Float32Array): Correlation => {
+    let bestLag: number | null = null;
+    let bestVal = -Infinity;
+    let zeroVal: number | null = null;
+    let secondVal = -Infinity;
+    for (let lag = -256; lag <= 256; lag++) {
+      let sum = 0;
+      for (let i = 0; i < len; i++) sum += out[start + i] * reference[start + i + lag];
+      if (lag === 0) zeroVal = sum;
+      if (sum > bestVal) {
+        secondVal = bestVal;
+        bestVal = sum;
+        bestLag = lag;
+      } else if (sum > secondVal) {
+        secondVal = sum;
+      }
     }
-  }
-  const correlation: Correlation = {
-    bestLag,
-    peakRatio: bestVal / Math.max(secondVal, 1e-12),
-    zeroVal,
-    bestVal,
+    return { bestLag, peakRatio: bestVal / Math.max(secondVal, 1e-12), zeroVal, bestVal };
   };
 
-  return { identity, correlation };
+  const correlation = correlate(decoded["b.wav"].getChannelData(0));
+  const sourceCorrelation =
+    gains.src === 0 ? undefined : correlate(decoded["src.wav"].getChannelData(0));
+
+  return { identity, correlation, sourceCorrelation };
 }
 
 /**
@@ -230,7 +264,7 @@ export async function renderSync({
       decodeInfo[name] = { error: String(e) };
     }
   }
-  if (!decoded["a.wav"] || !decoded["b.wav"]) {
+  if (!decoded["a.wav"] || !decoded["b.wav"] || !decoded["src.wav"]) {
     return { decodeInfo, renderSkipped: true };
   }
 
@@ -238,15 +272,19 @@ export async function renderSync({
   // Faithful render (the existing contract), then the static-gain variant with
   // distinct attenuations (A −6 dB, B −12 dB): both exact powers of two so the
   // scaled crossfade bound stays bit-identical, and both ≤ 0 dB like loudness
-  // matching, which only ever attenuates (#66).
-  // The two renders are independent offline contexts, so they run together
-  // rather than one after the other.
-  const [faithful, attenuated] = await Promise.all([
-    renderVariant(geo, decoded, { a: 1, b: 1 }),
-    renderVariant(geo, decoded, { a: 0.5, b: 0.25 }),
+  // matching, which only ever attenuates (#66). Then the three-lane variant
+  // (spec #42): the same render with SRC audible at its own gain (−18 dB), the
+  // shape a project session plays — the source is in the match group and on the
+  // one transport, so both contract points must survive its presence.
+  // The renders are independent offline contexts, so they run together rather
+  // than one after the other.
+  const [faithful, attenuated, threeLane] = await Promise.all([
+    renderVariant(geo, decoded, { a: 1, b: 1, src: 0 }),
+    renderVariant(geo, decoded, { a: 0.5, b: 0.25, src: 0 }),
+    renderVariant(geo, decoded, { a: 0.5, b: 0.25, src: 0.125 }),
   ]);
 
-  return { decodeInfo, ...faithful, attenuated };
+  return { decodeInfo, ...faithful, attenuated, threeLane };
 }
 
 declare global {

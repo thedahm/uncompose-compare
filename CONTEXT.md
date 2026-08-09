@@ -13,6 +13,14 @@ the written record — so that concealment (blind mode, later) can shuffle label
 schema change.
 _Avoid_: file, track, version, input
 
+**Source (SRC lane)**:
+The shared origin both candidates derive from, offered as a third playback lane labeled
+`SRC` (project mode auto-resolves it; bare-file mode takes an explicit `--source`). It is
+a *lane*, not a candidate: it plays sample-locked with A/B and joins the loudness match
+group, but it never wins a preference, never enters the record's `candidates[]`, and stays
+identified in blind mode (concealment is A/B only). Absent when the pair shares no source.
+_Avoid_: reference, original, candidate C, third file
+
 **Region**:
 A single span of the timeline the listener drags out on a waveform to concentrate on and
 loop over. The UI term is "region"; the comparison record stores it as the `loops[]`
@@ -32,5 +40,16 @@ The immutable file written once when the session concludes, conforming to the v0
 Schema this repo owns. It carries the candidates (label, path, sha256, size), the
 `loops[]` region, the append-only observations, and the result (preference label or null,
 with confidence and optional criterion/summary). Written exactly once, never mutated: an
-evaluation cannot be quietly revised after the fact.
+evaluation cannot be quietly revised after the fact. It lands as `<ULID>.json` in the
+invoking directory standalone (or `--out`), and under the project's `evaluations/` in
+project mode.
 _Avoid_: report, result file, output, log, manifest
+
+**Handover (evaluation handover)**:
+Concluding a project-mode session is one act — save *and* close. After the record is
+written to `evaluations/`, the server auto-imports it (`uncompose-project import`) and the
+process exits: 0 when saved and registered, nonzero when the import failed. The record is
+never the casualty of a failed handover — it is kept, the import's stderr is relayed, and
+the exact recovery command is offered. The lifecycle change (conclude ends the session in
+both modes) applies standalone too: an abandoned session still writes nothing.
+_Avoid_: sync, upload, export, registration (for the whole act)

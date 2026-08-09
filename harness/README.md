@@ -31,12 +31,21 @@ On Chromium, Firefox, and WebKit:
    frames, 44100 Hz, 2 channels.
 3. **Crossfade bound** — output is float-bit-identical to the live candidate
    outside the 10 ms fade window.
+4. **The SRC lane** (spec #42) — the same render with the source lane audible at
+   its own static loudness-match gain (A −6 dB, B −12 dB, SRC −18 dB): the live
+   candidate still peaks at lag 0, the source itself peaks at lag 0, and the
+   output outside the fade window is bit-identical to the summed mix. The source
+   is a third lane on the one transport, so it has to cost the contract nothing.
 
 `workbench.spec.mjs` (issue #12) drives the same served page for the DoD flow —
 both candidates load and render waveforms, `x`/lane-click switches the audible
 candidate at the current position, clicking a waveform seeks, `?` toggles the
 help modal. It runs on **Chromium only** (the flow is engine-independent; the
-sync contract above is where engines differ, so it keeps the full matrix).
+sync contract above is where engines differ, so it keeps the full matrix), as do
+the other flow specs: `blind.spec.mjs` and `blind-loudness.spec.mjs` (#29, #32),
+`source-lane.spec.mjs` (the SRC lane as a listener sees it — named and
+auditionable, not an `x` target, and still identified in a blind session while
+A/B stay concealed), and `project.spec.mjs` (the evaluations handover).
 
 ## Run it locally
 
