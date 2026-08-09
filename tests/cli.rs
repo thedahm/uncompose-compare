@@ -174,9 +174,10 @@ fn serving_with_cache(mut command: Command, dir: TempDir, cache_home: Option<&Pa
         }
     };
 
+    // stderr is left at its default (inherited from the test process) unless the
+    // caller piped it — the import-failure test captures the relayed stderr.
     let mut child = command
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
         .spawn()
         .expect("failed to launch binary");
 
@@ -1482,23 +1483,25 @@ fn conclude_enforces_confidence_iff_preference() {
 }
 
 #[test]
-fn second_conclude_is_refused() {
-    let cwd = TempDir::new("record-twice");
-    let server = launch_recording(&cwd.path, None);
+fn conclude_ends_the_session_and_exits_zero_in_standalone_mode() {
+    // Save-and-close is one act (spec #42 slice 5, #67 res. 8): the successful
+    // write concludes the session, the server shuts down, and the process exits 0.
+    // This supersedes M3's serve-forever-after-conclude — a second conclude is
+    // impossible because the process is gone.
+    let cwd = TempDir::new("record-lifecycle");
+    let mut server = launch_recording(&cwd.path, None);
     let body =
         r#"{"result": {"preference": "A", "confidence": 5}, "observations": [], "loops": []}"#;
 
-    let (first, _, _) = http_post(&server, &format!("/record?token={}", server.token), body);
-    assert_eq!(first, 200, "the first conclude writes the record");
+    let (status, _, _) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(status, 200, "the conclude writes the record");
 
-    let (second, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
-    assert_eq!(second, 409, "a second conclude is refused");
-    assert!(
-        String::from_utf8_lossy(&resp).contains("already"),
-        "the refusal explains itself: {}",
-        String::from_utf8_lossy(&resp)
-    );
-    // Still exactly one record: the write happened exactly once.
+    // The process exits, and it exits 0: a standalone save is a clean close. The
+    // wait() returning at all is the proof the server did not serve forever.
+    let code = server.child.wait().expect("child exits").code();
+    assert_eq!(code, Some(0), "a saved standalone session exits 0");
+
+    // Exactly one record, written once.
     let _ = sole_record(&cwd.path);
 }
 
@@ -2437,6 +2440,35 @@ fn stub_project_tool() -> (TempDir, String) {
     (dir, path)
 }
 
+/// A stub `uncompose-project` that records the argv it received (one arg per
+/// line) to `argv_log`, optionally prints `stderr_msg` to stderr, and exits
+/// `code` — the fake-tool seam the slice-5 auto-import handover runs against.
+/// Returns the dir holding it (kept alive by the caller) and a `PATH` that finds
+/// it. `argv_log` is baked into the script, so the handover needs no environment
+/// beyond PATH.
+fn logging_project_tool(argv_log: &Path, code: i32, stderr_msg: &str) -> (TempDir, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("project-tool");
+    let tool = dir.join("uncompose-project");
+    let log = argv_log.to_string_lossy();
+    let stderr_line = if stderr_msg.is_empty() {
+        String::new()
+    } else {
+        format!("echo {stderr_msg:?} >&2\n")
+    };
+    let script = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {log:?}\n{stderr_line}exit {code}\n");
+    std::fs::write(&tool, script).expect("write stub");
+    let mut perms = std::fs::metadata(&tool).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&tool, perms).unwrap();
+    let path = format!(
+        "{}:{}",
+        dir.path.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (dir, path)
+}
+
 /// A project with two candidate mixes derived from one shared raw source. The two
 /// outputs share the basename-stem `vocals` (in distinct directories), so
 /// `vocals@deriv-a` / `vocals@deriv-b` disambiguate by derivation; both
@@ -2553,7 +2585,8 @@ fn project_opens_a_three_lane_session_and_records_asset_ids() {
     assert!(source["audio"].as_str().unwrap().starts_with("/audio/"));
 
     // Conclude and read the record: each candidate carries its manifest asset id
-    // and the project ULID.
+    // and the project ULID. The project record lands under `<root>/evaluations/`,
+    // not the invoking directory (spec #42 slice 5).
     let body =
         r#"{"result": {"preference": "A", "confidence": 4}, "observations": [], "loops": []}"#;
     let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
@@ -2564,7 +2597,11 @@ fn project_opens_a_three_lane_session_and_records_asset_ids() {
         String::from_utf8_lossy(&resp)
     );
 
-    let record = validate_record_file(&sole_record(&cwd.path));
+    assert!(
+        std::fs::read_dir(&cwd.path).unwrap().next().is_none(),
+        "the project record does not land in the invoking directory"
+    );
+    let record = validate_record_file(&sole_record(&project.dir.path.join("evaluations")));
     let rc = record["candidates"].as_array().unwrap();
     let by_label = |label: &str| rc.iter().find(|c| c["label"] == label).unwrap();
     assert_eq!(
@@ -2875,5 +2912,164 @@ fn blind_project_conceals_ab_but_keeps_src_identified() {
     assert!(
         source["sha256"].is_string() && source["path"].is_string(),
         "the SRC lane keeps its identity in blind mode: {json}"
+    );
+}
+
+// --- Issue #41 / spec #42 slice 5: evaluations handover & conclude lifecycle --
+
+/// Read a logged argv (one arg per line) written by `logging_project_tool`.
+fn logged_argv(argv_log: &Path) -> Vec<String> {
+    std::fs::read_to_string(argv_log)
+        .expect("the handover ran and logged its argv")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn project_conclude_lands_in_evaluations_and_registers_with_the_pinned_argv() {
+    // The DoD: a project-mode conclude writes the record to
+    // `<root>/evaluations/<ulid>.json`, then invokes the pinned argv
+    // `uncompose-project import --project <abs-root> <abs-record>` (absolute
+    // paths), and the registration outcome rides the conclude response. Success
+    // exits 0.
+    let project = build_project();
+    let argv_log = TempDir::new("import-argv");
+    let log = argv_log.join("argv");
+    let (_tool, path_env) = logging_project_tool(&log, 0, "");
+    let cwd = TempDir::new("project-handover-cwd");
+    let mut server = launch_project(
+        &project.dir.path,
+        &cwd.path,
+        &["vocals@deriv-a", "vocals@deriv-b"],
+        &[],
+        &path_env,
+    );
+
+    let body =
+        r#"{"result": {"preference": "A", "confidence": 4}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(
+        status,
+        200,
+        "a project session concludes: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    // The record landed under `<root>/evaluations/`, not the invoking directory.
+    let evaluations = project.dir.path.join("evaluations");
+    let record_path = sole_record(&evaluations);
+    let record = validate_record_file(&record_path);
+    assert!(
+        record["id"].as_str().unwrap().len() == 26,
+        "the record is named by its ULID: {record}"
+    );
+
+    // The stub received exactly the pinned argv, both paths absolute.
+    let argv = logged_argv(&log);
+    assert_eq!(
+        argv,
+        vec![
+            "import".to_string(),
+            "--project".to_string(),
+            project.dir.path.to_string_lossy().into_owned(),
+            record_path.to_string_lossy().into_owned(),
+        ],
+        "the handover runs `import --project <root> <record>`: {argv:?}"
+    );
+    assert!(
+        Path::new(&argv[2]).is_absolute() && Path::new(&argv[3]).is_absolute(),
+        "both handover paths are absolute: {argv:?}"
+    );
+
+    // The registration outcome rides the conclude response.
+    let response: serde_json::Value =
+        serde_json::from_slice(&resp).expect("conclude response is json");
+    assert_eq!(
+        response["registration"]["registered"], true,
+        "a clean import registers: {response}"
+    );
+
+    // Save-and-registered is a clean close: the process exits 0.
+    let code = server.child.wait().expect("child exits").code();
+    assert_eq!(code, Some(0), "a saved and registered session exits 0");
+}
+
+#[test]
+fn project_import_failure_keeps_the_record_relays_stderr_and_exits_nonzero() {
+    // Failure semantics (#67 res. 7): the record is never the casualty. On import
+    // failure the record is kept, the tool's stderr is relayed, the process exits
+    // nonzero, and the exact recovery command is printed last. The registration
+    // outcome (with the recovery command) also rides the conclude response.
+    let project = build_project();
+    let argv_log = TempDir::new("import-argv-fail");
+    let log = argv_log.join("argv");
+    let (_tool, path_env) = logging_project_tool(&log, 3, "import blew up: manifest locked");
+    let cwd = TempDir::new("project-handover-fail-cwd");
+
+    // Capture the process's stderr so the relay + recovery line are observable.
+    let mut command = Command::new(BIN);
+    command
+        .arg("--project")
+        .arg(&project.dir.path)
+        .args(["vocals@deriv-a", "vocals@deriv-b"])
+        .env("PATH", &path_env)
+        .current_dir(&cwd.path)
+        .stderr(Stdio::piped());
+    let mut server = serving_from(command, TempDir::new("project-handover-fail-hold"));
+    let child_stderr = server.child.stderr.take().expect("piped stderr");
+
+    let body =
+        r#"{"result": {"preference": "B", "confidence": 2}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    // The conclude still succeeds — the record was written; only registration failed.
+    assert_eq!(
+        status,
+        200,
+        "the record is written even when import fails: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    // The record is kept under `<root>/evaluations/`.
+    let record_path = sole_record(&project.dir.path.join("evaluations"));
+    let _ = validate_record_file(&record_path);
+
+    // The registration outcome on the response says it failed, relays the stderr,
+    // and offers the exact recovery command.
+    let response: serde_json::Value =
+        serde_json::from_slice(&resp).expect("conclude response is json");
+    let registration = &response["registration"];
+    assert_eq!(
+        registration["registered"], false,
+        "a failed import is reported unregistered: {response}"
+    );
+    assert!(
+        registration["error"]
+            .as_str()
+            .unwrap()
+            .contains("import blew up"),
+        "the import stderr is relayed on the response: {response}"
+    );
+    let recovery = format!("uncompose project import {}", record_path.display());
+    assert_eq!(
+        registration["recovery"], recovery,
+        "the response offers the exact recovery command: {response}"
+    );
+
+    // The process exits nonzero, having relayed the stderr and printed the recovery
+    // command last on its own stderr.
+    let code = server.child.wait().expect("child exits").code();
+    assert_eq!(code, Some(1), "a failed import exits nonzero");
+    let mut printed = String::new();
+    BufReader::new(child_stderr)
+        .read_to_string(&mut printed)
+        .expect("read child stderr");
+    assert!(
+        printed.contains("import blew up"),
+        "the import stderr is relayed to the process stderr: {printed:?}"
+    );
+    assert!(
+        printed.trim_end().ends_with(&recovery),
+        "the recovery command is printed last: {printed:?}"
     );
 }
