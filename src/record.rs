@@ -147,7 +147,10 @@ impl Recorder {
             "completed_at": rfc3339(SystemTime::now()),
             "candidates": candidates,
             "mode": "ab",
-            "playback": {},
+            // Playback is server-authoritative (issue #30): the loudness match,
+            // measured and applied server-side, is recorded here — never taken
+            // from the browser's posted body.
+            "playback": { "loudness_match": session.loudness_match_json() },
             "loops": posted.get("loops").cloned().unwrap_or_else(|| json!([])),
             "observations": posted.get("observations").cloned().unwrap_or_else(|| json!([])),
             "result": posted.get("result").cloned().unwrap_or(Value::Null),

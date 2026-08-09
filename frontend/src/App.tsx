@@ -36,6 +36,7 @@ import {
   computeLoudness,
   computePeaks,
   computeSpectrogram,
+  dbToGain,
   formatTime,
   otherLabel,
   type CandidateViews,
@@ -59,11 +60,29 @@ interface Candidate {
   audio: string;
 }
 
+/** One lane's loudness-match figures, as the session (and record) report them. */
+interface LoudnessCandidate {
+  measured_lufs: number;
+  gain_db: number;
+}
+
+/**
+ * The session's `loudness_match` (issue #30), mirroring the record's
+ * `playback.loudness_match` shape (uncompose#66). Off: `{ enabled: false }`. On:
+ * the method plus a per-label map of measured LUFS and the applied gain.
+ */
+interface LoudnessMatch {
+  enabled: boolean;
+  method?: string;
+  candidates?: Partial<Record<Label, LoudnessCandidate>>;
+}
+
 interface SessionMeta {
   candidates: Candidate[];
   duration_mismatch: boolean;
   duration_delta_samples: number;
   duration_delta_ms: number;
+  loudness_match: LoudnessMatch;
 }
 
 /** Waveform/loudness envelope resolution — enough detail without paint cost. */
@@ -83,6 +102,19 @@ const VIEWS: { id: ViewMode; label: string }[] = [
 
 function candidateColor(label: Label): string {
   return label === "A" ? "#4ea1ff" : "#ff8f4e";
+}
+
+/**
+ * The static linear per-lane gains for the engine (issue #30): the measured
+ * attenuation when matching is on, unity for any lane the match does not name
+ * (and for both when matching is off — faithful as-is playback, #66).
+ */
+function laneGains(match: LoudnessMatch): Record<Label, number> {
+  const gain = (label: Label) => {
+    const db = match.enabled ? match.candidates?.[label]?.gain_db : undefined;
+    return db === undefined ? 1 : dbToGain(db);
+  };
+  return { A: gain("A"), B: gain("B") };
 }
 
 /**
@@ -182,7 +214,11 @@ export function App() {
         };
         const [bufA, bufB] = await Promise.all([decode(a), decode(b)]);
 
-        const eng = new PlaybackEngine(ctx, bufA, bufB);
+        // Static per-lane gains from the server's loudness match (issue #30):
+        // faithful unity when off, the measured attenuation when on. Constant
+        // for the session — the sync contract is untouched (#66).
+        const laneGain = laneGains(s.loudness_match);
+        const eng = new PlaybackEngine(ctx, bufA, bufB, laneGain);
         eng.onEnded = () => syncFrom(eng);
         engineRef.current = eng;
         setCandidates({ A: a, B: b });
@@ -436,6 +472,24 @@ export function App() {
         <p role="alert" data-testid="duration-mismatch" style={{ color: "#ffcf6b" }}>
           Duration mismatch: the candidates differ by {session.duration_delta_samples}{" "}
           samples ({session.duration_delta_ms.toFixed(1)} ms). Both still load.
+        </p>
+      )}
+
+      {/* Loudness matching (issue #30): state clearly whenever playback is not
+          at mastered levels. Sighted mode shows the per-lane figures. */}
+      {session?.loudness_match.enabled && (
+        <p data-testid="loudness-match" style={{ color: "#8fd6ff" }}>
+          Loudness matching active — not mastered levels (BS.1770 integrated).{" "}
+          {(["A", "B"] as Label[]).map((label) => {
+            const c = session.loudness_match.candidates?.[label];
+            if (!c) return null;
+            return (
+              <span key={label} data-testid={`loudness-${label}`} style={{ marginRight: 10 }}>
+                <strong>{label}</strong>: {c.measured_lufs.toFixed(1)} LUFS,{" "}
+                {c.gain_db === 0 ? "0.0" : c.gain_db.toFixed(1)} dB
+              </span>
+            );
+          })}
         </p>
       )}
 

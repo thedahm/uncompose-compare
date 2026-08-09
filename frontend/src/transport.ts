@@ -69,6 +69,15 @@ export function loopedPosition(
   return region.start + ((linear - region.start) % len);
 }
 
+/**
+ * A decibel gain as a linear amplitude factor: `10^(db/20)` (issue #30). 0 dB is
+ * unity; the negative gains loudness matching applies attenuate below 1. Used to
+ * turn the session's per-lane `gain_db` into the engine's static lane gains.
+ */
+export function dbToGain(db: number): number {
+  return Math.pow(10, db / 20);
+}
+
 /** Clamp a playback position (seconds) into `[0, duration]`. */
 export function clampPosition(pos: number, duration: number): number {
   if (pos < 0) return 0;

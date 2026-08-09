@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   clampFraction,
   clampPosition,
+  dbToGain,
   loopBounds,
   computeLoudness,
   computePeaks,
@@ -30,6 +31,19 @@ describe("clampPosition", () => {
   });
   it("clamps past the end to the duration", () => {
     expect(clampPosition(9, 3)).toBe(3);
+  });
+});
+
+describe("dbToGain", () => {
+  it("maps 0 dB to unity gain", () => {
+    expect(dbToGain(0)).toBe(1);
+  });
+  it("maps -6 dB to roughly half amplitude", () => {
+    expect(dbToGain(-6.0206)).toBeCloseTo(0.5, 4);
+  });
+  it("attenuates below unity for any negative gain", () => {
+    expect(dbToGain(-2.4)).toBeLessThan(1);
+    expect(dbToGain(-2.4)).toBeGreaterThan(0);
   });
 });
 

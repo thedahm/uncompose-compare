@@ -46,6 +46,13 @@ struct Cli {
     /// refused, never overwritten.
     #[arg(long, value_name = "PATH")]
     out: Option<PathBuf>,
+
+    /// Match playback loudness: measure ITU-R BS.1770 integrated loudness per
+    /// candidate at load and attenuate the louder lane down to the quietest
+    /// (gain-only, never boost). Off by default — faithful as-is playback is the
+    /// baseline (#66).
+    #[arg(long)]
+    loudness_match: bool,
 }
 
 #[derive(Subcommand)]
@@ -107,7 +114,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Load both candidates before binding: a bad invocation must fail with a
     // clear message and a non-zero exit, never a running server. Loading also
     // transcodes each input into a cached playback proxy (#74).
-    let session = Session::load(a, b, &cache)?;
+    let session = Session::load(a, b, &cache, cli.loudness_match)?;
 
     // Prune the cache once, at startup, never mid-session (#72). The proxies
     // this run just wrote/reused carry the freshest access time, so an LRU prune
