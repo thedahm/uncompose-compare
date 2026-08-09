@@ -259,7 +259,11 @@ export class PlaybackEngine {
       this.gains[outgoing].gain.setValueAtTime(this.gains[outgoing].gain.value, now);
       // Scale the equal-power curves to each lane's static gain: the incoming
       // lane rises to its own loudness-match level, the outgoing falls to 0.
-      this.gains[label].gain.setValueCurveAtTime(scaled(up, this.laneGain[label]), now, FADE_SECONDS);
+      this.gains[label].gain.setValueCurveAtTime(
+        scaled(up, this.laneGain[label]),
+        now,
+        FADE_SECONDS,
+      );
       this.gains[outgoing].gain.setValueCurveAtTime(
         scaled(down, this.laneGain[outgoing]),
         now,

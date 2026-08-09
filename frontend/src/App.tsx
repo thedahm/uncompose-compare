@@ -486,7 +486,7 @@ export function App() {
             return (
               <span key={label} data-testid={`loudness-${label}`} style={{ marginRight: 10 }}>
                 <strong>{label}</strong>: {c.measured_lufs.toFixed(1)} LUFS,{" "}
-                {c.gain_db === 0 ? "0.0" : c.gain_db.toFixed(1)} dB
+                {c.gain_db.toFixed(1)} dB
               </span>
             );
           })}
