@@ -25,7 +25,7 @@
  * warning (issue #10) survive; the `window.__uncomposeSync` harness seam lives in
  * `sync.ts`, registered from `main.tsx`, and is untouched by this page.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { PlaybackEngine } from "./engine";
 import { Waveform, type Pin } from "./Waveform";
 import { HelpModal } from "./HelpModal";
@@ -494,6 +494,19 @@ export function App() {
     o.position === null ? [] : [{ id: o.id, position: o.position, candidate: o.candidate }],
   );
 
+  // The saved verdict's colour-coded confidence stars beside the preferred
+  // label (issue #16) — on its lane row when sighted, inside its anonymous
+  // switch button when blind. Null until a confident preference is engraved.
+  const preferredStars = (label: Label, style?: CSSProperties) =>
+    saved?.verdict.preference === label && saved.verdict.confidence !== null ? (
+      <Stars
+        confidence={saved.verdict.confidence}
+        testid={`verdict-stars-${label}`}
+        title={`Preferred — confidence ${saved.verdict.confidence}/5`}
+        style={style}
+      />
+    ) : null;
+
   return (
     <main style={{ fontFamily: "system-ui, sans-serif", color: "#eee", background: "#0a0a0a", minHeight: "100vh", padding: 16 }}>
       <h1 data-testid="hello" style={{ fontSize: 18 }}>
@@ -661,14 +674,7 @@ export function App() {
                         marker — no name, path, hash, or size (concealment). */}
                     <span data-testid={`live-marker-${label}`}>{isLive ? "● " : "  "}</span>
                     {label}
-                    {saved?.verdict.preference === label && saved.verdict.confidence !== null && (
-                      <Stars
-                        confidence={saved.verdict.confidence}
-                        testid={`verdict-stars-${label}`}
-                        title={`Preferred — confidence ${saved.verdict.confidence}/5`}
-                        style={{ marginLeft: 6 }}
-                      />
-                    )}
+                    {preferredStars(label, { marginLeft: 6 })}
                   </button>
                 );
               })}
@@ -699,15 +705,7 @@ export function App() {
                       <span data-testid={`live-marker-${label}`}>{isLive ? "● " : "  "}</span>
                       <strong>{label}</strong> {c.name}
                     </span>
-                    {/* The saved verdict shows its colour-coded confidence stars on
-                        the preferred lane row (issue #16). */}
-                    {saved?.verdict.preference === label && saved.verdict.confidence !== null && (
-                      <Stars
-                        confidence={saved.verdict.confidence}
-                        testid={`verdict-stars-${label}`}
-                        title={`Preferred — confidence ${saved.verdict.confidence}/5`}
-                      />
-                    )}
+                    {preferredStars(label)}
                     <div style={{ flex: 1 }}>
                       <Waveform
                         views={views[label]}
