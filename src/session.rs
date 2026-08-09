@@ -119,6 +119,22 @@ impl Session {
         a.frames != b.frames || (a.duration_ms() - b.duration_ms()).abs() > 0.5
     }
 
+    /// True when the two candidates differ in sample rate. Like the duration
+    /// mismatch, this warns the sighted listener without blocking playback — the
+    /// files still play back faithfully at their own rates (#26 story 11). The
+    /// two rates themselves are already in the candidate metadata.
+    pub fn sample_rate_mismatch(&self) -> bool {
+        let [a, b] = &self.candidates;
+        a.sample_rate != b.sample_rate
+    }
+
+    /// True when the two candidates differ in channel count — same warning
+    /// contract as the sample-rate mismatch (#26 story 11).
+    pub fn channel_count_mismatch(&self) -> bool {
+        let [a, b] = &self.candidates;
+        a.channels != b.channels
+    }
+
     /// The session metadata as JSON for the `/session` endpoint. The
     /// `loudness_match` object mirrors the record's `playback.loudness_match`
     /// shape (uncompose#66) so the workbench reads the per-lane gains it applies
@@ -131,6 +147,8 @@ impl Session {
             "duration_delta_samples": (a.frames as i64 - b.frames as i64).abs(),
             "duration_delta_ms": finite((a.duration_ms() - b.duration_ms()).abs()),
             "loudness_match": self.loudness_match_json(),
+            "sample_rate_mismatch": self.sample_rate_mismatch(),
+            "channel_count_mismatch": self.channel_count_mismatch(),
         })
     }
 

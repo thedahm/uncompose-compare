@@ -615,6 +615,72 @@ fn session_no_mismatch_when_durations_match() {
 }
 
 #[test]
+fn session_flags_sample_rate_mismatch() {
+    let dir = TempDir::new("rate-mismatch");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    // Same duration (1000 ms) and channel count, differing sample rate only.
+    write_wav(&a, 44_100, 44_100, 2, 3);
+    write_wav(&b, 48_000, 48_000, 2, 4);
+    let server = launch_with(dir, &a, &b);
+
+    let json = session_json(&server);
+    assert!(
+        json.contains("\"sample_rate_mismatch\":true"),
+        "differing sample rates must flag a mismatch: {json}"
+    );
+    // Both values are observable in the payload for the warning to name.
+    assert!(
+        json.contains("\"sample_rate\":44100") && json.contains("\"sample_rate\":48000"),
+        "both sample rates are reported: {json}"
+    );
+    // A sample-rate difference is not a channel difference.
+    assert!(
+        json.contains("\"channel_count_mismatch\":false"),
+        "matched channel counts must not flag a channel mismatch: {json}"
+    );
+}
+
+#[test]
+fn session_flags_channel_count_mismatch() {
+    let dir = TempDir::new("channel-mismatch");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    // Same duration and sample rate, differing channel count only.
+    write_wav(&a, 44_100, 44_100, 1, 3);
+    write_wav(&b, 44_100, 44_100, 2, 4);
+    let server = launch_with(dir, &a, &b);
+
+    let json = session_json(&server);
+    assert!(
+        json.contains("\"channel_count_mismatch\":true"),
+        "differing channel counts must flag a mismatch: {json}"
+    );
+    assert!(
+        json.contains("\"channels\":1") && json.contains("\"channels\":2"),
+        "both channel counts are reported: {json}"
+    );
+    assert!(
+        json.contains("\"sample_rate_mismatch\":false"),
+        "matched sample rates must not flag a rate mismatch: {json}"
+    );
+}
+
+#[test]
+fn session_no_compatibility_mismatch_when_formats_match() {
+    let server = launch(); // two matched fixtures (same rate, channels, duration)
+    let json = session_json(&server);
+    assert!(
+        json.contains("\"sample_rate_mismatch\":false"),
+        "matched sample rates must not flag a mismatch: {json}"
+    );
+    assert!(
+        json.contains("\"channel_count_mismatch\":false"),
+        "matched channel counts must not flag a mismatch: {json}"
+    );
+}
+
+#[test]
 fn session_endpoint_refuses_missing_token() {
     let server = launch();
     let (status, headers, _) = http_get(&server.addr, "/session");
