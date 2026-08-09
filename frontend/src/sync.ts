@@ -74,13 +74,8 @@ export interface SyncResult {
   renderSkipped?: boolean;
 }
 
-/** Render geometry shared by every variant. */
-interface Geometry {
-  SR: number;
-  FRAMES: number;
-  SWITCH_SAMPLE: number;
-  FADE_SAMPLES: number;
-}
+/** Render geometry shared by every variant: SyncParams minus the fixtures. */
+type Geometry = Omit<SyncParams, "fixtures">;
 
 /** Distinct constant per-lane gains for the audible lanes A and B. */
 interface LaneGains {
@@ -244,13 +239,10 @@ export async function renderSync({
   // distinct attenuations (A −6 dB, B −12 dB): both exact powers of two so the
   // scaled crossfade bound stays bit-identical, and both ≤ 0 dB like loudness
   // matching, which only ever attenuates (#66).
-  const { identity, correlation } = await renderVariant(geo, decoded, {
-    a: 1,
-    b: 1,
-  });
+  const faithful = await renderVariant(geo, decoded, { a: 1, b: 1 });
   const attenuated = await renderVariant(geo, decoded, { a: 0.5, b: 0.25 });
 
-  return { decodeInfo, identity, correlation, attenuated };
+  return { decodeInfo, ...faithful, attenuated };
 }
 
 declare global {
