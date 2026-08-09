@@ -175,6 +175,30 @@ pub fn decode_pcm(path: &Path) -> Result<DecodedPcm, String> {
     })
 }
 
+/// The ITU-R BS.1770 integrated loudness of the decoded PCM, in LUFS (issue
+/// #30). The samples are `bits`-bit integers packed in `i32`; normalizing them
+/// to full-scale floats (`s / 2^(bits-1)`) makes the measurement absolute — the
+/// same signal at the same level reads the same LUFS regardless of source depth,
+/// so the two candidates' figures are directly comparable.
+///
+/// A signal too quiet or too short for the integrated gate reads as
+/// `f64::NEG_INFINITY` (ebur128's convention); the caller decides what a
+/// non-finite reading means for the match.
+pub fn integrated_lufs(pcm: &DecodedPcm) -> Result<f64, String> {
+    let mut meter = ebur128::EbuR128::new(pcm.channels as u32, pcm.sample_rate, ebur128::Mode::I)
+        .map_err(|e| format!("loudness meter: {e:?}"))?;
+    // Full-scale is 2^(bits-1); a `bits`-bit sample divided by it lands in
+    // [-1, 1], the range ebur128's float path expects.
+    let scale = (1i64 << (pcm.bits.saturating_sub(1))) as f32;
+    let normalized: Vec<f32> = pcm.samples.iter().map(|&s| s as f32 / scale).collect();
+    meter
+        .add_frames_f32(&normalized)
+        .map_err(|e| format!("loudness measure: {e:?}"))?;
+    meter
+        .loudness_global()
+        .map_err(|e| format!("loudness global: {e:?}"))
+}
+
 /// Encode interleaved integer PCM in `container` at the source sample rate and
 /// target bit depth (#74).
 pub fn encode(pcm: &DecodedPcm, container: Container) -> Result<Vec<u8>, String> {

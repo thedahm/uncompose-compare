@@ -44,10 +44,27 @@ const FADE_SECONDS = 0.01;
  */
 const FADE_CURVES = equalPowerCurves(64);
 
+/** A copy of an equal-power curve scaled by a lane's static gain factor. */
+function scaled(curve: Float32Array, factor: number): Float32Array {
+  if (factor === 1) return curve;
+  const out = new Float32Array(curve.length);
+  for (let i = 0; i < curve.length; i++) out[i] = curve[i] * factor;
+  return out;
+}
+
 export class PlaybackEngine {
   private ctx: AudioContext;
   private buffers: Record<Label, AudioBuffer>;
   private gains: Record<Label, GainNode>;
+  /**
+   * The static per-lane playback gain (linear), applied to the audible lane's
+   * steady-state level (issue #30). {A:1, B:1} is faithful as-is playback; with
+   * `--loudness-match` on, the louder lane carries a factor < 1. It is constant
+   * for the session and never resampled or ramped except through the switch
+   * crossfade, so the graph topology — and the sync contract (#66) — is
+   * untouched.
+   */
+  private laneGain: Record<Label, number>;
   private sources: Record<Label, AudioBufferSourceNode> | null = null;
 
   private liveLabel: Label = "A";
@@ -69,15 +86,22 @@ export class PlaybackEngine {
   /** Notified when playback ends on its own (reaches the end of the track). */
   onEnded: (() => void) | null = null;
 
-  constructor(ctx: AudioContext, a: AudioBuffer, b: AudioBuffer) {
+  constructor(
+    ctx: AudioContext,
+    a: AudioBuffer,
+    b: AudioBuffer,
+    laneGain: Record<Label, number> = { A: 1, B: 1 },
+  ) {
     this.ctx = ctx;
     this.buffers = { A: a, B: b };
+    this.laneGain = laneGain;
     this.gains = {
       A: ctx.createGain(),
       B: ctx.createGain(),
     };
-    // Live lane audible, the other silent, until the first switch.
-    this.gains.A.gain.value = 1;
+    // Live lane audible (at its static loudness-match gain), the other silent,
+    // until the first switch.
+    this.gains.A.gain.value = laneGain.A;
     this.gains.B.gain.value = 0;
     this.gains.A.connect(ctx.destination);
     this.gains.B.connect(ctx.destination);
@@ -233,10 +257,20 @@ export class PlaybackEngine {
       // Anchor the ramp at the present value so the curve starts from "now".
       this.gains[label].gain.setValueAtTime(this.gains[label].gain.value, now);
       this.gains[outgoing].gain.setValueAtTime(this.gains[outgoing].gain.value, now);
-      this.gains[label].gain.setValueCurveAtTime(up, now, FADE_SECONDS);
-      this.gains[outgoing].gain.setValueCurveAtTime(down, now, FADE_SECONDS);
+      // Scale the equal-power curves to each lane's static gain: the incoming
+      // lane rises to its own loudness-match level, the outgoing falls to 0.
+      this.gains[label].gain.setValueCurveAtTime(
+        scaled(up, this.laneGain[label]),
+        now,
+        FADE_SECONDS,
+      );
+      this.gains[outgoing].gain.setValueCurveAtTime(
+        scaled(down, this.laneGain[outgoing]),
+        now,
+        FADE_SECONDS,
+      );
     } else {
-      this.gains[label].gain.value = 1;
+      this.gains[label].gain.value = this.laneGain[label];
       this.gains[outgoing].gain.value = 0;
     }
   }
@@ -271,7 +305,10 @@ export class PlaybackEngine {
       // lane fully up, the other fully down) so a seek never leaves a fade half
       // applied.
       this.gains[label].gain.cancelScheduledValues(now);
-      this.gains[label].gain.setValueAtTime(label === this.liveLabel ? 1 : 0, now);
+      this.gains[label].gain.setValueAtTime(
+        label === this.liveLabel ? this.laneGain[label] : 0,
+        now,
+      );
       src.onended = () => {
         // Only the freshest generation drives transport state; a stop/seek that
         // tore these sources down has already moved on.

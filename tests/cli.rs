@@ -1318,10 +1318,14 @@ fn conclude_writes_valid_record_with_matching_hashes() {
     );
 
     let record = validate_record_file(&record_path);
-    // Server-authoritative fields: schema id, ULID, mode, empty playback.
+    // Server-authoritative fields: schema id, ULID, mode, and a playback object
+    // stating loudness matching was off (issue #30 — no `--loudness-match`).
     assert_eq!(record["schema"], RECORD_SCHEMA_ID);
     assert_eq!(record["mode"], "ab");
-    assert_eq!(record["playback"], serde_json::json!({}));
+    assert_eq!(
+        record["playback"],
+        serde_json::json!({ "loudness_match": { "enabled": false } })
+    );
     assert_eq!(
         record["id"].as_str().map(|s| s.len()),
         Some(26),
@@ -1557,6 +1561,157 @@ fn conclude_refuses_records_outside_the_v0_contract() {
     assert!(
         record.get("smuggled").is_none(),
         "the server assembles the record from known fields only: {record}"
+    );
+}
+
+// --- Issue #30: loudness matching (BS.1770 measure, static lane gains) --------
+
+/// Write a 16-bit PCM WAV of seeded noise scaled by `amp` (1.0 = full range) —
+/// a pair sharing a seed but differing in amplitude is the loudness-offset
+/// fixture the match is measured on (same noise, one lane quieter).
+fn write_wav_scaled(
+    path: &Path,
+    frames: u32,
+    sample_rate: u32,
+    channels: u16,
+    seed: u32,
+    amp: f32,
+) {
+    let bits = 16u16;
+    let block_align = channels * bits / 8;
+    let byte_rate = sample_rate * block_align as u32;
+    let data_len = frames * block_align as u32;
+
+    let mut fmt = Vec::new();
+    fmt.extend_from_slice(&1u16.to_le_bytes());
+    fmt.extend_from_slice(&channels.to_le_bytes());
+    fmt.extend_from_slice(&sample_rate.to_le_bytes());
+    fmt.extend_from_slice(&byte_rate.to_le_bytes());
+    fmt.extend_from_slice(&block_align.to_le_bytes());
+    fmt.extend_from_slice(&bits.to_le_bytes());
+    let mut buf = riff_wave(&fmt, data_len);
+
+    let mut next = noise(seed);
+    for _ in 0..frames {
+        for _ in 0..channels {
+            let s = (next() >> 16) as i16;
+            buf.extend_from_slice(&((s as f32 * amp) as i16).to_le_bytes());
+        }
+    }
+    std::fs::write(path, &buf).expect("write scaled wav fixture");
+}
+
+/// A loudness-offset fixture pair: candidate A full-scale, candidate B the same
+/// seeded noise scaled down ~6 dB, so A is unambiguously the louder lane.
+fn loudness_pair(dir: &TempDir) -> (PathBuf, PathBuf) {
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    write_wav_scaled(&a, 44_100, 44_100, 2, 1, 1.0);
+    write_wav_scaled(&b, 44_100, 44_100, 2, 1, 0.5);
+    (a, b)
+}
+
+#[test]
+fn loudness_match_session_carries_nonpositive_gains_with_quietest_at_zero() {
+    let dir = TempDir::new("loudness-session");
+    let (a, b) = loudness_pair(&dir);
+    let server = launch_opts(dir, &a, &b, None, &["--loudness-match"]);
+
+    let json = session_json(&server);
+    let session: serde_json::Value = serde_json::from_str(&json).expect("session json");
+    let lm = &session["loudness_match"];
+
+    assert_eq!(lm["enabled"], true, "matching is on: {json}");
+    assert_eq!(
+        lm["method"], "bs1770-integrated",
+        "the method is named: {json}"
+    );
+
+    let ga = lm["candidates"]["A"]["gain_db"].as_f64().expect("A gain");
+    let gb = lm["candidates"]["B"]["gain_db"].as_f64().expect("B gain");
+    // Never boost: every lane's gain is ≤ 0.
+    assert!(ga <= 0.0 && gb <= 0.0, "gains never boost: A={ga} B={gb}");
+    // The quietest lane (B, scaled down) is the reference, untouched at 0 dB;
+    // the louder lane (A) is pulled down below it.
+    assert_eq!(gb, 0.0, "the quietest lane keeps exactly 0.0: {json}");
+    assert!(ga < 0.0, "the louder lane is attenuated: A={ga}");
+
+    // Ordering, not exact figures: A measured louder than B.
+    let la = lm["candidates"]["A"]["measured_lufs"]
+        .as_f64()
+        .expect("A lufs");
+    let lb = lm["candidates"]["B"]["measured_lufs"]
+        .as_f64()
+        .expect("B lufs");
+    assert!(la > lb, "A is measured louder than B: A={la} B={lb}");
+}
+
+#[test]
+fn without_the_flag_the_session_states_matching_off() {
+    let server = launch(); // no --loudness-match
+    let json = session_json(&server);
+    let session: serde_json::Value = serde_json::from_str(&json).expect("session json");
+    assert_eq!(
+        session["loudness_match"],
+        serde_json::json!({ "enabled": false }),
+        "off by default, and the absence is stated: {json}"
+    );
+}
+
+#[test]
+fn loudness_match_record_playback_validates_against_the_pinned_schema() {
+    let cwd = TempDir::new("loudness-record-cwd");
+    let dir = TempDir::new("loudness-record-fixtures");
+    let (a, b) = loudness_pair(&dir);
+    let mut command = Command::new(BIN);
+    command
+        .arg(&a)
+        .arg(&b)
+        .arg("--loudness-match")
+        .current_dir(&cwd.path);
+    let server = serving_from(command, dir);
+
+    let body =
+        r#"{"result": {"preference": "A", "confidence": 3}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(
+        status,
+        200,
+        "a matched session concludes: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    // validate_record_file asserts conformance to the pinned v0 schema shape.
+    let record = validate_record_file(&sole_record(&cwd.path));
+    let lm = &record["playback"]["loudness_match"];
+    assert_eq!(
+        lm["enabled"], true,
+        "the record states matching was on: {record}"
+    );
+    assert_eq!(lm["method"], "bs1770-integrated");
+    assert_eq!(
+        lm["candidates"]["B"]["gain_db"].as_f64(),
+        Some(0.0),
+        "the quietest lane recorded at 0.0: {record}"
+    );
+    assert!(
+        lm["candidates"]["A"]["gain_db"].as_f64().unwrap() < 0.0,
+        "the louder lane recorded attenuated: {record}"
+    );
+}
+
+#[test]
+fn without_the_flag_the_record_states_matching_off() {
+    let cwd = TempDir::new("loudness-off-record");
+    let server = launch_recording(&cwd.path, None);
+    let body = r#"{"result": {"preference": null}, "observations": [], "loops": []}"#;
+    let (status, _, _) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(status, 200);
+    let record = validate_record_file(&sole_record(&cwd.path));
+    assert_eq!(
+        record["playback"]["loudness_match"],
+        serde_json::json!({ "enabled": false }),
+        "matching off is stated in the record: {record}"
     );
 }
 
