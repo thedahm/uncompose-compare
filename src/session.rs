@@ -267,42 +267,34 @@ impl Session {
     /// The `loudness_match` object the record's `playback` carries and the
     /// session advertises (issue #30). Matching on: `enabled: true`, the
     /// `method` string, and a per-label map of `{measured_lufs, gain_db}`.
-    /// Matching off: `{"enabled": false}` — the absence stated, not implied.
     pub fn loudness_match_json(&self) -> Value {
-        match &self.loudness {
-            Some(figures) => {
-                let mut candidates = Map::new();
-                for (c, l) in self.candidates.iter().zip(figures) {
-                    candidates.insert(
-                        c.label.to_string(),
-                        json!({
-                            "measured_lufs": finite(l.measured_lufs),
-                            "gain_db": finite(l.gain_db),
-                        }),
-                    );
-                }
-                json!({
-                    "enabled": true,
-                    "method": "bs1770-integrated",
-                    "candidates": candidates,
-                })
-            }
-            None => json!({ "enabled": false }),
-        }
+        self.loudness_match_json_with(|l| {
+            json!({
+                "measured_lufs": finite(l.measured_lufs),
+                "gain_db": finite(l.gain_db),
+            })
+        })
     }
 
     /// The `loudness_match` a *blind* session may advertise (issue #32): matching
     /// on carries only `enabled`, the `method`, and per-label `gain_db` — the gain
     /// the engine must apply to play the lanes level-fair. The measured LUFS is
     /// held back: a distinctive loudness figure fingerprints a candidate, so it
-    /// stays concealed until the conclude reveal. Matching off is the same
-    /// `{"enabled": false}` as sighted — the absence stated, not implied.
+    /// stays concealed until the conclude reveal.
     fn blind_loudness_match_json(&self) -> Value {
+        self.loudness_match_json_with(|l| json!({ "gain_db": finite(l.gain_db) }))
+    }
+
+    /// Shared scaffolding for the two `loudness_match` projections above: the
+    /// sighted/record shape and the blind one differ only in what each lane
+    /// carries, so `lane` supplies the per-label payload. Matching off is
+    /// `{"enabled": false}` in both — the absence stated, not implied.
+    fn loudness_match_json_with(&self, lane: impl Fn(&Loudness) -> Value) -> Value {
         match &self.loudness {
             Some(figures) => {
                 let mut candidates = Map::new();
                 for (c, l) in self.candidates.iter().zip(figures) {
-                    candidates.insert(c.label.to_string(), json!({ "gain_db": finite(l.gain_db) }));
+                    candidates.insert(c.label.to_string(), lane(l));
                 }
                 json!({
                     "enabled": true,

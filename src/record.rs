@@ -162,22 +162,14 @@ impl Recorder {
         // loudness matching ran (issue #32), each lane's measured LUFS and applied
         // gain. A blind session concealed the measured figures until now; they are
         // shown together with the identities at this one irreversible event.
-        let loudness = session.loudness_reveal();
-        let reveal = Value::Array(
-            candidates
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    let mut entry = c.clone();
-                    if let Some(figures) = &loudness {
-                        let (measured_lufs, gain_db) = figures[i];
-                        entry["measured_lufs"] = json!(measured_lufs);
-                        entry["gain_db"] = json!(gain_db);
-                    }
-                    entry
-                })
-                .collect(),
-        );
+        let mut reveal = candidates.clone();
+        if let Some(figures) = session.loudness_reveal() {
+            for (entry, (measured_lufs, gain_db)) in reveal.iter_mut().zip(figures) {
+                entry["measured_lufs"] = json!(measured_lufs);
+                entry["gain_db"] = json!(gain_db);
+            }
+        }
+        let reveal = Value::Array(reveal);
 
         let mut record = json!({
             "schema": self.schema_id,
