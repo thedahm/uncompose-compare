@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::audio::{decode_pcm, integrated_lufs};
 use crate::cache::{Cache, Proxy};
-use crate::hex;
+use crate::{hex, random_bytes};
 
 /// One loaded audio file, with everything the record and workbench need to
 /// identify and describe it. Decoded metadata is derived at load; the PCM
@@ -102,8 +102,47 @@ fn finite(n: f64) -> f64 {
 /// quietest lane gets exactly 0.0.
 #[derive(Clone, Copy)]
 pub struct Loudness {
+    /// The measured integrated loudness, LUFS. A lane too quiet or too short for
+    /// the integrated gate reads `-inf` (ebur128's convention) and is carried as
+    /// such — it is serialized as JSON `null`, never as a number.
     pub measured_lufs: f64,
     pub gain_db: f64,
+}
+
+impl Loudness {
+    /// The measured figure as JSON: the number when the gate produced one, else
+    /// `null`. A lane below the integrated gate has *no* measurement, and a
+    /// record must say so — flooring `-inf` to `0.0` would engrave the loudest
+    /// possible reading for the quietest possible lane (spec story 22: what was
+    /// done to playback is auditable, never a mystery).
+    pub fn measured_lufs_json(&self) -> Value {
+        if self.measured_lufs.is_finite() {
+            json!(self.measured_lufs)
+        } else {
+            Value::Null
+        }
+    }
+
+    /// The applied gain as JSON. Always a number: `match_gains` leaves a lane it
+    /// cannot measure at exactly 0 dB, so the gain — unlike the measurement — is
+    /// never absent.
+    pub fn gain_db_json(&self) -> Value {
+        json!(finite(self.gain_db))
+    }
+
+    /// The full per-lane figures the record and a sighted session carry.
+    fn figures_json(self) -> Value {
+        json!({
+            "measured_lufs": self.measured_lufs_json(),
+            "gain_db": self.gain_db_json(),
+        })
+    }
+
+    /// The reduced per-lane figures a blind session may advertise (ADR-0007):
+    /// the applied gain only.
+    fn blind_figures_json(self) -> Value {
+        json!({ "gain_db": self.gain_db_json() })
+    }
 }
 
 pub struct Session {
@@ -193,12 +232,18 @@ impl Session {
             )));
         }
         if self.duration_mismatch() {
+            // Both values, at a precision that can actually tell them apart: a
+            // one-frame difference is a real refusal, and `{:.0} ms` would print
+            // it as two equal numbers. The frame counts are directly comparable
+            // here — a rate mismatch was already refused above.
             return Err(LoadError::BlindRefused(format!(
-                "cannot blind-compare {} and {}: duration mismatch ({:.0} ms vs {:.0} ms)",
+                "cannot blind-compare {} and {}: duration mismatch ({:.3} ms vs {:.3} ms; {} frames vs {} frames)",
                 a.path,
                 b.path,
                 a.duration_ms(),
-                b.duration_ms()
+                b.duration_ms(),
+                a.frames,
+                b.frames
             )));
         }
         Ok(())
@@ -206,9 +251,18 @@ impl Session {
 
     /// True when the two candidates differ in duration. Reported alongside the
     /// deltas so the page can warn without blocking playback of either file.
+    ///
+    /// At equal sample rates the frame counts *are* the duration, so any frame
+    /// difference counts — that is the sample-exact check the workbench wants.
+    /// Across different rates a frame delta means nothing (44 100 frames and
+    /// 48 000 frames are both one second), so only the elapsed time decides; the
+    /// rate difference itself is reported by `sample_rate_mismatch` (#26 story
+    /// 11), and a listener is told the one thing that is true rather than warned
+    /// twice, once wrongly.
     pub fn duration_mismatch(&self) -> bool {
         let [a, b] = &self.candidates;
-        a.frames != b.frames || (a.duration_ms() - b.duration_ms()).abs() > 0.5
+        let frames_differ = a.sample_rate == b.sample_rate && a.frames != b.frames;
+        frames_differ || (a.duration_ms() - b.duration_ms()).abs() > 0.5
     }
 
     /// True when the two candidates differ in sample rate. Like the duration
@@ -236,15 +290,21 @@ impl Session {
             return self.to_blind_json();
         }
         let [a, b] = &self.candidates;
-        json!({
+        let mut meta = json!({
             "candidates": [a.to_json(), b.to_json()],
             "duration_mismatch": self.duration_mismatch(),
-            "duration_delta_samples": (a.frames as i64 - b.frames as i64).abs(),
             "duration_delta_ms": finite((a.duration_ms() - b.duration_ms()).abs()),
             "loudness_match": self.loudness_match_json(),
             "sample_rate_mismatch": self.sample_rate_mismatch(),
             "channel_count_mismatch": self.channel_count_mismatch(),
-        })
+        });
+        // A sample delta is only a delta when the two lanes count samples at the
+        // same rate; across rates it is arithmetic on incomparable units, so it
+        // is omitted rather than reported as a number that means nothing.
+        if !self.sample_rate_mismatch() {
+            meta["duration_delta_samples"] = json!((a.frames as i64 - b.frames as i64).abs());
+        }
+        meta
     }
 
     /// The concealed session payload for a blind session (#28): per candidate
@@ -268,12 +328,7 @@ impl Session {
     /// session advertises (issue #30). Matching on: `enabled: true`, the
     /// `method` string, and a per-label map of `{measured_lufs, gain_db}`.
     pub fn loudness_match_json(&self) -> Value {
-        self.loudness_match_json_with(|l| {
-            json!({
-                "measured_lufs": finite(l.measured_lufs),
-                "gain_db": finite(l.gain_db),
-            })
-        })
+        self.loudness_match_json_with(Loudness::figures_json)
     }
 
     /// The `loudness_match` a *blind* session may advertise (issue #32): matching
@@ -282,15 +337,15 @@ impl Session {
     /// held back: a distinctive loudness figure fingerprints a candidate, so it
     /// stays concealed until the conclude reveal.
     fn blind_loudness_match_json(&self) -> Value {
-        self.loudness_match_json_with(|l| json!({ "gain_db": finite(l.gain_db) }))
+        self.loudness_match_json_with(Loudness::blind_figures_json)
     }
 
     /// Shared scaffolding for the two `loudness_match` projections above: the
     /// sighted/record shape and the blind one differ only in what each lane
     /// carries, so `lane` supplies the per-label payload. Matching off is
     /// `{"enabled": false}` in both — the absence stated, not implied.
-    fn loudness_match_json_with(&self, lane: impl Fn(&Loudness) -> Value) -> Value {
-        match &self.loudness {
+    fn loudness_match_json_with(&self, lane: impl Fn(Loudness) -> Value) -> Value {
+        match self.loudness {
             Some(figures) => {
                 let mut candidates = Map::new();
                 for (c, l) in self.candidates.iter().zip(figures) {
@@ -307,13 +362,14 @@ impl Session {
     }
 
     /// The per-lane loudness figures for the conclude reveal (issue #32), aligned
-    /// with `candidates` and finite-guarded: `(measured_lufs, gain_db)` when
-    /// matching ran, else `None`. A blind session holds the measured figures back
+    /// with `candidates`: the measured `Loudness` per lane when matching ran, else
+    /// `None`. The named struct travels, not a bare pair — the reveal and the
+    /// record label the same two numbers, so the pairing stays nominal rather than
+    /// riding on tuple order. A blind session holds the measured figures back
     /// until this one irreversible event; they equal the numbers the record's
     /// `playback.loudness_match` carries.
-    pub fn loudness_reveal(&self) -> Option<[(f64, f64); 2]> {
+    pub fn loudness_reveal(&self) -> Option<[Loudness; 2]> {
         self.loudness
-            .map(|figures| figures.map(|l| (finite(l.measured_lufs), finite(l.gain_db))))
     }
 
     /// The labels this session actually loaded — the only candidate references a
@@ -335,6 +391,13 @@ pub enum LoadError {
         path: String,
         reason: String,
     },
+    /// The file decoded, but `--loudness-match` could not measure it (issue #30).
+    /// Its own variant so the message diagnoses the flag rather than blaming the
+    /// file for a corruption it does not have.
+    Unmeasurable {
+        path: String,
+        reason: String,
+    },
     /// A blind pair the interface cannot honestly conceal (#28): identical
     /// content or a duration/rate/channel mismatch. The string already names the
     /// property and both values.
@@ -352,6 +415,12 @@ impl fmt::Display for LoadError {
             }
             LoadError::Undecodable { path, reason } => {
                 write!(f, "cannot decode {path}: {reason}")
+            }
+            LoadError::Unmeasurable { path, reason } => {
+                write!(
+                    f,
+                    "cannot measure the loudness of {path} for --loudness-match: {reason}"
+                )
             }
             LoadError::BlindRefused(msg) => write!(f, "{msg}"),
             LoadError::Randomness(source) => {
@@ -443,7 +512,7 @@ fn load_candidate(
     // the full samples are still in hand (issue #30). Only when matching is on.
     let lufs = if measure {
         Some(
-            integrated_lufs(&decoded).map_err(|reason| LoadError::Undecodable {
+            integrated_lufs(&decoded).map_err(|reason| LoadError::Unmeasurable {
                 path: display.clone(),
                 reason,
             })?,
@@ -474,11 +543,12 @@ fn load_candidate(
 }
 
 /// One byte of OS randomness reduced to a coin flip: the label↔file shuffle a
-/// blind session opens with (#28). Linux-only (spec #1), so `/dev/urandom` is a
-/// fine, dependency-free source — the same one the session token draws from.
+/// blind session opens with (#28). The bytes come from the crate's one
+/// `random_bytes` reader — the same source the session token and the record ULID
+/// draw from.
 fn coin_flip() -> Result<bool, LoadError> {
     let mut byte = [0u8; 1];
-    fill_random(&mut byte)?;
+    random_bytes(&mut byte).map_err(LoadError::Randomness)?;
     Ok(byte[0] & 1 == 1)
 }
 
@@ -488,14 +558,8 @@ fn coin_flip() -> Result<bool, LoadError> {
 /// own inputs.
 fn opaque_ref() -> Result<String, LoadError> {
     let mut bytes = [0u8; 16];
-    fill_random(&mut bytes)?;
+    random_bytes(&mut bytes).map_err(LoadError::Randomness)?;
     Ok(hex(&bytes))
-}
-
-fn fill_random(buf: &mut [u8]) -> Result<(), LoadError> {
-    File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(buf))
-        .map_err(LoadError::Randomness)
 }
 
 #[cfg(test)]

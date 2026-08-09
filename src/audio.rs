@@ -10,7 +10,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use symphonia::core::audio::SampleBuffer;
+use symphonia::core::audio::{Channels, SampleBuffer};
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
@@ -65,13 +65,19 @@ pub fn target_bits(src_bits: u32) -> u32 {
 
 /// Fully-decoded source PCM plus the transcode policy derived from it: the
 /// interleaved samples (right-shifted into `bits`-bit integer range), the source
-/// sample rate (never resampled, #74), the channel count, and the target bit
-/// depth (16/24 pass through bit-exact; 32-bit int and float quantize to 24).
+/// sample rate (never resampled, #74), the channel count and layout, and the
+/// target bit depth (16/24 pass through bit-exact; 32-bit int and float quantize
+/// to 24).
 pub struct DecodedPcm {
     /// Interleaved integer samples in `bits`-bit range, ready for the encoder.
     pub samples: Vec<i32>,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Which speaker position each interleaved channel holds, when the source
+    /// declared one — the loudness meter needs it to weight the channels the way
+    /// BS.1770 does (issue #30). `None` for a source that names no layout; the
+    /// meter then falls back to ebur128's positional default.
+    pub layout: Option<Channels>,
     pub bits: u32,
 }
 
@@ -171,6 +177,7 @@ pub fn decode_pcm(path: &Path) -> Result<DecodedPcm, String> {
         samples,
         sample_rate,
         channels,
+        layout: codec_params.channels,
         bits,
     })
 }
@@ -184,19 +191,74 @@ pub fn decode_pcm(path: &Path) -> Result<DecodedPcm, String> {
 /// A signal too quiet or too short for the integrated gate reads as
 /// `f64::NEG_INFINITY` (ebur128's convention); the caller decides what a
 /// non-finite reading means for the match.
+///
+/// The samples are normalized a chunk at a time rather than into one full-length
+/// float copy: a long high-rate input is already the largest thing in memory at
+/// load, and doubling it for the meter is what turns a load that fits into one
+/// that does not.
 pub fn integrated_lufs(pcm: &DecodedPcm) -> Result<f64, String> {
+    let channels = pcm.channels as usize;
+    if channels == 0 {
+        return Err("no channels".to_string());
+    }
     let mut meter = ebur128::EbuR128::new(pcm.channels as u32, pcm.sample_rate, ebur128::Mode::I)
         .map_err(|e| format!("loudness meter: {e:?}"))?;
+    // Weight each channel by the position the source declared (BS.1770 counts
+    // surround channels +1.5 dB and excludes LFE). ebur128's default map is
+    // right for mono/stereo/quad/5.x and wrong past that — it leaves every
+    // channel beyond the sixth unweighted — so a declared layout always decides.
+    if let Some(layout) = pcm.layout {
+        for (index, channel) in layout.iter().take(channels).enumerate() {
+            meter
+                .set_channel(index as u32, bs1770_position(channel))
+                .map_err(|e| format!("loudness channel map: {e:?}"))?;
+        }
+    }
     // Full-scale is 2^(bits-1); a `bits`-bit sample divided by it lands in
     // [-1, 1], the range ebur128's float path expects.
     let scale = (1i64 << (pcm.bits.saturating_sub(1))) as f32;
-    let normalized: Vec<f32> = pcm.samples.iter().map(|&s| s as f32 / scale).collect();
-    meter
-        .add_frames_f32(&normalized)
-        .map_err(|e| format!("loudness measure: {e:?}"))?;
+    let mut scratch: Vec<f32> = Vec::with_capacity(METER_CHUNK_FRAMES * channels);
+    for chunk in pcm.samples.chunks(METER_CHUNK_FRAMES * channels) {
+        scratch.clear();
+        scratch.extend(chunk.iter().map(|&s| s as f32 / scale));
+        meter
+            .add_frames_f32(&scratch)
+            .map_err(|e| format!("loudness measure: {e:?}"))?;
+    }
     meter
         .loudness_global()
         .map_err(|e| format!("loudness global: {e:?}"))
+}
+
+/// Frames per metering chunk: enough that the per-call overhead is noise, small
+/// enough that the scratch buffer stays a rounding error next to the PCM.
+const METER_CHUNK_FRAMES: usize = 16_384;
+
+/// The BS.1770 position for one declared source channel.
+///
+/// The three front channels are counted at unity, the surround channels at the
+/// standard +1.5 dB (ebur128 applies that weight to its surround and ±60°/±90°
+/// positions), and LFE is excluded from the measurement entirely. A position
+/// BS.1770 does not name — height and wide channels, which arrive only from
+/// BS.2051-style layouts — is counted at unity, which is what
+/// `Channel::Center` means to the meter's weight table.
+fn bs1770_position(channel: Channels) -> ebur128::Channel {
+    use ebur128::Channel;
+    match channel {
+        Channels::FRONT_LEFT => Channel::Left,
+        Channels::FRONT_RIGHT => Channel::Right,
+        Channels::FRONT_CENTRE => Channel::Center,
+        // The one position BS.1770 explicitly leaves out of the measurement.
+        Channels::LFE1 | Channels::LFE2 => Channel::Unused,
+        Channels::REAR_LEFT => Channel::LeftSurround,
+        Channels::REAR_RIGHT => Channel::RightSurround,
+        Channels::SIDE_LEFT => Channel::Mp090,
+        Channels::SIDE_RIGHT => Channel::Mm090,
+        Channels::FRONT_LEFT_CENTRE => Channel::MpSC,
+        Channels::FRONT_RIGHT_CENTRE => Channel::MmSC,
+        Channels::REAR_CENTRE => Channel::Mp180,
+        _ => Channel::Center,
+    }
 }
 
 /// Encode interleaved integer PCM in `container` at the source sample rate and
@@ -287,5 +349,84 @@ mod tests {
         // A full-range i32 (32-bit source) keeps its top 24 bits.
         let full: i32 = 0x7FAB_CDEF;
         assert_eq!(full >> (32 - target_bits(32)), full >> 8);
+    }
+
+    /// The canonical 7.1 layout, in the bit order symphonia interleaves it:
+    /// front L/R/C, LFE, rear L/R, side L/R.
+    fn surround_71() -> Channels {
+        Channels::FRONT_LEFT
+            | Channels::FRONT_RIGHT
+            | Channels::FRONT_CENTRE
+            | Channels::LFE1
+            | Channels::REAR_LEFT
+            | Channels::REAR_RIGHT
+            | Channels::SIDE_LEFT
+            | Channels::SIDE_RIGHT
+    }
+
+    /// One second of 16-bit 1 kHz tone at −6 dBFS, present only in the given
+    /// interleaved channel indices and silent in every other.
+    fn tone_in(channels: u16, layout: Channels, present: &[usize]) -> DecodedPcm {
+        let sample_rate = 48_000u32;
+        let mut samples = vec![0i32; sample_rate as usize * channels as usize];
+        for frame in 0..sample_rate as usize {
+            let t = frame as f64 / sample_rate as f64;
+            let value = ((t * 1000.0 * std::f64::consts::TAU).sin() * 16_384.0) as i32;
+            for &channel in present {
+                samples[frame * channels as usize + channel] = value;
+            }
+        }
+        DecodedPcm {
+            samples,
+            sample_rate,
+            channels,
+            layout: Some(layout),
+            bits: 16,
+        }
+    }
+
+    /// The declared layout — not ebur128's positional default — decides which
+    /// channels the measurement counts. The default map leaves everything past
+    /// the sixth channel unweighted, so a 7.1 source whose only content sits in
+    /// the side channels would otherwise measure as silence.
+    #[test]
+    fn side_channels_of_a_71_source_are_measured() {
+        let pcm = tone_in(8, surround_71(), &[6, 7]);
+        let lufs = integrated_lufs(&pcm).expect("the meter runs");
+        assert!(
+            lufs.is_finite() && lufs > -30.0,
+            "the side channels carry the whole signal: {lufs} LUFS"
+        );
+    }
+
+    /// LFE is excluded from BS.1770 integrated loudness, so a source whose only
+    /// content is in the LFE channel has no measurable loudness.
+    #[test]
+    fn the_lfe_channel_is_excluded_from_the_measurement() {
+        let pcm = tone_in(8, surround_71(), &[3]);
+        let lufs = integrated_lufs(&pcm).expect("the meter runs");
+        assert!(
+            !lufs.is_finite(),
+            "LFE-only content measures as no reading, not a level: {lufs} LUFS"
+        );
+    }
+
+    /// Metering a chunk at a time (rather than one full-length float copy) must
+    /// not move the reading: a −6 dBFS 1 kHz tone spanning several chunks lands
+    /// where such a tone belongs.
+    #[test]
+    fn chunked_metering_measures_a_stereo_tone_at_its_level() {
+        let pcm = tone_in(2, Channels::FRONT_LEFT | Channels::FRONT_RIGHT, &[0, 1]);
+        assert!(
+            pcm.samples.len() > 2 * METER_CHUNK_FRAMES * 2,
+            "the fixture spans several metering chunks"
+        );
+        let lufs = integrated_lufs(&pcm).expect("the meter runs");
+        // A −6 dBFS sine is −9 dBFS RMS per channel; two coherent channels sum
+        // to about −6 LUFS. Assert the neighborhood, not a digit.
+        assert!(
+            (lufs - -6.0).abs() < 1.5,
+            "a −6 dBFS 1 kHz stereo tone measures near −6 LUFS, got {lufs}"
+        );
     }
 }

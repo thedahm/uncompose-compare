@@ -52,6 +52,12 @@ function scaled(curve: Float32Array, factor: number): Float32Array {
   return out;
 }
 
+/** The pair of fade curves one lane switches with, at its static gain. */
+interface LaneFade {
+  up: Float32Array;
+  down: Float32Array;
+}
+
 export class PlaybackEngine {
   private ctx: AudioContext;
   private buffers: Record<Label, AudioBuffer>;
@@ -65,6 +71,12 @@ export class PlaybackEngine {
    * untouched.
    */
   private laneGain: Record<Label, number>;
+  /**
+   * Each lane's crossfade curves at its static gain, built once: the gains are
+   * session-constant, so scaling the shared equal-power curves per switch would
+   * allocate two arrays on every `x` press for a result that never changes.
+   */
+  private laneFade: Record<Label, LaneFade>;
   private sources: Record<Label, AudioBufferSourceNode> | null = null;
 
   private liveLabel: Label = "A";
@@ -95,6 +107,11 @@ export class PlaybackEngine {
     this.ctx = ctx;
     this.buffers = { A: a, B: b };
     this.laneGain = laneGain;
+    const fade = (label: Label): LaneFade => ({
+      up: scaled(FADE_CURVES.up, laneGain[label]),
+      down: scaled(FADE_CURVES.down, laneGain[label]),
+    });
+    this.laneFade = { A: fade("A"), B: fade("B") };
     this.gains = {
       A: ctx.createGain(),
       B: ctx.createGain(),
@@ -251,21 +268,16 @@ export class PlaybackEngine {
     this.liveLabel = label;
     const now = this.ctx.currentTime;
     if (this.playing) {
-      const { up, down } = FADE_CURVES;
       this.gains[label].gain.cancelScheduledValues(now);
       this.gains[outgoing].gain.cancelScheduledValues(now);
       // Anchor the ramp at the present value so the curve starts from "now".
       this.gains[label].gain.setValueAtTime(this.gains[label].gain.value, now);
       this.gains[outgoing].gain.setValueAtTime(this.gains[outgoing].gain.value, now);
-      // Scale the equal-power curves to each lane's static gain: the incoming
-      // lane rises to its own loudness-match level, the outgoing falls to 0.
-      this.gains[label].gain.setValueCurveAtTime(
-        scaled(up, this.laneGain[label]),
-        now,
-        FADE_SECONDS,
-      );
+      // The equal-power curves at each lane's static gain: the incoming lane
+      // rises to its own loudness-match level, the outgoing falls to 0.
+      this.gains[label].gain.setValueCurveAtTime(this.laneFade[label].up, now, FADE_SECONDS);
       this.gains[outgoing].gain.setValueCurveAtTime(
-        scaled(down, this.laneGain[outgoing]),
+        this.laneFade[outgoing].down,
         now,
         FADE_SECONDS,
       );

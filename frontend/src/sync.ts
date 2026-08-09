@@ -239,8 +239,12 @@ export async function renderSync({
   // distinct attenuations (A −6 dB, B −12 dB): both exact powers of two so the
   // scaled crossfade bound stays bit-identical, and both ≤ 0 dB like loudness
   // matching, which only ever attenuates (#66).
-  const faithful = await renderVariant(geo, decoded, { a: 1, b: 1 });
-  const attenuated = await renderVariant(geo, decoded, { a: 0.5, b: 0.25 });
+  // The two renders are independent offline contexts, so they run together
+  // rather than one after the other.
+  const [faithful, attenuated] = await Promise.all([
+    renderVariant(geo, decoded, { a: 1, b: 1 }),
+    renderVariant(geo, decoded, { a: 0.5, b: 0.25 }),
+  ]);
 
   return { decodeInfo, ...faithful, attenuated };
 }

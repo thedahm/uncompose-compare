@@ -5,17 +5,15 @@
 //! compare — and covers the `/session`, `/audio/<reference>`, and `/record`
 //! endpoints as well as the embedded bundle.
 
-use std::fs::File;
-use std::io::Read;
 use std::net::SocketAddr;
 
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-use crate::hex;
 use crate::record::Recorder;
 use crate::session::Session;
+use crate::{hex, random_bytes};
 
 /// The Vite/React bundle, embedded at compile time. `build.rs` guarantees the
 /// folder is present and non-empty, so a build that reaches here has assets.
@@ -84,7 +82,14 @@ pub fn serve(mut request: Request, token: &str, session: &Session, recorder: &Re
         let (status, payload) = match recorder.conclude(session, &body) {
             // The reveal (label→file) rides the successful-write response and
             // nothing before it — the browser had no identity until now (#29).
-            Ok(c) => (200, json!({ "path": c.path, "reveal": c.reveal })),
+            // A sighted conclude carries no reveal: nothing was concealed.
+            Ok(c) => {
+                let mut payload = json!({ "path": c.path });
+                if let Some(reveal) = c.reveal {
+                    payload["reveal"] = reveal;
+                }
+                (200, payload)
+            }
             Err(e) => (e.status(), json!({ "error": e.to_string() })),
         };
         let _ = request.respond(json_response(status, &payload));
@@ -193,11 +198,10 @@ fn cookie_token(request: &Request) -> Option<&str> {
         })
 }
 
-/// A per-session token: 16 bytes of OS randomness, hex-encoded. The tool is
-/// Linux-only (spec #1), so `/dev/urandom` is a fine, dependency-free source.
+/// A per-session token: 16 bytes of OS randomness, hex-encoded (`random_bytes`).
 pub fn session_token() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let mut bytes = [0u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    random_bytes(&mut bytes)?;
     Ok(hex(&bytes))
 }
 

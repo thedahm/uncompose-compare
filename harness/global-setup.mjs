@@ -8,10 +8,10 @@
 // `uncompose-compare` on PATH for a locally-installed wheel. We deliberately do
 // NOT fall back to `cargo run`: the whole point is to exercise the packaged
 // artifact.
-import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { spawnServed } from "./serve.mjs";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 export const URL_FILE = path.join(dir, ".served-url");
@@ -27,34 +27,8 @@ export default async function globalSetup() {
   // seam, not these particular candidates, but the binary needs them to launch.
   const fixtures = path.join(dir, "fixtures");
   const args = [path.join(fixtures, "a.wav"), path.join(fixtures, "b.wav")];
-  const child = spawn(bin, args, { stdio: ["ignore", "pipe", "inherit"] });
-
-  const url = await new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`${bin} printed no URL within 15s`)),
-      15_000,
-    );
-    child.on("error", (err) =>
-      reject(new Error(`failed to launch ${bin}: ${err.message}`)),
-    );
-    child.on("exit", (code) =>
-      reject(new Error(`${bin} exited (code ${code}) before printing a URL`)),
-    );
-
-    let buf = "";
-    child.stdout.on("data", (chunk) => {
-      buf += chunk.toString();
-      const nl = buf.indexOf("\n");
-      if (nl === -1) return;
-      const line = buf.slice(0, nl).trim();
-      clearTimeout(timer);
-      if (!line.startsWith("http://127.0.0.1:")) {
-        reject(new Error(`expected a loopback URL, got: ${line}`));
-      } else {
-        resolve(line);
-      }
-    });
-  });
+  const { child, url: served } = spawnServed(bin, args);
+  const url = await served;
 
   writeFileSync(URL_FILE, url);
   writeFileSync(PID_FILE, String(child.pid));

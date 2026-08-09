@@ -27,3 +27,13 @@ pub mod session;
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// Fill `buf` with OS randomness. The tool is Linux-only (spec #1), so
+/// `/dev/urandom` is a fine, dependency-free source — and one place, so the
+/// session token, the record ULID, and the blind shuffle/opaque references all
+/// draw from the same reader and each map the one `io::Error` into its own
+/// error type.
+pub fn random_bytes(buf: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")?.read_exact(buf)
+}

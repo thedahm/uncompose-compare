@@ -25,6 +25,12 @@ sha2 = "0.11"
 symphonia = { version = "0.5", default-features = false, features = ["wav", "flac", "pcm"] }
 tiny_http = "0.12"
 
+[dev-dependencies]
+# The process-boundary tests hash their own fixtures to know what a session must
+# report (and, blind, must never leak) — the same hasher the binary uses, run
+# independently of it.
+sha2 = "0.11"
+
 [profile.release]
 opt-level = "z"
 strip = true

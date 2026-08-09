@@ -23,9 +23,11 @@ Verdict save reveals nothing.**
   shows can never diverge from what was written. A refused conclude (a second conclude, an
   invalid record, an overwrite) reveals nothing — only a completed write reveals, exactly as
   it is the only thing that concludes the session.
-- The reveal is displayed only for a blind session. A sighted session already names the files
-  on its lane rows, so there is nothing to reveal; the response still carries the mapping
-  (uniform shape), but the UI shows the reveal panel only when the session was blind.
+- The reveal belongs to a blind session and is carried only by one. A sighted session already
+  names the files on its lane rows and already has the loudness figures, so it conceals
+  nothing and has nothing to reveal: its conclude response omits `reveal` entirely rather
+  than repeating identities the page has held since load. The reveal is a concealment
+  concept, so it exists exactly where concealment did.
 
 ## Consequences
 

@@ -11,7 +11,8 @@ decided:
 **`playback` requires a single `loudness_match` object and nothing else. `loudness_match`
 requires `enabled` (boolean); when `enabled` is `true` it also carries `method` (string,
 `bs1770-integrated` in v0.1) and `candidates`, a per-label map of
-`{measured_lufs, gain_db}` numbers. When matching is off the server writes exactly
+`{measured_lufs, gain_db}` numbers (`measured_lufs` is `null` for a lane the integrated gate
+gave no reading for — see the consequences). When matching is off the server writes exactly
 `{"loudness_match": {"enabled": false}}`.**
 
 ```json
@@ -61,7 +62,15 @@ than it can forge a candidate's hash.
 - The session endpoint advertises the same `loudness_match` shape it will record, so the
   workbench reads the per-lane `gain_db` it applies as a static gain from the exact shape
   the record carries — one shape, measured once, both displayed and engraved.
-- A non-finite measurement (a silent lane reads `-inf` LUFS) is left at `0.0` gain and does
-  not become the match reference, so a silent input can never produce a `-inf` gain that
-  would fail the `number` type. The measured figure is floored to a finite value for the
-  same reason.
+- A non-finite measurement (a lane below the integrated gate reads `-inf` LUFS) is left at
+  `0.0` gain and does not become the match reference, so a silent input can never produce a
+  `-inf` gain that would fail the `number` type.
+- **That lane's `measured_lufs` is recorded as `null`, not as a number.** JSON has no
+  `-inf`, and the two candidate encodings are not equally honest: flooring it to `0.0`
+  would engrave the *loudest possible* figure for the *quietest possible* lane —
+  indistinguishable from a real reading, and self-inconsistent with the `0.0 dB` gain
+  beside it. `null` says the one true thing: the gate produced no reading. `measured_lufs`
+  is therefore typed `["number", "null"]`; `gain_db` stays a plain number, because a lane
+  that could not be measured still has a defined applied gain (exactly 0 dB). Readers that
+  average or plot the figures must skip the nulls — which is the correct treatment of a
+  measurement that does not exist.

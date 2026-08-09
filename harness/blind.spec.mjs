@@ -12,11 +12,11 @@
 // disk. It runs on Chromium only (the flow is engine-independent; the cross-engine
 // contract keeps the full matrix in sync.spec.mjs).
 import { test, expect } from "@playwright/test";
-import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { spawnServed } from "./serve.mjs";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -40,25 +40,9 @@ let recordDir;
 
 test.beforeAll(async () => {
   recordDir = mkdtempSync(path.join(tmpdir(), "blind-flow-"));
-  child = spawn(bin, [inputs.a, inputs.b, "--blind"], {
-    cwd: recordDir,
-    stdio: ["ignore", "pipe", "inherit"],
-  });
-  servedUrl = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${bin} --blind printed no URL within 15s`)), 15_000);
-    child.on("error", (err) => reject(new Error(`failed to launch ${bin} --blind: ${err.message}`)));
-    child.on("exit", (code) => reject(new Error(`${bin} --blind exited (code ${code}) before a URL`)));
-    let buf = "";
-    child.stdout.on("data", (chunk) => {
-      buf += chunk.toString();
-      const nl = buf.indexOf("\n");
-      if (nl === -1) return;
-      clearTimeout(timer);
-      const line = buf.slice(0, nl).trim();
-      if (!line.startsWith("http://127.0.0.1:")) reject(new Error(`expected a loopback URL, got: ${line}`));
-      else resolve(line);
-    });
-  });
+  const served = spawnServed(bin, [inputs.a, inputs.b, "--blind"], { cwd: recordDir });
+  child = served.child;
+  servedUrl = await served.url;
 });
 
 test.afterAll(() => {

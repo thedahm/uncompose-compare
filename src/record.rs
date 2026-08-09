@@ -18,12 +18,13 @@
 use std::cell::Cell;
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use crate::random_bytes;
 use crate::session::Session;
 
 /// The v0 comparison-record JSON Schema, this repo's owned artifact.
@@ -48,13 +49,16 @@ pub struct Recorder {
     concluded: Cell<bool>,
 }
 
-/// A successful conclude: where the immutable record landed, and the reveal the
-/// UI displays — the label→file mapping (`{label, path, sha256, size}` per
-/// candidate), identical to what the record carries (#29), each lane also
-/// carrying its `{measured_lufs, gain_db}` when loudness matching ran (#32).
+/// A successful conclude: where the immutable record landed, and — for a blind
+/// session — the reveal the UI displays: the label→file mapping
+/// (`{label, path, sha256, size}` per candidate), identical to what the record
+/// carries (#29), each lane also carrying its `{measured_lufs, gain_db}` when
+/// loudness matching ran (#32). A sighted session reveals nothing: it never
+/// concealed anything, so `reveal` is `None` and the response omits the key
+/// (ADR-0006 — the reveal is the blind session's payload).
 pub struct Conclusion {
     pub path: String,
-    pub reveal: Value,
+    pub reveal: Option<Value>,
 }
 
 /// Why a conclude was refused, mapped to an HTTP status the UI can act on.
@@ -161,15 +165,18 @@ impl Recorder {
         // UI shows post-conclude cannot diverge from what was written — plus, when
         // loudness matching ran (issue #32), each lane's measured LUFS and applied
         // gain. A blind session concealed the measured figures until now; they are
-        // shown together with the identities at this one irreversible event.
-        let mut reveal = candidates.clone();
-        if let Some(figures) = session.loudness_reveal() {
-            for (entry, (measured_lufs, gain_db)) in reveal.iter_mut().zip(figures) {
-                entry["measured_lufs"] = json!(measured_lufs);
-                entry["gain_db"] = json!(gain_db);
+        // shown together with the identities at this one irreversible event. Only a
+        // blind session has anything to reveal (ADR-0006).
+        let reveal = session.blind.then(|| {
+            let mut reveal = candidates.clone();
+            if let Some(figures) = session.loudness_reveal() {
+                for (entry, lane) in reveal.iter_mut().zip(figures) {
+                    entry["measured_lufs"] = lane.measured_lufs_json();
+                    entry["gain_db"] = lane.gain_db_json();
+                }
             }
-        }
-        let reveal = Value::Array(reveal);
+            Value::Array(reveal)
+        });
 
         let mut record = json!({
             "schema": self.schema_id,
@@ -347,7 +354,7 @@ fn new_ulid() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_default()
         .as_millis();
     let mut rand = [0u8; 10];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut rand)?;
+    random_bytes(&mut rand)?;
     let mut rnd: u128 = 0;
     for &b in &rand {
         rnd = (rnd << 8) | b as u128;

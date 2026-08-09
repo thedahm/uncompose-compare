@@ -73,7 +73,7 @@
       "required": ["measured_lufs", "gain_db"],
       "additionalProperties": false,
       "properties": {
-        "measured_lufs": { "type": "number", "description": "Measured integrated loudness, LUFS" },
+        "measured_lufs": { "type": ["number", "null"], "description": "Measured integrated loudness, LUFS; null when the lane fell below the integrated gate and has no reading" },
         "gain_db": { "type": "number", "maximum": 0, "description": "Applied gain, dB; always ≤ 0 (attenuate to quietest, never boost)" }
       }
     },

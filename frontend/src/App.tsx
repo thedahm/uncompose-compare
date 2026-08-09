@@ -16,6 +16,12 @@
  * The SRC lane and stems section are kept as empty structural slots so M4/M5 add
  * rows rather than redesign.
  *
+ * The `/session` payload is a discriminated union (#28): a blind session's
+ * candidates structurally cannot carry a name, path, hash, or size, and a
+ * sighted session's carry all of them plus the compatibility flags. The page
+ * branches on that one discriminator — anonymous switch buttons or identified
+ * lane rows — so concealment is checked by the compiler rather than remembered.
+ *
  * This file is the shell: state, the transport wiring, and the stage. The parts
  * that stand alone live beside it — the ledger (`Ledger.tsx`), the verdict modal
  * (`VerdictModal.tsx`), the help modal (`HelpModal.tsx`) — over the pure logic in
@@ -48,36 +54,41 @@ import { addObservation, emptyLedger, makeObservation, redo, undo, type Ledger, 
 import { buildRecordPayload, type Verdict } from "./record";
 
 /**
- * A session candidate. In a sighted session every field is present; in a blind
- * one (#28) the server conceals identity, so only `label`, `duration_ms`, and
- * the opaque `audio` reference arrive — name, path, sha256, size, and the
- * per-candidate technical metadata are omitted (the browser cannot leak what it
- * does not have). Reveal comes only at conclude (#29).
+ * A candidate as a *blind* session serves it (#28): the server conceals identity,
+ * so only the label, the shared duration, and the opaque audio reference arrive.
+ * Name, path, sha256, size, and the per-candidate technical metadata are not
+ * optional here — they are structurally absent, so the blind page cannot leak
+ * what its type cannot hold. Reveal comes only at conclude (#29).
  */
-interface Candidate {
+interface BlindCandidate {
   label: string;
-  name?: string;
-  path?: string;
-  sha256?: string;
-  size?: number;
-  frames?: number;
   duration_ms: number;
-  sample_rate?: number;
-  channels?: number;
   audio: string;
+}
+
+/** A candidate as a sighted session serves it: identity and metadata, all present. */
+interface SightedCandidate extends BlindCandidate {
+  name: string;
+  path: string;
+  sha256: string;
+  size: number;
+  frames: number;
+  sample_rate: number;
+  channels: number;
 }
 
 /**
  * One label's revealed identity, returned by conclude and shown post-write (#29).
  * When loudness matching ran (#32) the reveal also carries the measured LUFS and
- * applied gain a blind session held back until this one irreversible event.
+ * applied gain a blind session held back until this one irreversible event —
+ * `measured_lufs` null for a lane that fell below the integrated gate.
  */
 interface RevealCandidate {
   label: Label;
   path: string;
   sha256: string;
   size: number;
-  measured_lufs?: number;
+  measured_lufs?: number | null;
   gain_db?: number;
 }
 
@@ -85,10 +96,10 @@ interface RevealCandidate {
  * One lane's loudness-match figures. Sighted (and the record) report both the
  * measured LUFS and the applied gain; a blind session (#32) conceals the measured
  * figure and carries only the `gain_db` the engine applies, so `measured_lufs` is
- * optional.
+ * absent there — and `null` for any lane the integrated gate gave no reading for.
  */
 interface LoudnessCandidate {
-  measured_lufs?: number;
+  measured_lufs?: number | null;
   gain_db: number;
 }
 
@@ -104,21 +115,45 @@ interface LoudnessMatch {
   candidates?: Partial<Record<Label, LoudnessCandidate>>;
 }
 
-interface SessionMeta {
-  candidates: Candidate[];
+/**
+ * A blind session (#28): the label↔file assignment was shuffled at load and every
+ * identifying detail is concealed. Blind mode refuses any mismatch pre-bind, so
+ * the compatibility flags do not exist here at all — the payload carries the
+ * candidates and the loudness match, and nothing that could name a file.
+ */
+export interface BlindSession {
+  blind: true;
+  candidates: BlindCandidate[];
   loudness_match: LoudnessMatch;
-  /**
-   * A blind session (#28): the label↔file assignment was shuffled at load and
-   * every identifying detail is concealed. The mismatch flags below are omitted
-   * (blind mode refuses any mismatch pre-bind), so they are absent, not `false`.
-   */
-  blind?: boolean;
-  duration_mismatch?: boolean;
-  duration_delta_samples?: number;
-  duration_delta_ms?: number;
-  sample_rate_mismatch?: boolean;
-  channel_count_mismatch?: boolean;
 }
+
+/**
+ * A sighted session: identified candidates plus the compatibility flags the
+ * workbench warns on. Every flag is present (the server always states them), so
+ * the sighted path reads real values rather than defaulting around absences.
+ */
+export interface SightedSession {
+  blind?: false;
+  candidates: SightedCandidate[];
+  loudness_match: LoudnessMatch;
+  duration_mismatch: boolean;
+  duration_delta_ms: number;
+  /**
+   * Absent when the two lanes run at different sample rates: a frame delta
+   * across rates counts incomparable units, so the server omits it rather than
+   * report a number that means nothing.
+   */
+  duration_delta_samples?: number;
+  sample_rate_mismatch: boolean;
+  channel_count_mismatch: boolean;
+}
+
+/**
+ * The `/session` payload. The two shapes are discriminated by `blind`, so
+ * concealment is a type-level fact: a blind payload structurally cannot hold an
+ * identity, and the sighted path keeps its compile-time guarantees.
+ */
+export type SessionMeta = BlindSession | SightedSession;
 
 /** Waveform/loudness envelope resolution — enough detail without paint cost. */
 const BUCKETS = 1000;
@@ -137,6 +172,40 @@ const VIEWS: { id: ViewMode; label: string }[] = [
 
 function candidateColor(label: Label): string {
   return label === "A" ? "#4ea1ff" : "#ff8f4e";
+}
+
+/**
+ * The session's two lanes keyed by label — the label is the reference key
+ * everywhere else (record, verdict, pins, loudness match), so the page never
+ * treats "the first candidate" as A. Null when the payload does not name both.
+ * The blind/sighted discriminator rides along, so the lane rows read identities
+ * the type guarantees are there.
+ */
+export type Lanes =
+  | { blind: true; byLabel: Record<Label, BlindCandidate> }
+  | { blind: false; byLabel: Record<Label, SightedCandidate> };
+
+export function lanesOf(session: SessionMeta): Lanes | null {
+  const pair = <T extends { label: string }>(candidates: T[]): Record<Label, T> | null => {
+    const a = candidates.find((c) => c.label === "A");
+    const b = candidates.find((c) => c.label === "B");
+    return a && b ? { A: a, B: b } : null;
+  };
+  if (session.blind) {
+    const byLabel = pair(session.candidates);
+    return byLabel && { blind: true, byLabel };
+  }
+  const byLabel = pair(session.candidates);
+  return byLabel && { blind: false, byLabel };
+}
+
+/**
+ * A lane's measured loudness for display: the figure, or the honest absence when
+ * the lane fell below BS.1770's integrated gate (the record writes `null` there
+ * rather than a number it does not have — ADR-0003).
+ */
+export function formatLufs(lufs: number | null | undefined): string {
+  return typeof lufs === "number" ? `${lufs.toFixed(1)} LUFS` : "no LUFS reading (below the gate)";
 }
 
 /**
@@ -177,7 +246,6 @@ function computeViews(channel: Float32Array): CandidateViews {
 export function App() {
   const [session, setSession] = useState<SessionMeta | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [candidates, setCandidates] = useState<Record<Label, Candidate> | null>(null);
   const [views, setViews] = useState<Record<Label, CandidateViews> | null>(null);
   const [view, setView] = useState<ViewMode>("waveform");
 
@@ -239,18 +307,18 @@ export function App() {
         const s = (await res.json()) as SessionMeta;
         setSession(s);
 
-        const byLabel = (label: Label) =>
-          s.candidates.find((c) => c.label === label);
-        const a = byLabel("A");
-        const b = byLabel("B");
-        if (!a || !b) throw new Error("session is missing candidate A or B");
+        const lanes = lanesOf(s);
+        if (!lanes) throw new Error("session is missing candidate A or B");
 
         const ctx = new AudioContext();
-        const decode = async (c: Candidate): Promise<AudioBuffer> => {
+        const decode = async (c: BlindCandidate): Promise<AudioBuffer> => {
           const buf = await (await fetch(c.audio)).arrayBuffer();
           return await ctx.decodeAudioData(buf);
         };
-        const [bufA, bufB] = await Promise.all([decode(a), decode(b)]);
+        const [bufA, bufB] = await Promise.all([
+          decode(lanes.byLabel.A),
+          decode(lanes.byLabel.B),
+        ]);
 
         // Static per-lane gains from the server's loudness match (issue #30):
         // faithful unity when off, the measured attenuation when on. Constant
@@ -259,7 +327,6 @@ export function App() {
         const eng = new PlaybackEngine(ctx, bufA, bufB, laneGain);
         eng.onEnded = () => syncFrom(eng);
         engineRef.current = eng;
-        setCandidates({ A: a, B: b });
         setViews({
           A: computeViews(bufA.getChannelData(0)),
           B: computeViews(bufB.getChannelData(0)),
@@ -501,6 +568,10 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [togglePlay, toggleSwitch, toggleLoop, clearRegion, rewind, step, pin, live]);
 
+  // The two lanes keyed by label, narrowed once from the session payload: the
+  // blind pair carries no identity to render, the sighted pair carries all of it.
+  const lanes = session && lanesOf(session);
+
   // Only positioned observations get a caret on the stage waveform.
   const pins: Pin[] = ledger.observations.flatMap((o) =>
     o.position === null ? [] : [{ id: o.id, position: o.position, candidate: o.candidate }],
@@ -519,18 +590,29 @@ export function App() {
       />
     ) : null;
 
+  // The lane header both presentations share: the live marker, the label, and
+  // the engraved verdict's stars. The blind switch button and the sighted lane
+  // row then differ only in their wrapper and in whether a filename follows the
+  // label — so the live marker and the stars cannot drift between them.
+  const laneHeader = (label: Label, name?: string) => (
+    <>
+      <span data-testid={`live-marker-${label}`}>{live === label ? "● " : "  "}</span>
+      <strong>{label}</strong>
+      {name ? ` ${name}` : null}
+      {preferredStars(label, { marginLeft: 6 })}
+    </>
+  );
+
   return (
     <main style={{ fontFamily: "system-ui, sans-serif", color: "#eee", background: "#0a0a0a", minHeight: "100vh", padding: 16 }}>
       <h1 data-testid="hello" style={{ fontSize: 18 }}>
         uncompose-compare
       </h1>
 
-      {session?.duration_mismatch && (
-        <p role="alert" data-testid="duration-mismatch" style={{ color: "#ffcf6b" }}>
-          Duration mismatch: the candidates differ by {session.duration_delta_samples}{" "}
-          samples ({(session.duration_delta_ms ?? 0).toFixed(1)} ms). Both still load.
-        </p>
-      )}
+      {/* The compatibility warnings are a sighted-session concern: blind mode
+          refuses a mismatched pair pre-bind, so there is nothing to warn about
+          (and no metadata to warn with). */}
+      {session && !session.blind && <SessionWarnings session={session} />}
 
       {/* Loudness matching (issue #30): state clearly whenever playback is not
           at mastered levels. Sighted mode shows the per-lane figures; a blind
@@ -544,28 +626,14 @@ export function App() {
             ? "Per-lane figures are hidden until reveal."
             : (["A", "B"] as Label[]).map((label) => {
                 const c = session.loudness_match.candidates?.[label];
-                if (c?.measured_lufs === undefined) return null;
+                if (!c) return null;
                 return (
                   <span key={label} data-testid={`loudness-${label}`} style={{ marginRight: 10 }}>
-                    <strong>{label}</strong>: {c.measured_lufs.toFixed(1)} LUFS,{" "}
+                    <strong>{label}</strong>: {formatLufs(c.measured_lufs)},{" "}
                     {c.gain_db.toFixed(1)} dB
                   </span>
                 );
               })}
-        </p>
-      )}
-
-      {session?.sample_rate_mismatch && (
-        <p role="alert" data-testid="sample-rate-mismatch" style={{ color: "#ffcf6b" }}>
-          Sample-rate mismatch: A is {session.candidates[0].sample_rate} Hz, B is{" "}
-          {session.candidates[1].sample_rate} Hz. Both still load.
-        </p>
-      )}
-
-      {session?.channel_count_mismatch && (
-        <p role="alert" data-testid="channel-count-mismatch" style={{ color: "#ffcf6b" }}>
-          Channel-count mismatch: A has {session.candidates[0].channels}, B has{" "}
-          {session.candidates[1].channels}. Both still load.
         </p>
       )}
 
@@ -575,7 +643,7 @@ export function App() {
 
       {!views && !error && <p data-testid="loading">Loading candidates…</p>}
 
-      {views && candidates && (
+      {views && lanes && (
         <section data-testid="workbench">
           {/* Primary stage: the live candidate's display with the transport. */}
           <div data-testid="stage" style={{ marginBottom: 12 }}>
@@ -669,38 +737,32 @@ export function App() {
               two anonymous switch buttons in their place (per the #61 design); a
               sighted session keeps the labelled lane rows with their waveforms.
               Either way the live lane switches by button and by `x`. */}
-          {session?.blind ? (
+          {lanes.blind ? (
             <div data-testid="switch-buttons" role="group" aria-label="Switch candidate">
-              {(["A", "B"] as Label[]).map((label) => {
-                const isLive = live === label;
-                return (
-                  <button
-                    key={label}
-                    data-testid={`switch-${label}`}
-                    data-live={isLive}
-                    aria-pressed={isLive}
-                    onClick={() => switchTo(label)}
-                    style={{
-                      marginRight: 8,
-                      padding: "8px 16px",
-                      fontWeight: "bold",
-                      borderLeft: `3px solid ${isLive ? "#fff" : "transparent"}`,
-                    }}
-                  >
-                    {/* An anonymous button carries only the label and the live
-                        marker — no name, path, hash, or size (concealment). */}
-                    <span data-testid={`live-marker-${label}`}>{isLive ? "● " : "  "}</span>
-                    {label}
-                    {preferredStars(label, { marginLeft: 6 })}
-                  </button>
-                );
-              })}
+              {(["A", "B"] as Label[]).map((label) => (
+                <button
+                  key={label}
+                  data-testid={`switch-${label}`}
+                  data-live={live === label}
+                  aria-pressed={live === label}
+                  onClick={() => switchTo(label)}
+                  style={{
+                    marginRight: 8,
+                    padding: "8px 16px",
+                    fontWeight: "bold",
+                    borderLeft: `3px solid ${live === label ? "#fff" : "transparent"}`,
+                  }}
+                >
+                  {/* An anonymous button carries only the shared lane header —
+                      no name, path, hash, or size (concealment). */}
+                  {laneHeader(label)}
+                </button>
+              ))}
             </div>
           ) : (
             /* A/B lane rows: click to audition; ● marks the live lane. */
             <div data-testid="lanes">
               {(["A", "B"] as Label[]).map((label) => {
-                const c = candidates[label];
                 const isLive = live === label;
                 return (
                   <div
@@ -719,10 +781,8 @@ export function App() {
                     {/* Clicking the label auditions; dragging the waveform selects a
                         region, while a plain click on it also auditions (onActivate). */}
                     <span style={{ width: 90, cursor: "pointer" }} onClick={() => switchTo(label)}>
-                      <span data-testid={`live-marker-${label}`}>{isLive ? "● " : "  "}</span>
-                      <strong>{label}</strong> {c.name}
+                      {laneHeader(label, lanes.byLabel[label].name)}
                     </span>
-                    {preferredStars(label)}
                     <div style={{ flex: 1 }}>
                       <Waveform
                         views={views[label]}
@@ -804,9 +864,10 @@ export function App() {
             )}
             {/* Reveal at conclude (#29): only after the record is written — the
                 one irreversible event — does the UI show which file each label
-                was. Blind mode concealed this until now; sighted mode already
-                names the files, so the reveal is shown only for a blind session. */}
-            {session?.blind && concludeResult?.reveal && (
+                was. Only a blind session concealed anything, so only a blind
+                conclude carries a reveal; a sighted response has no `reveal` key
+                to render (ADR-0006). */}
+            {concludeResult?.reveal && (
               <div data-testid="reveal" style={{ color: "#8fd6ff", marginTop: 8 }}>
                 <strong>Revealed:</strong>{" "}
                 {concludeResult.reveal.map((c) => (
@@ -814,8 +875,8 @@ export function App() {
                     <strong>{c.label}</strong> was <code>{c.path}</code>
                     {/* Matching on (#32): the measured LUFS and applied gain,
                         held back during the blind session, surface here. */}
-                    {c.measured_lufs !== undefined && c.gain_db !== undefined && (
-                      <> ({c.measured_lufs.toFixed(1)} LUFS, {c.gain_db.toFixed(1)} dB)</>
+                    {c.gain_db !== undefined && (
+                      <> ({formatLufs(c.measured_lufs)}, {c.gain_db.toFixed(1)} dB)</>
                     )}
                   </span>
                 ))}
@@ -843,5 +904,47 @@ export function App() {
 
       {helpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}
     </main>
+  );
+}
+
+/**
+ * The compatibility warnings a sighted session shows (issues #10, #26 story 11):
+ * a duration, sample-rate, or channel-count difference is reported, never
+ * blocking — both files still load and play at their own rate.
+ *
+ * Each warning names only the property it is about. A sample delta is reported
+ * only when the server sent one: across different sample rates a frame delta
+ * counts incomparable units, so the listener gets the rate warning alone rather
+ * than a second, meaningless one beside it.
+ */
+function SessionWarnings({ session }: { session: SightedSession }) {
+  const lanes = lanesOf(session);
+  if (!lanes || lanes.blind) return null;
+  const { A, B } = lanes.byLabel;
+  return (
+    <>
+      {session.duration_mismatch && (
+        <p role="alert" data-testid="duration-mismatch" style={{ color: "#ffcf6b" }}>
+          Duration mismatch: the candidates differ by{" "}
+          {session.duration_delta_samples !== undefined
+            ? `${session.duration_delta_samples} samples (${session.duration_delta_ms.toFixed(1)} ms)`
+            : `${session.duration_delta_ms.toFixed(1)} ms`}
+          . Both still load.
+        </p>
+      )}
+
+      {session.sample_rate_mismatch && (
+        <p role="alert" data-testid="sample-rate-mismatch" style={{ color: "#ffcf6b" }}>
+          Sample-rate mismatch: A is {A.sample_rate} Hz, B is {B.sample_rate} Hz. Both
+          still load.
+        </p>
+      )}
+
+      {session.channel_count_mismatch && (
+        <p role="alert" data-testid="channel-count-mismatch" style={{ color: "#ffcf6b" }}>
+          Channel-count mismatch: A has {A.channels}, B has {B.channels}. Both still load.
+        </p>
+      )}
+    </>
   );
 }
