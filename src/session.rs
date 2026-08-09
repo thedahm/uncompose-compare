@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -31,6 +30,11 @@ pub struct Candidate {
     pub path: String,
     pub sha256: String,
     pub size: u64,
+    /// The manifest asset id this candidate resolved from, in project mode
+    /// (spec #42); `None` for a bare-file launch. Recorded on the candidate.
+    pub asset: Option<String>,
+    /// The manifest project ULID, in project mode; `None` for a bare-file launch.
+    pub project: Option<String>,
     /// Total decoded frames (samples per channel) — the candidate's duration.
     pub frames: u64,
     pub sample_rate: u32,
@@ -145,12 +149,47 @@ impl Loudness {
     }
 }
 
+/// One lane to load: the resolved file, plus the manifest facts a project launch
+/// carries (spec #42) — the expected content hash to check integrity against, and
+/// the asset/project ids to record. A bare-file launch leaves all three `None`.
+pub struct Lane {
+    pub path: std::path::PathBuf,
+    /// The manifest's recorded sha256 for this asset, checked against the bytes on
+    /// disk at load; `None` for a bare-file launch (nothing to check against).
+    pub expected_sha256: Option<String>,
+    pub asset: Option<String>,
+    pub project: Option<String>,
+}
+
+impl Lane {
+    /// A bare-file lane: a path with no manifest facts (bare-file mode, and the
+    /// SRC lane of `--source`).
+    pub fn bare(path: std::path::PathBuf) -> Lane {
+        Lane {
+            path,
+            expected_sha256: None,
+            asset: None,
+            project: None,
+        }
+    }
+}
+
 pub struct Session {
     pub candidates: [Candidate; 2],
+    /// The SRC lane: the candidates' shared source in project mode, or the
+    /// explicit `--source` file in bare-file mode (spec #42). `None` when there is
+    /// no source (bare-file without `--source`, `--exclude-source`, or a project
+    /// pair that shares none). It joins the sample-locked graph and the loudness
+    /// match group, and — unlike A/B — stays identified in a blind session.
+    pub source: Option<Candidate>,
     pub proxies: HashMap<String, Proxy>,
-    /// Per-lane loudness figures when `--loudness-match` is on (aligned with
-    /// `candidates`), else `None` — playback is then faithful as-is (#66).
+    /// Per-lane loudness figures for A and B when `--loudness-match` is on (aligned
+    /// with `candidates`), else `None` — playback is then faithful as-is (#66).
     pub loudness: Option<[Loudness; 2]>,
+    /// The SRC lane's loudness figures when matching is on and a source is present.
+    /// SRC joins the match group (attenuate-to-quietest including the source, #66),
+    /// so the A/B gains above are relative to the quietest of all three lanes.
+    pub source_loudness: Option<Loudness>,
     /// A blind session (`--blind`): the label↔file assignment was shuffled at
     /// load and the served surface conceals every identifying detail (#28). The
     /// record still carries full identities — concealment is a session concern,
@@ -160,27 +199,48 @@ pub struct Session {
 
 impl Session {
     pub fn load(
-        a: &Path,
-        b: &Path,
+        a: Lane,
+        b: Lane,
+        source: Option<Lane>,
         cache: &Cache,
         loudness_match: bool,
         blind: bool,
     ) -> Result<Self, LoadError> {
         let mut proxies = HashMap::new();
         // Blind mode shuffles which file the listener sees as A vs B by an
-        // OS-randomness coin flip, so argument order tells them nothing (#28).
+        // OS-randomness coin flip, so argument order tells them nothing (#28). The
+        // SRC lane is never shuffled — it is the reference, and stays identified.
         let swap = blind && coin_flip()?;
-        let (path_a, path_b) = if swap { (b, a) } else { (a, b) };
-        let (ca, lufs_a) = load_candidate("A", path_a, cache, &mut proxies, loudness_match, blind)?;
-        let (cb, lufs_b) = load_candidate("B", path_b, cache, &mut proxies, loudness_match, blind)?;
-        let loudness = match (lufs_a, lufs_b) {
-            (Some(la), Some(lb)) => Some(match_gains([la, lb])),
-            _ => None,
+        let (lane_a, lane_b) = if swap { (b, a) } else { (a, b) };
+        let (ca, lufs_a) =
+            load_candidate("A", &lane_a, cache, &mut proxies, loudness_match, blind)?;
+        let (cb, lufs_b) =
+            load_candidate("B", &lane_b, cache, &mut proxies, loudness_match, blind)?;
+        // The SRC lane loads identified (blind = false): its audio reference is the
+        // content hash, its metadata rides the payload — concealment is A/B only.
+        let (source, lufs_src) = match source {
+            Some(sl) => {
+                let (c, l) =
+                    load_candidate("SRC", &sl, cache, &mut proxies, loudness_match, false)?;
+                (Some(c), l)
+            }
+            None => (None, None),
+        };
+        let (loudness, source_loudness) = match (lufs_a, lufs_b) {
+            // Matching on: A and B are always measured (a below-gate lane reads
+            // -inf, carried as such). SRC joins the reference search when present.
+            (Some(la), Some(lb)) => {
+                let (ab, src) = match_gains(la, lb, lufs_src);
+                (Some(ab), src)
+            }
+            _ => (None, None),
         };
         let session = Session {
             candidates: [ca, cb],
+            source,
             proxies,
             loudness,
+            source_loudness,
             blind,
         };
         // Blind mode refuses, pre-bind, any pair it cannot honestly conceal:
@@ -304,6 +364,11 @@ impl Session {
         if !self.sample_rate_mismatch() {
             meta["duration_delta_samples"] = json!((a.frames as i64 - b.frames as i64).abs());
         }
+        // The SRC lane, when present: a third identified lane (spec #42), the same
+        // shape as an A/B candidate so the workbench renders it alongside them.
+        if let Some(source) = &self.source {
+            meta["source"] = source.to_json();
+        }
         meta
     }
 
@@ -317,11 +382,19 @@ impl Session {
     /// session applies the same per-lane gains.
     fn to_blind_json(&self) -> Value {
         let [a, b] = &self.candidates;
-        json!({
+        let mut meta = json!({
             "blind": true,
             "candidates": [a.to_blind_json(), b.to_blind_json()],
             "loudness_match": self.blind_loudness_match_json(),
-        })
+        });
+        // Concealment is A/B only (spec #42): the SRC lane is the shared reference
+        // both candidates are compared against, and revealing it discloses nothing
+        // about which candidate is which. It rides the blind payload fully
+        // identified — the same shape a sighted session serves it.
+        if let Some(source) = &self.source {
+            meta["source"] = source.to_json();
+        }
+        meta
     }
 
     /// The `loudness_match` object the record's `playback` carries and the
@@ -350,6 +423,15 @@ impl Session {
                 let mut candidates = Map::new();
                 for (c, l) in self.candidates.iter().zip(figures) {
                     candidates.insert(c.label.to_string(), lane(l));
+                }
+                // SRC joins the match group (spec #42, #66): its own attenuation is
+                // recorded alongside A/B's so the record documents what was done to
+                // every playback lane. In a blind session `lane` is the gain-only
+                // projection, so SRC's measured figure stays concealed too — showing
+                // it would let a listener derive A/B's measured LUFS from the gains
+                // when SRC is the quietest reference.
+                if let (Some(src), Some(sl)) = (&self.source, self.source_loudness) {
+                    candidates.insert(src.label.to_string(), lane(sl));
                 }
                 json!({
                     "enabled": true,
@@ -402,6 +484,14 @@ pub enum LoadError {
     /// content or a duration/rate/channel mismatch. The string already names the
     /// property and both values.
     BlindRefused(String),
+    /// A project-mode asset whose bytes on disk no longer hash to the sha256 the
+    /// manifest records (spec #42). Refused before binding, naming the asset.
+    HashMismatch {
+        asset: String,
+        path: String,
+        expected: String,
+        actual: String,
+    },
     /// OS randomness (`/dev/urandom`) was unavailable when shuffling the blind
     /// labels or minting an opaque audio reference (#28).
     Randomness(std::io::Error),
@@ -423,6 +513,16 @@ impl fmt::Display for LoadError {
                 )
             }
             LoadError::BlindRefused(msg) => write!(f, "{msg}"),
+            LoadError::HashMismatch {
+                asset,
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "asset {asset} ({path}) does not match the manifest: \
+                 expected sha256 {expected}, found {actual}"
+            ),
             LoadError::Randomness(source) => {
                 write!(
                     f,
@@ -435,18 +535,23 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-/// Turn the two candidates' measured LUFS into per-lane match figures (issue
-/// #30): every lane is attenuated by `quietest − lane` decibels, so the louder
-/// lanes come down to the quietest and the quietest gets exactly 0.0. Gains are
-/// always ≤ 0 (never boost, #66). A non-finite reading (a silent lane) is left
-/// at 0 dB and does not drag the reference to −∞.
-fn match_gains(lufs: [f64; 2]) -> [Loudness; 2] {
-    let reference = lufs
-        .iter()
-        .copied()
+/// Turn the lanes' measured LUFS into per-lane match figures (issue #30): every
+/// lane is attenuated by `quietest − lane` decibels, so the louder lanes come
+/// down to the quietest and the quietest gets exactly 0.0. Gains are always ≤ 0
+/// (never boost, #66). A non-finite reading (a silent lane) is left at 0 dB and
+/// does not drag the reference to −∞.
+///
+/// The SRC lane, when present, joins the reference search (spec #42, #66):
+/// attenuate-to-quietest across A, B, *and* the source, so A/B are level-fair
+/// against the reference they are compared to. It returns its own `Loudness`
+/// alongside the A/B pair.
+fn match_gains(a: f64, b: f64, source: Option<f64>) -> ([Loudness; 2], Option<Loudness>) {
+    let reference = [Some(a), Some(b), source]
+        .into_iter()
+        .flatten()
         .filter(|l| l.is_finite())
         .fold(f64::INFINITY, f64::min);
-    lufs.map(|measured_lufs| {
+    let lane = |measured_lufs: f64| {
         let gain_db = if measured_lufs.is_finite() && reference.is_finite() {
             (reference - measured_lufs).min(0.0)
         } else {
@@ -456,7 +561,8 @@ fn match_gains(lufs: [f64; 2]) -> [Loudness; 2] {
             measured_lufs,
             gain_db,
         }
-    })
+    };
+    ([lane(a), lane(b)], source.map(lane))
 }
 
 /// Hash, size, decode, and transcode one input into a `Candidate` plus its
@@ -465,12 +571,13 @@ fn match_gains(lufs: [f64; 2]) -> [Loudness; 2] {
 /// dropped.
 fn load_candidate(
     label: &'static str,
-    path: &Path,
+    lane: &Lane,
     cache: &Cache,
     proxies: &mut HashMap<String, Proxy>,
     measure: bool,
     blind: bool,
 ) -> Result<(Candidate, Option<f64>), LoadError> {
+    let path = lane.path.as_path();
     let display = path.display().to_string();
 
     let mut file = File::open(path).map_err(|source| LoadError::Unreadable {
@@ -486,6 +593,21 @@ fn load_candidate(
 
     let size = bytes.len() as u64;
     let sha256 = hex(&Sha256::digest(&bytes));
+
+    // Integrity (spec #42): in project mode the manifest records each asset's
+    // sha256. The resolved file is hashed here by the existing pipeline, so a
+    // manifest that no longer matches the bytes on disk refuses before the server
+    // binds — naming the asset that drifted.
+    if let Some(expected) = &lane.expected_sha256 {
+        if expected != &sha256 {
+            return Err(LoadError::HashMismatch {
+                asset: lane.asset.clone().unwrap_or_else(|| display.clone()),
+                path: display.clone(),
+                expected: expected.clone(),
+                actual: sha256,
+            });
+        }
+    }
 
     let decoded = decode_pcm(path).map_err(|reason| LoadError::Undecodable {
         path: display.clone(),
@@ -533,6 +655,8 @@ fn load_candidate(
             path: display,
             sha256,
             size,
+            asset: lane.asset.clone(),
+            project: lane.project.clone(),
             frames: decoded.frames(),
             sample_rate: decoded.sample_rate,
             channels: decoded.channels,
@@ -570,7 +694,8 @@ mod tests {
     fn quietest_lane_is_untouched_and_louder_is_attenuated() {
         // B is quieter, so it is the reference: its gain is exactly 0, and the
         // louder A is pulled down by the difference (a negative gain).
-        let [a, b] = match_gains([-11.2, -13.6]);
+        let ([a, b], src) = match_gains(-11.2, -13.6, None);
+        assert!(src.is_none(), "no source lane when none is passed");
         assert_eq!(b.gain_db, 0.0, "the quietest lane keeps 0 dB");
         assert!((a.gain_db - (-2.4)).abs() < 1e-9, "A: {}", a.gain_db);
         assert!(
@@ -585,8 +710,27 @@ mod tests {
     fn a_silent_lane_does_not_drag_the_reference_to_negative_infinity() {
         // A non-finite reading is left at 0 dB and excluded from the reference,
         // so the finite lane still matches to a real gain rather than −∞.
-        let [a, b] = match_gains([f64::NEG_INFINITY, -14.0]);
+        let ([a, b], _) = match_gains(f64::NEG_INFINITY, -14.0, None);
         assert_eq!(a.gain_db, 0.0);
         assert_eq!(b.gain_db, 0.0, "the only finite lane is the reference");
+    }
+
+    #[test]
+    fn the_source_lane_joins_the_reference_search() {
+        // SRC is the quietest lane, so it becomes the 0 dB reference and both A
+        // and B are attenuated down to it (spec #42, #66).
+        let ([a, b], src) = match_gains(-11.2, -13.6, Some(-16.0));
+        let src = src.expect("a source lane");
+        assert_eq!(src.gain_db, 0.0, "the quietest lane (SRC) is the reference");
+        assert!(
+            (a.gain_db - (-16.0 - -11.2)).abs() < 1e-9,
+            "A: {}",
+            a.gain_db
+        );
+        assert!(
+            (b.gain_db - (-16.0 - -13.6)).abs() < 1e-9,
+            "B: {}",
+            b.gain_db
+        );
     }
 }

@@ -10,7 +10,7 @@
  * session's ledger the "found" entry would otherwise be off-screen (story 11).
  */
 import { useEffect, useRef, useState, type MutableRefObject } from "react";
-import { formatTime, type Label } from "./transport";
+import { formatTime, type LaneId } from "./transport";
 import {
   canRedo,
   canUndo,
@@ -41,7 +41,7 @@ export function LedgerSection({
   /** Submit the composer's text — `both` tags both candidates (shift+enter). */
   submitComposer: (both: boolean) => void;
   composerRef: MutableRefObject<HTMLInputElement | null>;
-  live: Label;
+  live: LaneId;
   activePin: string | null;
   setActivePin: (id: string | null) => void;
   /** Seek to an observation and light up its caret/row pair. */
