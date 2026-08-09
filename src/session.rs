@@ -260,26 +260,41 @@ impl Session {
         json!({
             "blind": true,
             "candidates": [a.to_blind_json(), b.to_blind_json()],
-            "loudness_match": self.loudness_match_json(),
+            "loudness_match": self.blind_loudness_match_json(),
         })
     }
 
     /// The `loudness_match` object the record's `playback` carries and the
     /// session advertises (issue #30). Matching on: `enabled: true`, the
     /// `method` string, and a per-label map of `{measured_lufs, gain_db}`.
-    /// Matching off: `{"enabled": false}` — the absence stated, not implied.
     pub fn loudness_match_json(&self) -> Value {
+        self.loudness_match_json_with(|l| {
+            json!({
+                "measured_lufs": finite(l.measured_lufs),
+                "gain_db": finite(l.gain_db),
+            })
+        })
+    }
+
+    /// The `loudness_match` a *blind* session may advertise (issue #32): matching
+    /// on carries only `enabled`, the `method`, and per-label `gain_db` — the gain
+    /// the engine must apply to play the lanes level-fair. The measured LUFS is
+    /// held back: a distinctive loudness figure fingerprints a candidate, so it
+    /// stays concealed until the conclude reveal.
+    fn blind_loudness_match_json(&self) -> Value {
+        self.loudness_match_json_with(|l| json!({ "gain_db": finite(l.gain_db) }))
+    }
+
+    /// Shared scaffolding for the two `loudness_match` projections above: the
+    /// sighted/record shape and the blind one differ only in what each lane
+    /// carries, so `lane` supplies the per-label payload. Matching off is
+    /// `{"enabled": false}` in both — the absence stated, not implied.
+    fn loudness_match_json_with(&self, lane: impl Fn(&Loudness) -> Value) -> Value {
         match &self.loudness {
             Some(figures) => {
                 let mut candidates = Map::new();
                 for (c, l) in self.candidates.iter().zip(figures) {
-                    candidates.insert(
-                        c.label.to_string(),
-                        json!({
-                            "measured_lufs": finite(l.measured_lufs),
-                            "gain_db": finite(l.gain_db),
-                        }),
-                    );
+                    candidates.insert(c.label.to_string(), lane(l));
                 }
                 json!({
                     "enabled": true,
@@ -289,6 +304,16 @@ impl Session {
             }
             None => json!({ "enabled": false }),
         }
+    }
+
+    /// The per-lane loudness figures for the conclude reveal (issue #32), aligned
+    /// with `candidates` and finite-guarded: `(measured_lufs, gain_db)` when
+    /// matching ran, else `None`. A blind session holds the measured figures back
+    /// until this one irreversible event; they equal the numbers the record's
+    /// `playback.loudness_match` carries.
+    pub fn loudness_reveal(&self) -> Option<[(f64, f64); 2]> {
+        self.loudness
+            .map(|figures| figures.map(|l| (finite(l.measured_lufs), finite(l.gain_db))))
     }
 
     /// The labels this session actually loaded — the only candidate references a

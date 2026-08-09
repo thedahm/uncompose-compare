@@ -50,7 +50,8 @@ pub struct Recorder {
 
 /// A successful conclude: where the immutable record landed, and the reveal the
 /// UI displays — the label→file mapping (`{label, path, sha256, size}` per
-/// candidate), identical to what the record carries (#29).
+/// candidate), identical to what the record carries (#29), each lane also
+/// carrying its `{measured_lufs, gain_db}` when loudness matching ran (#32).
 pub struct Conclusion {
     pub path: String,
     pub reveal: Value,
@@ -125,7 +126,9 @@ impl Recorder {
     ///
     /// On success returns where the record landed plus the reveal — the
     /// label→file mapping (`{label, path, sha256, size}` per candidate, identical
-    /// to what was written). A blind session (#29) concealed identity from the
+    /// to what was written), plus each lane's `{measured_lufs, gain_db}` when
+    /// loudness matching ran (#32). A blind session (#29) concealed identity — and,
+    /// composed with matching, the measured loudness figures (#32) — from the
     /// browser until now; the successful write is the one irreversible event, so
     /// the reveal rides its response and nothing before it.
     pub fn conclude(&self, session: &Session, body: &str) -> Result<Conclusion, RecordError> {
@@ -154,9 +157,19 @@ impl Recorder {
 
         let id = new_ulid().map_err(|e| RecordError::Io(e.to_string()))?;
 
-        // The reveal is exactly the trusted candidates the record carries, so the
-        // mapping the UI shows post-conclude cannot diverge from what was written.
-        let reveal = Value::Array(candidates.clone());
+        // The reveal is the trusted candidates the record carries — the mapping the
+        // UI shows post-conclude cannot diverge from what was written — plus, when
+        // loudness matching ran (issue #32), each lane's measured LUFS and applied
+        // gain. A blind session concealed the measured figures until now; they are
+        // shown together with the identities at this one irreversible event.
+        let mut reveal = candidates.clone();
+        if let Some(figures) = session.loudness_reveal() {
+            for (entry, (measured_lufs, gain_db)) in reveal.iter_mut().zip(figures) {
+                entry["measured_lufs"] = json!(measured_lufs);
+                entry["gain_db"] = json!(gain_db);
+            }
+        }
+        let reveal = Value::Array(reveal);
 
         let mut record = json!({
             "schema": self.schema_id,
