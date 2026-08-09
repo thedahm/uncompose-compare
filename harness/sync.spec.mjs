@@ -87,9 +87,21 @@ test("zero-offset render: cross-correlation peak at lag 0", () => {
   expect(result.correlation.peakRatio).toBeGreaterThan(2);
 });
 
-test("crossfade bound: bit-identical output outside the 10 ms window", () => {
+test("static-gain variant: zero-offset render survives distinct per-lane attenuation", () => {
+  // uncompose#66's claim — a constant per-lane gain (what loudness matching,
+  // #30, applies) cannot disturb the sync promise — made a tested fact on every
+  // push. The same zero-offset render runs with distinct lane attenuation (A
+  // −6 dB, B −12 dB); the cross-correlation peak must stay at exactly lag 0.
   expect(result.renderSkipped).toBeFalsy();
-  for (const id of result.identity) {
+  expect(result.attenuated).toBeTruthy();
+  expect(result.attenuated.correlation.bestLag).toBe(0);
+  expect(result.attenuated.correlation.peakRatio).toBeGreaterThan(2);
+});
+
+// The crossfade bound, shared by the faithful render and the static-gain
+// variant: zero mismatches outside the fade window on every channel.
+const expectBitIdentity = (identity) => {
+  for (const id of identity) {
     expect(
       id.preMismatch,
       `ch${id.ch} pre-switch mismatches (first at ${id.firstPre}, maxDiff ${id.maxDiff})`,
@@ -99,4 +111,16 @@ test("crossfade bound: bit-identical output outside the 10 ms window", () => {
       `ch${id.ch} post-fade mismatches (first at ${id.firstPost}, maxDiff ${id.maxDiff})`,
     ).toBe(0);
   }
+};
+
+test("static-gain variant: crossfade bound holds under attenuation", () => {
+  // Constant gain scales the output but never shifts a sample, so bit-identity
+  // outside the fade window survives (compared against the scaled candidate).
+  expect(result.renderSkipped).toBeFalsy();
+  expectBitIdentity(result.attenuated.identity);
+});
+
+test("crossfade bound: bit-identical output outside the 10 ms window", () => {
+  expect(result.renderSkipped).toBeFalsy();
+  expectBitIdentity(result.identity);
 });

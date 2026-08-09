@@ -38,6 +38,15 @@ test("load: both candidates render waveforms in the stage and lane rows", async 
   await expect(page.getByTestId("live-marker-A")).toContainText("●");
 });
 
+test("loudness: the default session runs unmatched, with no matching banner", async ({ page }) => {
+  // Loudness matching is off by default (#66): the global-setup binary launches
+  // without --loudness-match, so the workbench shows faithful as-is playback and
+  // never claims matching is active (issue #30, acceptance: unchanged without
+  // the flag). The --loudness-match banner and figures are asserted at the
+  // process boundary (tests/cli.rs), where a matched session can be launched.
+  await expect(page.getByTestId("loudness-match")).toHaveCount(0);
+});
+
 test("switch: pressing x moves the live candidate from A to B", async ({ page }) => {
   await expect(page.getByTestId("live-lane")).toContainText("A");
   await page.keyboard.press("x");

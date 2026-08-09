@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+ebur128 = "0.1.10"
 flacenc = "0.5"
 hound = "3.5"
 jsonschema = { version = "0.49.8", default-features = false }
@@ -23,6 +24,12 @@ serde_json = "1.0.151"
 sha2 = "0.11"
 symphonia = { version = "0.5", default-features = false, features = ["wav", "flac", "pcm"] }
 tiny_http = "0.12"
+
+[dev-dependencies]
+# The process-boundary tests hash their own fixtures to know what a session must
+# report (and, blind, must never leak) — the same hasher the binary uses, run
+# independently of it.
+sha2 = "0.11"
 
 [profile.release]
 opt-level = "z"

@@ -37,6 +37,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use sha2::Digest;
+
 const BIN: &str = env!("CARGO_BIN_EXE_uncompose-compare");
 
 /// A scratch directory for a test's fixtures, removed on drop.
@@ -71,7 +73,7 @@ impl Drop for TempDir {
 /// filled with deterministic seeded noise — the default fixture shape. Returns
 /// the byte length written.
 fn write_wav(path: &Path, frames: u32, sample_rate: u32, channels: u16, seed: u32) -> u64 {
-    write_wav_fmt(path, frames, sample_rate, channels, 16, false, seed);
+    write_wav_fmt(path, frames, sample_rate, channels, 16, false, seed, 1.0);
     std::fs::metadata(path).expect("wav fixture written").len()
 }
 
@@ -615,6 +617,112 @@ fn session_no_mismatch_when_durations_match() {
 }
 
 #[test]
+fn session_flags_sample_rate_mismatch() {
+    let dir = TempDir::new("rate-mismatch");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    // Same duration (1000 ms) and channel count, differing sample rate only.
+    write_wav(&a, 44_100, 44_100, 2, 3);
+    write_wav(&b, 48_000, 48_000, 2, 4);
+    let server = launch_with(dir, &a, &b);
+
+    let json = session_json(&server);
+    assert!(
+        json.contains("\"sample_rate_mismatch\":true"),
+        "differing sample rates must flag a mismatch: {json}"
+    );
+    // Both values are observable in the payload for the warning to name.
+    assert!(
+        json.contains("\"sample_rate\":44100") && json.contains("\"sample_rate\":48000"),
+        "both sample rates are reported: {json}"
+    );
+    // A sample-rate difference is not a channel difference.
+    assert!(
+        json.contains("\"channel_count_mismatch\":false"),
+        "matched channel counts must not flag a channel mismatch: {json}"
+    );
+    // Nor is it a duration difference: these two fixtures are both exactly one
+    // second long, they just count samples at different rates. The listener is
+    // told the one thing that is true — the rates differ — and not warned a
+    // second time about a "difference" of 3900 samples that is no difference at
+    // all. The frame delta itself is omitted: across rates it counts
+    // incomparable units.
+    let session: serde_json::Value = serde_json::from_str(&json).expect("session json");
+    assert_eq!(
+        session["duration_mismatch"], false,
+        "equal durations at different rates are not a duration mismatch: {json}"
+    );
+    assert!(
+        session.get("duration_delta_samples").is_none(),
+        "a cross-rate frame delta is meaningless and must not be reported: {json}"
+    );
+}
+
+#[test]
+fn session_flags_duration_mismatch_across_sample_rates_by_elapsed_time() {
+    // The other half of the rule above: when the two lanes really are different
+    // lengths, a rate difference must not hide it. 44 100 frames at 44.1 kHz is
+    // 1000 ms; 24 000 frames at 48 kHz is 500 ms.
+    let dir = TempDir::new("rate-and-duration-mismatch");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    write_wav(&a, 44_100, 44_100, 2, 3);
+    write_wav(&b, 24_000, 48_000, 2, 4);
+    let server = launch_with(dir, &a, &b);
+
+    let json = session_json(&server);
+    let session: serde_json::Value = serde_json::from_str(&json).expect("session json");
+    assert_eq!(
+        session["duration_mismatch"], true,
+        "a real length difference is flagged whatever the rates: {json}"
+    );
+    assert_eq!(
+        session["duration_delta_ms"].as_f64(),
+        Some(500.0),
+        "the elapsed-time delta is the one that means something: {json}"
+    );
+}
+
+#[test]
+fn session_flags_channel_count_mismatch() {
+    let dir = TempDir::new("channel-mismatch");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    // Same duration and sample rate, differing channel count only.
+    write_wav(&a, 44_100, 44_100, 1, 3);
+    write_wav(&b, 44_100, 44_100, 2, 4);
+    let server = launch_with(dir, &a, &b);
+
+    let json = session_json(&server);
+    assert!(
+        json.contains("\"channel_count_mismatch\":true"),
+        "differing channel counts must flag a mismatch: {json}"
+    );
+    assert!(
+        json.contains("\"channels\":1") && json.contains("\"channels\":2"),
+        "both channel counts are reported: {json}"
+    );
+    assert!(
+        json.contains("\"sample_rate_mismatch\":false"),
+        "matched sample rates must not flag a rate mismatch: {json}"
+    );
+}
+
+#[test]
+fn session_no_compatibility_mismatch_when_formats_match() {
+    let server = launch(); // two matched fixtures (same rate, channels, duration)
+    let json = session_json(&server);
+    assert!(
+        json.contains("\"sample_rate_mismatch\":false"),
+        "matched sample rates must not flag a mismatch: {json}"
+    );
+    assert!(
+        json.contains("\"channel_count_mismatch\":false"),
+        "matched channel counts must not flag a mismatch: {json}"
+    );
+}
+
+#[test]
 fn session_endpoint_refuses_missing_token() {
     let server = launch();
     let (status, headers, _) = http_get(&server.addr, "/session");
@@ -739,8 +847,15 @@ fn undecodable_file_is_a_clear_error() {
 // --- Issue #11: proxy pipeline, content-hash cache, audio endpoints ---------
 
 /// Write a WAV of arbitrary bit depth and integer/float sample format, mono or
-/// stereo, filled with deterministic seeded noise. A simple `fmt ` chunk (tag 1
-/// integer, tag 3 IEEE float) — enough for symphonia to decode as a source.
+/// stereo, filled with deterministic seeded noise scaled by `amp` (1.0 = full
+/// range). A simple `fmt ` chunk (tag 1 integer, tag 3 IEEE float) — enough for
+/// symphonia to decode as a source.
+///
+/// `amp` is what makes a loudness fixture: two files sharing a seed but written
+/// at different amplitudes are the same noise, one lane quieter, so the match
+/// has an unambiguous louder lane to attenuate. Scaling goes through `f64`, so
+/// `amp = 1.0` reproduces the unscaled sample exactly at every depth.
+#[allow(clippy::too_many_arguments)]
 fn write_wav_fmt(
     path: &Path,
     frames: u32,
@@ -749,6 +864,7 @@ fn write_wav_fmt(
     bits: u16,
     float: bool,
     seed: u32,
+    amp: f64,
 ) {
     let block_align = channels * bits / 8;
     let byte_rate = sample_rate * block_align as u32;
@@ -763,18 +879,29 @@ fn write_wav_fmt(
     fmt.extend_from_slice(&bits.to_le_bytes());
     let mut buf = riff_wave(&fmt, data_len);
 
+    let scaled = |sample: i64| (sample as f64 * amp) as i64;
     let mut next = noise(seed);
     for _ in 0..frames {
         for _ in 0..channels {
             let s = next();
             match (float, bits) {
                 (true, 32) => {
-                    let f = s as f32 / u32::MAX as f32 - 0.5;
+                    let f = (s as f32 / u32::MAX as f32 - 0.5) * amp as f32;
                     buf.extend_from_slice(&f.to_le_bytes());
                 }
-                (false, 16) => buf.extend_from_slice(&((s >> 16) as i16).to_le_bytes()),
-                (false, 24) => buf.extend_from_slice(&s.to_le_bytes()[0..3]),
-                (false, 32) => buf.extend_from_slice(&(s as i32).to_le_bytes()),
+                (false, 16) => {
+                    buf.extend_from_slice(&(scaled((s >> 16) as i16 as i64) as i16).to_le_bytes())
+                }
+                (false, 24) => {
+                    // Sign-extend the low 24 bits, scale, and write the low three
+                    // bytes back — the same bytes as the raw word when amp is 1.
+                    let raw = ((s << 8) as i32) >> 8;
+                    let value = scaled(raw as i64) as i32;
+                    buf.extend_from_slice(&value.to_le_bytes()[0..3]);
+                }
+                (false, 32) => {
+                    buf.extend_from_slice(&(scaled(s as i32 as i64) as i32).to_le_bytes())
+                }
                 other => panic!("unsupported fixture format {other:?}"),
             }
         }
@@ -950,8 +1077,8 @@ fn audio_endpoint_bit_depth_policy() {
         let dir = TempDir::new(tag);
         let a = dir.join("a.wav");
         let b = dir.join("b.wav");
-        write_wav_fmt(&a, 44_100, 48_000, 2, bits, float, 11);
-        write_wav_fmt(&b, 44_100, 48_000, 2, bits, float, 12);
+        write_wav_fmt(&a, 44_100, 48_000, 2, bits, float, 11, 1.0);
+        write_wav_fmt(&b, 44_100, 48_000, 2, bits, float, 12, 1.0);
         let server = launch_with(dir, &a, &b);
 
         let hash = first_sha256(&session_json(&server));
@@ -1244,6 +1371,12 @@ fn conclude_writes_valid_record_with_matching_hashes() {
     // The UI is told where the record landed, and it landed there.
     let response: serde_json::Value = serde_json::from_str(&resp).expect("record response is JSON");
     let reported = response["path"].as_str().expect("response reports a path");
+    // A sighted conclude reveals nothing: it concealed nothing (ADR-0006), and
+    // the page has named both files since load.
+    assert!(
+        response.get("reveal").is_none(),
+        "a sighted conclude carries no reveal: {resp}"
+    );
     let record_path = sole_record(&cwd.path);
     assert_eq!(
         reported,
@@ -1252,10 +1385,14 @@ fn conclude_writes_valid_record_with_matching_hashes() {
     );
 
     let record = validate_record_file(&record_path);
-    // Server-authoritative fields: schema id, ULID, mode, empty playback.
+    // Server-authoritative fields: schema id, ULID, mode, and a playback object
+    // stating loudness matching was off (issue #30 — no `--loudness-match`).
     assert_eq!(record["schema"], RECORD_SCHEMA_ID);
     assert_eq!(record["mode"], "ab");
-    assert_eq!(record["playback"], serde_json::json!({}));
+    assert_eq!(
+        record["playback"],
+        serde_json::json!({ "loudness_match": { "enabled": false } })
+    );
     assert_eq!(
         record["id"].as_str().map(|s| s.len()),
         Some(26),
@@ -1494,6 +1631,194 @@ fn conclude_refuses_records_outside_the_v0_contract() {
     );
 }
 
+// --- Issue #30: loudness matching (BS.1770 measure, static lane gains) --------
+
+/// A 16-bit PCM WAV of seeded noise at `amp` of full range — the loudness
+/// fixture shape, over the one WAV writer every other fixture uses.
+fn write_wav_at(path: &Path, frames: u32, sample_rate: u32, channels: u16, seed: u32, amp: f64) {
+    write_wav_fmt(path, frames, sample_rate, channels, 16, false, seed, amp);
+}
+
+/// A loudness-offset fixture pair: candidate A full-scale, candidate B the same
+/// seeded noise scaled down ~6 dB, so A is unambiguously the louder lane.
+fn loudness_pair(dir: &TempDir) -> (PathBuf, PathBuf) {
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    write_wav_at(&a, 44_100, 44_100, 2, 1, 1.0);
+    write_wav_at(&b, 44_100, 44_100, 2, 1, 0.5);
+    (a, b)
+}
+
+#[test]
+fn loudness_match_session_carries_nonpositive_gains_with_quietest_at_zero() {
+    let dir = TempDir::new("loudness-session");
+    let (a, b) = loudness_pair(&dir);
+    let server = launch_opts(dir, &a, &b, None, &["--loudness-match"]);
+
+    let json = session_json(&server);
+    let session: serde_json::Value = serde_json::from_str(&json).expect("session json");
+    let lm = &session["loudness_match"];
+
+    assert_eq!(lm["enabled"], true, "matching is on: {json}");
+    assert_eq!(
+        lm["method"], "bs1770-integrated",
+        "the method is named: {json}"
+    );
+
+    let ga = lm["candidates"]["A"]["gain_db"].as_f64().expect("A gain");
+    let gb = lm["candidates"]["B"]["gain_db"].as_f64().expect("B gain");
+    // Never boost: every lane's gain is ≤ 0.
+    assert!(ga <= 0.0 && gb <= 0.0, "gains never boost: A={ga} B={gb}");
+    // The quietest lane (B, scaled down) is the reference, untouched at 0 dB;
+    // the louder lane (A) is pulled down below it.
+    assert_eq!(gb, 0.0, "the quietest lane keeps exactly 0.0: {json}");
+    assert!(ga < 0.0, "the louder lane is attenuated: A={ga}");
+
+    // Ordering, not exact figures: A measured louder than B.
+    let la = lm["candidates"]["A"]["measured_lufs"]
+        .as_f64()
+        .expect("A lufs");
+    let lb = lm["candidates"]["B"]["measured_lufs"]
+        .as_f64()
+        .expect("B lufs");
+    assert!(la > lb, "A is measured louder than B: A={la} B={lb}");
+}
+
+#[test]
+fn without_the_flag_the_session_states_matching_off() {
+    let server = launch(); // no --loudness-match
+    let json = session_json(&server);
+    let session: serde_json::Value = serde_json::from_str(&json).expect("session json");
+    assert_eq!(
+        session["loudness_match"],
+        serde_json::json!({ "enabled": false }),
+        "off by default, and the absence is stated: {json}"
+    );
+}
+
+#[test]
+fn loudness_match_record_playback_validates_against_the_pinned_schema() {
+    let cwd = TempDir::new("loudness-record-cwd");
+    let dir = TempDir::new("loudness-record-fixtures");
+    let (a, b) = loudness_pair(&dir);
+    let mut command = Command::new(BIN);
+    command
+        .arg(&a)
+        .arg(&b)
+        .arg("--loudness-match")
+        .current_dir(&cwd.path);
+    let server = serving_from(command, dir);
+
+    let body =
+        r#"{"result": {"preference": "A", "confidence": 3}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(
+        status,
+        200,
+        "a matched session concludes: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    // validate_record_file asserts conformance to the pinned v0 schema shape.
+    let record = validate_record_file(&sole_record(&cwd.path));
+    let lm = &record["playback"]["loudness_match"];
+    assert_eq!(
+        lm["enabled"], true,
+        "the record states matching was on: {record}"
+    );
+    assert_eq!(lm["method"], "bs1770-integrated");
+    assert_eq!(
+        lm["candidates"]["B"]["gain_db"].as_f64(),
+        Some(0.0),
+        "the quietest lane recorded at 0.0: {record}"
+    );
+    assert!(
+        lm["candidates"]["A"]["gain_db"].as_f64().unwrap() < 0.0,
+        "the louder lane recorded attenuated: {record}"
+    );
+}
+
+#[test]
+fn a_lane_below_the_gate_records_a_null_measurement_not_a_zero() {
+    // A silent (or sub-gate) lane reads -inf LUFS from the meter. JSON has no
+    // -inf, and the two ways of writing it down are not equally honest: 0.0 is
+    // the *loudest possible* figure and would be indistinguishable from a real
+    // reading, while null says the true thing — the gate produced no reading.
+    // The gain is still a number (exactly 0 dB: an unmeasurable lane is never
+    // attenuated, and never becomes the match reference).
+    let cwd = TempDir::new("silent-lane-cwd");
+    let dir = TempDir::new("silent-lane-fixtures");
+    let a = dir.join("silent.wav");
+    let b = dir.join("noise.wav");
+    write_wav_at(&a, 44_100, 44_100, 2, 1, 0.0); // digital silence
+    write_wav_at(&b, 44_100, 44_100, 2, 2, 1.0);
+    let mut command = Command::new(BIN);
+    command
+        .arg(&a)
+        .arg(&b)
+        .arg("--loudness-match")
+        .current_dir(&cwd.path);
+    let server = serving_from(command, dir);
+
+    // The session says the same thing the record will.
+    let json = session_json(&server);
+    let session: serde_json::Value = serde_json::from_str(&json).expect("session json");
+    assert_eq!(
+        session["loudness_match"]["candidates"]["A"]["measured_lufs"],
+        serde_json::Value::Null,
+        "the silent lane has no reading to report: {json}"
+    );
+
+    let body =
+        r#"{"result": {"preference": "B", "confidence": 3}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(
+        status,
+        200,
+        "an unmeasurable lane still concludes: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    // validate_record_file asserts conformance to the pinned v0 schema, so this
+    // also pins that the schema admits a null measurement.
+    let record = validate_record_file(&sole_record(&cwd.path));
+    let lm = &record["playback"]["loudness_match"];
+    assert_eq!(
+        lm["candidates"]["A"]["measured_lufs"],
+        serde_json::Value::Null,
+        "the record states the absence rather than inventing 0.0 LUFS: {record}"
+    );
+    assert_eq!(
+        lm["candidates"]["A"]["gain_db"].as_f64(),
+        Some(0.0),
+        "an unmeasurable lane is left untouched: {record}"
+    );
+    assert_eq!(
+        lm["candidates"]["B"]["gain_db"].as_f64(),
+        Some(0.0),
+        "the only measurable lane is the reference: {record}"
+    );
+    assert!(
+        lm["candidates"]["B"]["measured_lufs"].as_f64().is_some(),
+        "the measurable lane still reports its figure: {record}"
+    );
+}
+
+#[test]
+fn without_the_flag_the_record_states_matching_off() {
+    let cwd = TempDir::new("loudness-off-record");
+    let server = launch_recording(&cwd.path, None);
+    let body = r#"{"result": {"preference": null}, "observations": [], "loops": []}"#;
+    let (status, _, _) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(status, 200);
+    let record = validate_record_file(&sole_record(&cwd.path));
+    assert_eq!(
+        record["playback"]["loudness_match"],
+        serde_json::json!({ "enabled": false }),
+        "matching off is stated in the record: {record}"
+    );
+}
+
 #[test]
 fn record_endpoint_enforces_the_privacy_contract() {
     let cwd = TempDir::new("record-guard");
@@ -1521,5 +1846,554 @@ fn record_endpoint_enforces_the_privacy_contract() {
     assert!(
         std::fs::read_dir(&cwd.path).unwrap().next().is_none(),
         "a refused conclude writes no record"
+    );
+}
+
+// --- Issue #28: blind sessions (shuffle, concealment, refusals, reconnection) --
+
+/// The two files' `{sha256, size}` — the identifying strings a blind session of
+/// that pair must never leak, and the ones a sighted session reports. Computed
+/// here from the bytes on disk, so the expectation is an independent oracle
+/// rather than whatever the binary happens to say (and no second server has to
+/// be launched to learn two hashes).
+fn identities(a: &Path, b: &Path) -> [(String, u64); 2] {
+    let identity = |path: &Path| {
+        let bytes = std::fs::read(path).expect("fixture readable");
+        (
+            uncompose_compare::hex(&sha2::Sha256::digest(&bytes)),
+            bytes.len() as u64,
+        )
+    };
+    [identity(a), identity(b)]
+}
+
+/// Assert that a blind response carries no identifying string of either input:
+/// no basename, no fixture path, no content hash, and no decimal file size.
+///
+/// The opaque audio references are blanked first. A reference is 32 hex
+/// characters of OS randomness and an all-digit size like `176444` is itself
+/// valid hex, so scanning the raw text for one can match random noise a few
+/// times in 100 000 runs and fail a session that leaked nothing. The references
+/// are shown non-identifying by construction elsewhere in this file (never the
+/// content hash, never content-derived), so the sweep covers everything else.
+fn assert_no_identity_leak(body: &str, fixture_dir: &str, identities: &[(String, u64); 2]) {
+    let swept = without_audio_refs(body);
+    assert!(!swept.contains("alpha.wav"), "basename A leaked: {body}");
+    assert!(!swept.contains("bravo.wav"), "basename B leaked: {body}");
+    assert!(
+        !swept.contains(fixture_dir),
+        "the fixture path leaked: {body}"
+    );
+    for (sha, size) in identities {
+        assert!(!swept.contains(sha.as_str()), "a sha256 leaked: {body}");
+        assert!(
+            !swept.contains(&size.to_string()),
+            "a decimal size leaked: {body}"
+        );
+    }
+}
+
+/// `body` with any `/audio/<opaque reference>` replaced by a fixed placeholder.
+/// Non-JSON bodies (an error string) pass through untouched — they carry no
+/// reference to blank.
+fn without_audio_refs(body: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    if let Some(candidates) = value["candidates"].as_array_mut() {
+        for candidate in candidates {
+            if candidate.get("audio").is_some() {
+                candidate["audio"] = serde_json::json!("/audio/<opaque>");
+            }
+        }
+    }
+    value.to_string()
+}
+
+#[test]
+fn blind_session_conceals_every_identifying_detail() {
+    // Files kept alive by the test across both a sighted and a blind launch.
+    let files = TempDir::new("blind-files");
+    let a = files.join("alpha.wav");
+    let b = files.join("bravo.wav");
+    write_wav(&a, 44_100, 44_100, 2, 21);
+    write_wav(&b, 44_100, 44_100, 2, 22);
+    let identities = identities(&a, &b);
+
+    let server = launch_opts(TempDir::new("blind-conceal"), &a, &b, None, &["--blind"]);
+    let json = session_json(&server);
+
+    // The blind payload states it is blind and carries only label + duration +
+    // an audio reference per candidate.
+    let s: serde_json::Value = serde_json::from_str(&json).expect("blind session json");
+    assert_eq!(s["blind"], true, "the session states it is blind: {json}");
+    for label in ["A", "B"] {
+        let has = s["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["label"] == label);
+        assert!(has, "blind session labels {label}: {json}");
+    }
+    assert!(
+        json.contains("\"duration_ms\":1000"),
+        "the shared duration is carried: {json}"
+    );
+
+    // The concealment-leak sweep: no basename, path, sha256 hex, or decimal size
+    // of either input appears anywhere in the session payload.
+    assert_no_identity_leak(&json, &files.path.to_string_lossy(), &identities);
+
+    // The audio reference is opaque, not the content hash — and the content-hash
+    // URL is not servable in blind mode.
+    let audio = s["candidates"][0]["audio"].as_str().expect("audio url");
+    let reference = audio.strip_prefix("/audio/").expect("an /audio/ url");
+    for (sha, _) in &identities {
+        assert_ne!(reference, sha, "the audio ref must not be the content hash");
+        let (status, _, _) = http_get(
+            &server.addr,
+            &format!("/audio/{sha}?token={}", server.token),
+        );
+        assert_eq!(
+            status, 404,
+            "a content-hash URL must not serve in blind mode"
+        );
+    }
+
+    // The opaque reference still serves a proxy that decodes.
+    let (status, headers, bytes) =
+        http_get(&server.addr, &format!("{audio}?token={}", server.token));
+    assert_eq!(status, 200, "the opaque audio reference serves the proxy");
+    assert!(!bytes.is_empty(), "the served proxy is non-empty");
+    assert!(
+        headers.contains("audio/"),
+        "the proxy carries an audio content-type: {headers}"
+    );
+}
+
+#[test]
+fn blind_error_bodies_conceal_identity_too() {
+    // Testing decision 1 sweeps "the session payload, any audio URL, or any error
+    // body of a blind session". The refusal paths are the ones that could leak by
+    // accident — a validation failure that echoed the record it refused would hand
+    // back the very paths and hashes the session is concealing — so every error a
+    // running blind session can produce is swept, not just its happy path.
+    let files = TempDir::new("blind-error-files");
+    let a = files.join("alpha.wav");
+    let b = files.join("bravo.wav");
+    write_wav(&a, 44_100, 44_100, 2, 61);
+    write_wav(&b, 44_100, 44_100, 2, 62);
+    let identities = identities(&a, &b);
+    let fixture_dir = files.path.to_string_lossy().to_string();
+
+    let cwd = TempDir::new("blind-error-cwd");
+    let mut command = Command::new(BIN);
+    command
+        .arg(&a)
+        .arg(&b)
+        .arg("--blind")
+        .current_dir(&cwd.path);
+    let server = serving_from(command, TempDir::new("blind-error-hold"));
+    let tokened = format!("/record?token={}", server.token);
+
+    // An unknown audio reference: the 404 an unguessable reference resolves to.
+    let (status, _, body) = http_get(
+        &server.addr,
+        &format!("/audio/{}?token={}", "f".repeat(32), server.token),
+    );
+    assert_eq!(status, 404, "an unknown reference is a 404");
+    assert_no_identity_leak(&String::from_utf8_lossy(&body), &fixture_dir, &identities);
+
+    // A missing token: the blanket refusal body.
+    let (status, _, body) = http_get(&server.addr, "/session");
+    assert_eq!(status, 403, "an untokened request is refused");
+    assert_no_identity_leak(&String::from_utf8_lossy(&body), &fixture_dir, &identities);
+
+    // Every conclude the endpoint can refuse: unparseable, schema-invalid, and a
+    // reference to a candidate this session never loaded. None of them writes a
+    // record, so the session stays concludable and each refusal is independent.
+    let refused = [
+        "not json at all",
+        r#"{"result": {"preference": "A", "confidence": 9}, "observations": [], "loops": []}"#,
+        r#"{"result": {"preference": "A", "confidence": 3}, "observations": "nope", "loops": []}"#,
+        r#"{"result": {"preference": "Z", "confidence": 3}, "observations": [], "loops": []}"#,
+        r#"{"result": {"preference": null}, "observations": [{"at": "2026-08-08T10:00:00Z", "candidate": "Z", "text": "?"}], "loops": []}"#,
+    ];
+    for body in refused {
+        let (status, _, response) = http_post(&server, &tokened, body);
+        let response = String::from_utf8_lossy(&response).to_string();
+        assert_eq!(status, 400, "the endpoint refuses {body}: {response}");
+        assert_no_identity_leak(&response, &fixture_dir, &identities);
+    }
+
+    // Nothing was written, so none of those refusals concluded the session.
+    assert!(
+        std::fs::read_dir(&cwd.path).unwrap().next().is_none(),
+        "a refused conclude writes no record"
+    );
+}
+
+/// Run a blind invocation expected to be refused pre-bind, returning
+/// (exit code, stderr). The caller keeps the fixture files alive.
+fn blind_refusal(a: &Path, b: &Path) -> (Option<i32>, String) {
+    run_expecting_failure(&[a.to_str().unwrap(), b.to_str().unwrap(), "--blind"])
+}
+
+#[test]
+fn blind_refuses_identical_content() {
+    let dir = TempDir::new("blind-identical");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    // Same params and seed => byte-identical => equal sha256.
+    write_wav(&a, 44_100, 44_100, 2, 5);
+    write_wav(&b, 44_100, 44_100, 2, 5);
+    let (code, stderr) = blind_refusal(&a, &b);
+    assert_eq!(code, Some(1), "a blind refusal exits 1");
+    let lc = stderr.to_lowercase();
+    assert!(
+        lc.contains("blind") && lc.contains("identical"),
+        "identical content is named: {stderr}"
+    );
+}
+
+#[test]
+fn blind_refuses_duration_mismatch() {
+    let dir = TempDir::new("blind-duration");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    write_wav(&a, 44_100, 44_100, 2, 1); // 1000 ms
+    write_wav(&b, 33_075, 44_100, 2, 2); // 750 ms
+    let (code, stderr) = blind_refusal(&a, &b);
+    assert_eq!(code, Some(1), "a blind refusal exits 1");
+    let lc = stderr.to_lowercase();
+    assert!(
+        lc.contains("duration") && stderr.contains("1000") && stderr.contains("750"),
+        "duration mismatch names the property and both values: {stderr}"
+    );
+}
+
+#[test]
+fn blind_duration_refusal_names_two_distinguishable_values() {
+    // A one-frame difference is still a refusal, and the message has to name two
+    // values a reader can tell apart — "1000 ms vs 1000 ms" names a mismatch
+    // between two equal numbers, which reads as a bug rather than a reason.
+    let dir = TempDir::new("blind-duration-subms");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    write_wav(&a, 44_100, 44_100, 2, 1);
+    write_wav(&b, 44_101, 44_100, 2, 2); // one frame longer: ~0.023 ms
+    let (code, stderr) = blind_refusal(&a, &b);
+    assert_eq!(code, Some(1), "a blind refusal exits 1");
+    assert!(
+        stderr.to_lowercase().contains("duration"),
+        "the property is named: {stderr}"
+    );
+    assert!(
+        stderr.contains("44100") && stderr.contains("44101"),
+        "both values are named, distinguishably: {stderr}"
+    );
+}
+
+#[test]
+fn blind_refuses_sample_rate_mismatch() {
+    let dir = TempDir::new("blind-rate");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    // Equal duration and channels, differing sample rate only.
+    write_wav(&a, 44_100, 44_100, 2, 1);
+    write_wav(&b, 48_000, 48_000, 2, 2);
+    let (code, stderr) = blind_refusal(&a, &b);
+    assert_eq!(code, Some(1), "a blind refusal exits 1");
+    let lc = stderr.to_lowercase();
+    assert!(
+        lc.contains("sample-rate") && stderr.contains("44100") && stderr.contains("48000"),
+        "sample-rate mismatch names the property and both values: {stderr}"
+    );
+}
+
+#[test]
+fn blind_refuses_channel_count_mismatch() {
+    let dir = TempDir::new("blind-channels");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    // Equal duration and sample rate, differing channel count only.
+    write_wav(&a, 44_100, 44_100, 1, 1);
+    write_wav(&b, 44_100, 44_100, 2, 2);
+    let (code, stderr) = blind_refusal(&a, &b);
+    assert_eq!(code, Some(1), "a blind refusal exits 1");
+    assert!(
+        stderr.to_lowercase().contains("channel-count"),
+        "channel-count mismatch is named: {stderr}"
+    );
+}
+
+#[test]
+fn blind_record_reconnects_labels_to_the_real_hashes() {
+    let cwd = TempDir::new("blind-record-cwd");
+    let files = TempDir::new("blind-record-files");
+    let a = files.join("alpha.wav");
+    let b = files.join("bravo.wav");
+    write_wav(&a, 44_100, 44_100, 2, 31);
+    write_wav(&b, 44_100, 44_100, 2, 32);
+    let identities = identities(&a, &b);
+    let input_hashes: std::collections::HashSet<String> =
+        identities.iter().map(|(sha, _)| sha.clone()).collect();
+
+    let mut command = Command::new(BIN);
+    command
+        .arg(&a)
+        .arg(&b)
+        .arg("--blind")
+        .current_dir(&cwd.path);
+    let server = serving_from(command, TempDir::new("blind-record-hold"));
+
+    let body =
+        r#"{"result": {"preference": "A", "confidence": 4}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(
+        status,
+        200,
+        "a blind session concludes: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let record = validate_record_file(&sole_record(&cwd.path));
+    assert_eq!(
+        record["mode"], "ab-blind-randomized",
+        "the record marks the blind, randomized session: {record}"
+    );
+
+    // Labels {A, B} map bijectively onto the two real input hashes — the record
+    // alone reconnects what the listener saw to what was on disk. (The shuffle
+    // itself is OS randomness; we assert reconnection, not distribution.)
+    let candidates = record["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2);
+    let labels: std::collections::HashSet<&str> = candidates
+        .iter()
+        .map(|c| c["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        labels,
+        std::collections::HashSet::from(["A", "B"]),
+        "both labels present exactly once: {record}"
+    );
+    let recorded: std::collections::HashSet<String> = candidates
+        .iter()
+        .map(|c| c["sha256"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        recorded, input_hashes,
+        "the recorded hashes are exactly the two inputs': {record}"
+    );
+}
+
+#[test]
+fn blind_conclude_reveals_the_mapping_matching_the_record() {
+    // Reveal at conclude (issue #29): the successful conclude response carries the
+    // label→file mapping the UI displays, and it is identical to what the record
+    // on disk carries. The reveal is the single irreversible event's payload — the
+    // browser never received identity before it.
+    let cwd = TempDir::new("blind-reveal-cwd");
+    let files = TempDir::new("blind-reveal-files");
+    let a = files.join("alpha.wav");
+    let b = files.join("bravo.wav");
+    write_wav(&a, 44_100, 44_100, 2, 51);
+    write_wav(&b, 44_100, 44_100, 2, 52);
+
+    let mut command = Command::new(BIN);
+    command
+        .arg(&a)
+        .arg(&b)
+        .arg("--blind")
+        .current_dir(&cwd.path);
+    let server = serving_from(command, TempDir::new("blind-reveal-hold"));
+
+    let body =
+        r#"{"result": {"preference": "A", "confidence": 4}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(
+        status,
+        200,
+        "a blind session concludes: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let response: serde_json::Value =
+        serde_json::from_slice(&resp).expect("conclude response is json");
+    let reveal = response["reveal"]
+        .as_array()
+        .expect("the conclude response reveals the label→file mapping");
+    assert_eq!(reveal.len(), 2, "both labels revealed: {response}");
+
+    // The reveal reconnects each label to its real file, identical to the record.
+    let record = validate_record_file(&sole_record(&cwd.path));
+    let record_candidates = record["candidates"].as_array().unwrap();
+    for label in ["A", "B"] {
+        let r = reveal
+            .iter()
+            .find(|c| c["label"] == label)
+            .unwrap_or_else(|| panic!("reveal names label {label}: {response}"));
+        let rec = record_candidates
+            .iter()
+            .find(|c| c["label"] == label)
+            .unwrap();
+        assert_eq!(
+            r["path"], rec["path"],
+            "reveal path matches record for {label}"
+        );
+        assert_eq!(
+            r["sha256"], rec["sha256"],
+            "reveal sha256 matches record for {label}"
+        );
+        assert_eq!(
+            r["size"], rec["size"],
+            "reveal size matches record for {label}"
+        );
+    }
+}
+
+// --- Issue #32: blind loudness concealment (matching active, numbers hidden) --
+
+#[test]
+fn blind_loudness_conceals_measured_lufs_but_carries_applied_gains() {
+    // `--blind --loudness-match` composes into a level-fair blind test: the
+    // session payload carries no more than the gains the engine must apply. A
+    // measured LUFS figure fingerprints a candidate, so it is held back until the
+    // conclude reveal — the payload states matching is on and gives per-lane
+    // gains, but no `measured_lufs` anywhere.
+    let dir = TempDir::new("blind-loudness-session");
+    let (a, b) = loudness_pair(&dir);
+    let server = launch_opts(dir, &a, &b, None, &["--blind", "--loudness-match"]);
+
+    let json = session_json(&server);
+    let s: serde_json::Value = serde_json::from_str(&json).expect("blind session json");
+    assert_eq!(s["blind"], true, "the session states it is blind: {json}");
+
+    let lm = &s["loudness_match"];
+    assert_eq!(lm["enabled"], true, "matching is active in blind: {json}");
+    assert_eq!(
+        lm["method"], "bs1770-integrated",
+        "the method is named: {json}"
+    );
+
+    // Only the applied gains ride along — never boost, and (the shuffle hides
+    // which label is which file) the quietest lane at exactly 0.0 with the louder
+    // lane attenuated below it.
+    let ga = lm["candidates"]["A"]["gain_db"].as_f64().expect("A gain");
+    let gb = lm["candidates"]["B"]["gain_db"].as_f64().expect("B gain");
+    assert!(ga <= 0.0 && gb <= 0.0, "gains never boost: A={ga} B={gb}");
+    assert!(
+        (ga == 0.0 && gb < 0.0) || (gb == 0.0 && ga < 0.0),
+        "one lane is the 0 dB reference and the other is attenuated: A={ga} B={gb}"
+    );
+
+    // The concealment-leak sweep with matching on: no measured figure — not the
+    // key, not a value — reaches any pre-conclude response.
+    assert!(
+        !json.contains("measured_lufs"),
+        "a measured LUFS figure leaked into the blind session: {json}"
+    );
+}
+
+#[test]
+fn blind_loudness_reveal_and_record_carry_the_full_figures() {
+    // After conclude, the reveal carries the loudness figures alongside the
+    // label→file mapping, and the record's `playback.loudness_match` carries the
+    // full per-label numbers as in sighted mode. The reveal is the one
+    // irreversible event's payload; the browser saw no measured figure before it.
+    let cwd = TempDir::new("blind-loudness-reveal-cwd");
+    let files = TempDir::new("blind-loudness-reveal-files");
+    let (a, b) = loudness_pair(&files);
+
+    let mut command = Command::new(BIN);
+    command
+        .arg(&a)
+        .arg(&b)
+        .arg("--blind")
+        .arg("--loudness-match")
+        .current_dir(&cwd.path);
+    let server = serving_from(command, TempDir::new("blind-loudness-reveal-hold"));
+
+    let body =
+        r#"{"result": {"preference": "A", "confidence": 4}, "observations": [], "loops": []}"#;
+    let (status, _, resp) = http_post(&server, &format!("/record?token={}", server.token), body);
+    assert_eq!(
+        status,
+        200,
+        "a blind matched session concludes: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let response: serde_json::Value =
+        serde_json::from_slice(&resp).expect("conclude response is json");
+    let reveal = response["reveal"].as_array().expect("the reveal mapping");
+
+    // The record carries the full loudness_match object, per-label measured and
+    // applied, exactly as sighted mode.
+    let record = validate_record_file(&sole_record(&cwd.path));
+    assert_eq!(
+        record["mode"], "ab-blind-randomized",
+        "blind record: {record}"
+    );
+    let lm = &record["playback"]["loudness_match"];
+    assert_eq!(
+        lm["enabled"], true,
+        "the record states matching was on: {record}"
+    );
+    assert_eq!(lm["method"], "bs1770-integrated");
+
+    // The reveal reconnects each label to its file *and* its loudness figures,
+    // matching the record on both.
+    for label in ["A", "B"] {
+        let r = reveal
+            .iter()
+            .find(|c| c["label"] == label)
+            .unwrap_or_else(|| panic!("reveal names label {label}: {response}"));
+        let rec_lm = &lm["candidates"][label];
+        assert_eq!(
+            r["measured_lufs"].as_f64(),
+            rec_lm["measured_lufs"].as_f64(),
+            "reveal measured LUFS matches record for {label}: {response}"
+        );
+        assert_eq!(
+            r["gain_db"].as_f64(),
+            rec_lm["gain_db"].as_f64(),
+            "reveal gain matches record for {label}: {response}"
+        );
+    }
+    // The blind shuffle hides which label holds the scaled file, but one lane is
+    // always the 0 dB reference and the other is attenuated below it.
+    let ga = lm["candidates"]["A"]["gain_db"].as_f64().unwrap();
+    let gb = lm["candidates"]["B"]["gain_db"].as_f64().unwrap();
+    assert!(
+        (ga == 0.0 && gb < 0.0) || (gb == 0.0 && ga < 0.0),
+        "one lane is the 0 dB reference and the other attenuated: A={ga} B={gb}"
+    );
+}
+
+#[test]
+fn sighted_mode_is_unaffected_by_the_blind_flag() {
+    // A plain (no --blind) session still carries full metadata and mode "ab".
+    let dir = TempDir::new("blind-sighted-unaffected");
+    let a = dir.join("a.wav");
+    let b = dir.join("b.wav");
+    write_wav(&a, 44_100, 44_100, 2, 41);
+    write_wav(&b, 44_100, 44_100, 2, 42);
+    let server = launch_with(dir, &a, &b);
+    let json = session_json(&server);
+    assert!(
+        json.contains("\"sha256\":\"") && json.contains("\"path\":\""),
+        "a sighted session still carries identities: {json}"
+    );
+    assert!(
+        !json.contains("\"blind\":true"),
+        "a sighted session is not marked blind: {json}"
+    );
+    // The audio URL is still the content-hash URL a sighted session has always
+    // served.
+    let sha = first_sha256(&json);
+    assert!(
+        json.contains(&format!("/audio/{sha}")),
+        "sighted audio is served by content hash: {json}"
     );
 }

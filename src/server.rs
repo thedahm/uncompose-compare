@@ -2,20 +2,18 @@
 //!
 //! The privacy contract holds on every response — loopback bind, per-session
 //! token, Host check, blanket `Cache-Control: no-store`, constant-time token
-//! compare — and covers the `/session`, `/audio/<sha256>`, and `/record`
+//! compare — and covers the `/session`, `/audio/<reference>`, and `/record`
 //! endpoints as well as the embedded bundle.
 
-use std::fs::File;
-use std::io::Read;
 use std::net::SocketAddr;
 
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-use crate::hex;
 use crate::record::Recorder;
 use crate::session::Session;
+use crate::{hex, random_bytes};
 
 /// The Vite/React bundle, embedded at compile time. `build.rs` guarantees the
 /// folder is present and non-empty, so a build that reaches here has assets.
@@ -82,23 +80,36 @@ pub fn serve(mut request: Request, token: &str, session: &Session, recorder: &Re
             return;
         }
         let (status, payload) = match recorder.conclude(session, &body) {
-            Ok(path) => (200, json!({ "path": path })),
+            // The reveal (label→file) rides the successful-write response and
+            // nothing before it — the browser had no identity until now (#29).
+            // A sighted conclude carries no reveal: nothing was concealed.
+            Ok(c) => {
+                let mut payload = json!({ "path": c.path });
+                if let Some(reveal) = c.reveal {
+                    payload["reveal"] = reveal;
+                }
+                (200, payload)
+            }
             Err(e) => (e.status(), json!({ "error": e.to_string() })),
         };
         let _ = request.respond(json_response(status, &payload));
         return;
     }
 
-    // Audio proxy endpoint: resolve strictly through the content-hash table, so a
-    // request names a source hash we already loaded — never a filesystem path.
-    // An unknown hash is a 404, not a chance to read arbitrary files.
-    if let Some(hash) = path.strip_prefix("audio/") {
-        let response = match session.proxies.get(hash) {
+    // Audio proxy endpoint: resolve strictly through the per-session reference
+    // table, so a request names a reference we already loaded — never a
+    // filesystem path. Sighted sessions key by source hash; blind sessions key
+    // by an opaque per-session reference, so a content hash is never servable
+    // (#28) and the shuffle cannot be decoded. An unknown reference is a 404,
+    // not a chance to read arbitrary files.
+    if let Some(reference) = path.strip_prefix("audio/") {
+        let response = match session.proxies.get(reference) {
             Some(proxy) => match std::fs::read(&proxy.path) {
                 Ok(data) => Response::from_data(data)
                     .with_header(header("Content-Type", proxy.container.content_type()))
                     .with_header(header("Cache-Control", "no-store")),
-                // A proxy pruned out from under us resolves like an unknown hash.
+                // A proxy pruned out from under us resolves like an unknown
+                // reference.
                 Err(_) => not_found(),
             },
             None => not_found(),
@@ -138,7 +149,7 @@ fn json_response(status: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>
         .with_header(header("Cache-Control", "no-store"))
 }
 
-/// A 404 for an unknown asset or content hash — like every other response,
+/// A 404 for an unknown asset or audio reference — like every other response,
 /// never cached.
 fn not_found() -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_string("not found")
@@ -187,11 +198,10 @@ fn cookie_token(request: &Request) -> Option<&str> {
         })
 }
 
-/// A per-session token: 16 bytes of OS randomness, hex-encoded. The tool is
-/// Linux-only (spec #1), so `/dev/urandom` is a fine, dependency-free source.
+/// A per-session token: 16 bytes of OS randomness, hex-encoded (`random_bytes`).
 pub fn session_token() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let mut bytes = [0u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    random_bytes(&mut bytes)?;
     Ok(hex(&bytes))
 }
 

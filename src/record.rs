@@ -18,12 +18,13 @@
 use std::cell::Cell;
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use crate::random_bytes;
 use crate::session::Session;
 
 /// The v0 comparison-record JSON Schema, this repo's owned artifact.
@@ -46,6 +47,18 @@ pub struct Recorder {
     /// The session's `created_at`, stamped once at startup (RFC 3339, UTC).
     created_at: String,
     concluded: Cell<bool>,
+}
+
+/// A successful conclude: where the immutable record landed, and — for a blind
+/// session — the reveal the UI displays: the label→file mapping
+/// (`{label, path, sha256, size}` per candidate), identical to what the record
+/// carries (#29), each lane also carrying its `{measured_lufs, gain_db}` when
+/// loudness matching ran (#32). A sighted session reveals nothing: it never
+/// concealed anything, so `reveal` is `None` and the response omits the key
+/// (ADR-0006 — the reveal is the blind session's payload).
+pub struct Conclusion {
+    pub path: String,
+    pub reveal: Option<Value>,
 }
 
 /// Why a conclude was refused, mapped to an HTTP status the UI can act on.
@@ -114,7 +127,15 @@ impl Recorder {
     /// `schema`/`id`/timestamps/`candidates`/`mode`/`playback` (so hashes and
     /// paths can't be forged from the browser); the body supplies only `result`,
     /// `observations`, `loops`, and `context`.
-    pub fn conclude(&self, session: &Session, body: &str) -> Result<String, RecordError> {
+    ///
+    /// On success returns where the record landed plus the reveal — the
+    /// label→file mapping (`{label, path, sha256, size}` per candidate, identical
+    /// to what was written), plus each lane's `{measured_lufs, gain_db}` when
+    /// loudness matching ran (#32). A blind session (#29) concealed identity — and,
+    /// composed with matching, the measured loudness figures (#32) — from the
+    /// browser until now; the successful write is the one irreversible event, so
+    /// the reveal rides its response and nothing before it.
+    pub fn conclude(&self, session: &Session, body: &str) -> Result<Conclusion, RecordError> {
         // Refuse a second conclude before doing any work.
         if self.concluded.get() {
             return Err(RecordError::AlreadyConcluded);
@@ -140,14 +161,38 @@ impl Recorder {
 
         let id = new_ulid().map_err(|e| RecordError::Io(e.to_string()))?;
 
+        // The reveal is the trusted candidates the record carries — the mapping the
+        // UI shows post-conclude cannot diverge from what was written — plus, when
+        // loudness matching ran (issue #32), each lane's measured LUFS and applied
+        // gain. A blind session concealed the measured figures until now; they are
+        // shown together with the identities at this one irreversible event. Only a
+        // blind session has anything to reveal (ADR-0006).
+        let reveal = session.blind.then(|| {
+            let mut reveal = candidates.clone();
+            if let Some(figures) = session.loudness_reveal() {
+                for (entry, lane) in reveal.iter_mut().zip(figures) {
+                    entry["measured_lufs"] = lane.measured_lufs_json();
+                    entry["gain_db"] = lane.gain_db_json();
+                }
+            }
+            Value::Array(reveal)
+        });
+
         let mut record = json!({
             "schema": self.schema_id,
             "id": id,
             "created_at": self.created_at,
             "completed_at": rfc3339(SystemTime::now()),
             "candidates": candidates,
-            "mode": "ab",
-            "playback": {},
+            // Sighted `ab`, or `ab-blind-randomized` when the labels were
+            // shuffled (#28). The candidates above already carry the shuffled
+            // label mapped to each real path/sha256/size, so the record alone
+            // reconnects what the listener saw to what was on disk.
+            "mode": session.mode(),
+            // Playback is server-authoritative (issue #30): the loudness match,
+            // measured and applied server-side, is recorded here — never taken
+            // from the browser's posted body.
+            "playback": { "loudness_match": session.loudness_match_json() },
             "loops": posted.get("loops").cloned().unwrap_or_else(|| json!([])),
             "observations": posted.get("observations").cloned().unwrap_or_else(|| json!([])),
             "result": posted.get("result").cloned().unwrap_or(Value::Null),
@@ -173,7 +218,10 @@ impl Recorder {
 
         // Only a completed write concludes the session; that write is the one.
         self.concluded.set(true);
-        Ok(dest.display().to_string())
+        Ok(Conclusion {
+            path: dest.display().to_string(),
+            reveal,
+        })
     }
 
     /// Write `record` to `dest` atomically, exactly once.
@@ -306,7 +354,7 @@ fn new_ulid() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_default()
         .as_millis();
     let mut rand = [0u8; 10];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut rand)?;
+    random_bytes(&mut rand)?;
     let mut rnd: u128 = 0;
     for &b in &rand {
         rnd = (rnd << 8) | b as u128;

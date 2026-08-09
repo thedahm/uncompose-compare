@@ -3,7 +3,7 @@
   "$id": "https://uncompose.org/schemas/compare/v0/uncompose.compare.schema.json",
   "title": "uncompose comparison record (v0)",
   "type": "object",
-  "required": ["schema", "id", "created_at", "completed_at", "candidates", "mode", "observations", "result"],
+  "required": ["schema", "id", "created_at", "completed_at", "candidates", "mode", "playback", "observations", "result"],
   "additionalProperties": false,
   "properties": {
     "schema": {
@@ -21,7 +21,12 @@
     "mode": { "enum": ["ab", "ab-blind", "ab-blind-randomized"] },
     "playback": {
       "type": "object",
-      "description": "Playback configuration incl. any loudness adjustment applied. Shape owned by uncompose#66."
+      "required": ["loudness_match"],
+      "additionalProperties": false,
+      "description": "Playback configuration incl. any loudness adjustment applied. Shape owned by uncompose#66.",
+      "properties": {
+        "loudness_match": { "$ref": "#/$defs/loudness_match" }
+      }
     },
     "loops": {
       "type": "array",
@@ -40,6 +45,38 @@
   },
   "$defs": {
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "loudness_match": {
+      "type": "object",
+      "required": ["enabled"],
+      "additionalProperties": false,
+      "description": "Loudness matching state (uncompose#66). Off: {\"enabled\": false}. On: enabled true plus method and a per-label map of measured LUFS and applied (non-positive) gain.",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "method": { "type": "string", "description": "Measurement method; \"bs1770-integrated\" in v0.1" },
+        "candidates": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/loudness_candidate" },
+          "description": "Keyed by candidate label"
+        }
+      },
+      "allOf": [
+        {
+          "description": "method and candidates are present exactly when matching is enabled.",
+          "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
+          "then": { "required": ["method", "candidates"] },
+          "else": { "not": { "anyOf": [{ "required": ["method"] }, { "required": ["candidates"] }] } }
+        }
+      ]
+    },
+    "loudness_candidate": {
+      "type": "object",
+      "required": ["measured_lufs", "gain_db"],
+      "additionalProperties": false,
+      "properties": {
+        "measured_lufs": { "type": ["number", "null"], "description": "Measured integrated loudness, LUFS; null when the lane fell below the integrated gate and has no reading" },
+        "gain_db": { "type": "number", "maximum": 0, "description": "Applied gain, dB; always ≤ 0 (attenuate to quietest, never boost)" }
+      }
+    },
     "ext": {
       "type": "object",
       "propertyNames": { "pattern": "^[a-z0-9][a-z0-9._-]*$" },
