@@ -7,6 +7,8 @@ on:
     branches: ["**"]
   pull_request:
   workflow_dispatch:
+  # Called by the release workflow as part of its gate.
+  workflow_call:
 
 jobs:
   build-and-clean-install:
