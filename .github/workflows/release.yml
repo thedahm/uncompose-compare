@@ -65,24 +65,33 @@ jobs:
       - uses: actions/checkout@v4
 
       # Build-time toolchain only (#60): the wheel carries the compiled binary
-      # with the bundle embedded, and nothing else.
+      # with the bundle embedded, and nothing else. rust-embed reads
+      # `frontend/dist` at compile time, so the bundle is built here, on the
+      # runner, before the container build below sees the workspace.
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install maturin
-        run: pipx install maturin || pip install maturin
+      - name: Build the frontend bundle
+        run: npm run build:frontend
 
       # Linux x86_64 only, per the v0.1 platform scope: one wheel, no matrix.
-      - name: Build the wheel
-        run: scripts/build-wheel.sh
+      # Built in the manylinux container rather than on the runner — the same
+      # choice uncompose's own release makes — so the binary is tagged against
+      # an old glibc and runs on machines older than the runner, which a plain
+      # `maturin build` here (what scripts/build-wheel.sh does for local and CI
+      # builds) would quietly rule out.
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --locked --out target/wheels
+          manylinux: auto
 
       - name: Check the wheel is the one this tag names
         run: scripts/check-wheel.sh target/wheels "${{ needs.version.outputs.version }}"
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Prove the wheel installs and serves with no toolchain
         run: scripts/clean-install-proof.sh
 

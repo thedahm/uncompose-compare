@@ -68,13 +68,23 @@ wheel name the repository, workflow, and commit that produced it. Story 23 asks 
 traceability that is verifiable rather than asserted, and this is the form a stranger
 can check from the index alone.
 
-## One Linux wheel, no sdist
+## One Linux wheel, built in the manylinux container, and no sdist
 
-The v0.1 platform scope is Linux x86_64, so there is no matrix. No sdist is published
-either: it would ask a user's machine for a Rust toolchain *and* Node — the two things
-the embedding chain exists to keep out of the install story — and would do it on
-platforms this release does not support, where the absence of a wheel is the clearer
-answer.
+The v0.1 platform scope is Linux x86_64, so there is no matrix. The release build goes
+through `PyO3/maturin-action` with `manylinux: auto`, as uncompose's own release
+workflow does, rather than `scripts/build-wheel.sh`'s plain `maturin build`: on the
+runner the binary is tagged against the runner's glibc, which quietly excludes every
+machine older than it. The frontend bundle is still built on the runner first — the
+container compiles a workspace that already has `frontend/dist` in it, so rust-embed
+finds what `build.rs` insists on. `build-wheel.sh` keeps the simpler build for local and
+CI use, where the point is that packaging works, not the artifact anyone installs.
+
+No sdist is published. Here this repo departs from uncompose's release, which publishes
+one: an sdist of this crate could not be built at all, because it would carry no
+`frontend/dist` and `build.rs` refuses to embed an absent bundle. Even if it could, it
+would ask a user's machine for a Rust toolchain *and* Node — the two things the
+embedding chain exists to keep out of the install story — on platforms this release does
+not support, where the absence of a wheel is the clearer answer.
 
 ## The wheel that was proven is the wheel that is published
 
