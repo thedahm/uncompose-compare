@@ -18,7 +18,8 @@ having the rights to the audio you process.
 Pre-v0.1: the first release is being built in the open on the
 [issue tracker](https://github.com/thedahm/uncompose-compare/issues), with decisions this
 repo owns recorded in [`docs/adr/`](docs/adr/). The install line below goes live with the
-`v0.1.0` tag.
+`v0.1.0` tag. See the [release notes](docs/releases/v0.1.0.md) and
+[known limitations](docs/known-limitations.md) for what v0.1 does and does not do.
 
 ## Install
 
