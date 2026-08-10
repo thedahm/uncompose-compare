@@ -7,8 +7,15 @@ else publishes. The reasoning behind that shape is
 
 ## One-time setup (a human with PyPI access)
 
-The workflow holds no credentials, so PyPI has to be told which workflow it trusts.
-On <https://pypi.org/manage/project/uncompose-compare/settings/publishing/>, add a
+The workflow holds no credentials, so two things have to be arranged by hand once.
+
+**1. The environments.** Under *Settings → Environments*, create `pypi` and `testpypi`.
+No protection rules are needed; they exist so the release job runs under a name PyPI can
+be told to trust. Adding required reviewers to `pypi` later turns a release into a
+two-person action without touching the workflow.
+
+**2. The trusted publishers.** On
+<https://pypi.org/manage/project/uncompose-compare/settings/publishing/>, add a
 GitHub publisher:
 
 | Field            | Value               |
@@ -18,11 +25,9 @@ GitHub publisher:
 | Workflow name    | `release.yml`       |
 | Environment name | `pypi`              |
 
-Repeat on <https://test.pypi.org> with the environment name `testpypi` (register the
+Repeat on <https://test.pypi.org> with the environment name `testpypi` — register the
 project there first if it does not exist, via a pending publisher with the same four
-fields). The two environments already exist in the repository's settings with no
-protection rules; adding required reviewers to `pypi` later turns a release into a
-two-person action without touching the workflow.
+fields.
 
 No API token is ever created. If one exists on the account from an earlier hand-rolled
 release, revoke it — this pipeline cannot use it and nothing else should.
