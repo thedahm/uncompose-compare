@@ -6,12 +6,12 @@
 //! exactly `<dir>/uncompose.project.json` (no upward walk, no plumbing command).
 //! Each positional is a *ref* into that manifest, in one of two v0.1 forms:
 //!
-//! - a bare token is an **asset slug** — the manifest asset whose `slug` matches;
+//! - a bare token is an **asset id** — the manifest asset whose `id` matches;
 //! - `<name>@<derivation>` selects, among that derivation's **output** assets,
 //!   the one whose file basename-stem equals `<name>`.
 //!
 //! A raw path refuses in project mode (the refs are manifest handles, not files).
-//! No-match and ambiguity both list the derivation's outputs with slug and
+//! No-match and ambiguity both list the derivation's outputs with id and
 //! filename, so the message alone tells the listener what they could have named.
 //!
 //! The SRC lane is auto-resolved: the asset that is an input of *both*
@@ -30,12 +30,12 @@ use serde_json::Value;
 /// The manifest filename, fixed under the project root (no upward walk).
 pub const MANIFEST_NAME: &str = "uncompose.project.json";
 
-/// One manifest asset: a content-addressed file with a human slug.
+/// One manifest asset: a content-addressed file. Its `id` is the human handle
+/// (schema v0 types it as a slug), and bare-token refs match it.
 pub struct Asset {
     pub id: String,
-    pub slug: String,
-    /// The asset's file, relative to the project root.
-    pub file: String,
+    /// The asset's file path, relative to the project root.
+    pub path: String,
     pub sha256: String,
 }
 
@@ -43,7 +43,7 @@ impl Asset {
     /// The file's basename-stem — its filename without the final extension. The
     /// `<name>` in a `<name>@<derivation>` ref matches this.
     fn stem(&self) -> String {
-        Path::new(&self.file)
+        Path::new(&self.path)
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default()
@@ -67,7 +67,7 @@ pub struct Manifest {
 }
 
 /// A ref resolved to a concrete asset, plus the derivation it was selected
-/// through (`Some` for the `name@derivation` form, `None` for a bare slug — the
+/// through (`Some` for the `name@derivation` form, `None` for a bare id — the
 /// shared-source search then looks up the asset's producers itself).
 pub struct Resolved<'a> {
     pub asset: &'a Asset,
@@ -77,7 +77,7 @@ pub struct Resolved<'a> {
 impl Resolved<'_> {
     /// The asset's absolute file path, under the project root.
     pub fn path(&self, manifest: &Manifest) -> PathBuf {
-        manifest.root.join(&self.asset.file)
+        manifest.root.join(&self.asset.path)
     }
 }
 
@@ -127,7 +127,7 @@ impl Manifest {
     }
 
     /// Resolve one positional ref (v0.1 grammar). A raw path refuses; a bare token
-    /// is an asset slug; `<name>@<derivation>` selects among that derivation's
+    /// is an asset id; `<name>@<derivation>` selects among that derivation's
     /// outputs by basename-stem.
     pub fn resolve(&self, token: &str) -> Result<Resolved<'_>, ProjectError> {
         if token.contains('/') || token.contains('\\') {
@@ -138,25 +138,26 @@ impl Manifest {
 
         match token.split_once('@') {
             Some((name, deriv_id)) => self.resolve_in_derivation(name, deriv_id),
-            None => self.resolve_slug(token),
+            None => self.resolve_id(token),
         }
     }
 
-    fn resolve_slug(&self, slug: &str) -> Result<Resolved<'_>, ProjectError> {
-        let matches: Vec<&Asset> = self.assets.iter().filter(|a| a.slug == slug).collect();
+    fn resolve_id(&self, id: &str) -> Result<Resolved<'_>, ProjectError> {
+        // Ids are the manifest's identity and unique in anything
+        // uncompose-project writes; the many-branch is defence against a
+        // hand-edited manifest, phrased like every other ambiguity.
+        let matches: Vec<&Asset> = self.assets.iter().filter(|a| a.id == id).collect();
         match matches.as_slice() {
             [] => Err(ProjectError::NoMatch(format!(
-                "no asset with slug {slug:?} in the project. Known slugs: {}",
-                self.slug_list()
+                "no asset with id {id:?} in the project. Known ids: {}",
+                self.id_list()
             ))),
             [asset] => Ok(Resolved {
                 asset,
                 derivation: None,
             }),
-            // The slug is what collided, so it names every match equally — the
-            // asset id is the field that tells them apart here.
             many => Err(ProjectError::Ambiguous(format!(
-                "slug {slug:?} names {} assets: {}",
+                "id {id:?} names {} assets: {}",
                 many.len(),
                 asset_listing(many, |a| a.id.as_str())
             ))),
@@ -240,7 +241,7 @@ impl Manifest {
 
     /// The input asset ids of a resolved candidate's producing derivations: the
     /// explicit derivation for a `name@derivation` ref, else every derivation that
-    /// outputs the bare-slug asset.
+    /// outputs the bare-id asset.
     fn producer_inputs(&self, resolved: &Resolved<'_>) -> Vec<String> {
         let producers: Vec<&Derivation> = match resolved.derivation {
             Some(d) => vec![d],
@@ -260,11 +261,11 @@ impl Manifest {
         self.assets.iter().find(|a| a.id == id)
     }
 
-    fn slug_list(&self) -> String {
-        let mut slugs: Vec<&str> = self.assets.iter().map(|a| a.slug.as_str()).collect();
-        slugs.sort_unstable();
-        slugs.dedup();
-        slugs.join(", ")
+    fn id_list(&self) -> String {
+        let mut ids: Vec<&str> = self.assets.iter().map(|a| a.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.join(", ")
     }
 
     fn derivation_list(&self) -> String {
@@ -278,20 +279,19 @@ impl Manifest {
 
 /// Render assets as `<lead> (filename)` pairs — the one listing shape every
 /// resolution error uses, so a listener reads the same thing everywhere. `lead`
-/// picks the field that actually distinguishes the entries: the slug for a
-/// derivation's outputs (the handle a ref would name), the id when the slug is
-/// what collided.
+/// is the asset id today; the parenthesised path is what tells entries apart
+/// when the ids themselves collided.
 fn asset_listing(assets: &[&Asset], lead: impl Fn(&Asset) -> &str) -> String {
     assets
         .iter()
-        .map(|a| format!("{} ({})", lead(a), a.file))
+        .map(|a| format!("{} ({})", lead(a), a.path))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// A derivation's outputs, listed by the slug a ref would name.
+/// A derivation's outputs, listed by the id a ref would name.
 fn outputs_listing(outputs: &[&Asset]) -> String {
-    asset_listing(outputs, |a| a.slug.as_str())
+    asset_listing(outputs, |a| a.id.as_str())
 }
 
 fn parse_assets(value: &Value, display: &str) -> Result<Vec<Asset>, ProjectError> {
@@ -316,8 +316,7 @@ fn parse_assets(value: &Value, display: &str) -> Result<Vec<Asset>, ProjectError
             };
             Ok(Asset {
                 id: field("id")?,
-                slug: field("slug")?,
-                file: field("file")?,
+                path: field("path")?,
                 sha256: field("sha256")?,
             })
         })
@@ -326,7 +325,7 @@ fn parse_assets(value: &Value, display: &str) -> Result<Vec<Asset>, ProjectError
 
 fn parse_derivations(value: &Value, display: &str) -> Result<Vec<Derivation>, ProjectError> {
     // Derivations are optional: a manifest of bare assets with no processing
-    // graph resolves slugs fine (and simply never grows an SRC lane).
+    // graph resolves bare ids fine (and simply never grows an SRC lane).
     let Some(array) = value.get("derivations") else {
         return Ok(Vec::new());
     };
@@ -430,7 +429,7 @@ impl fmt::Display for ProjectError {
             ProjectError::RawPath { token } => write!(
                 f,
                 "{token:?} looks like a path, but --project takes manifest refs \
-                 (an asset slug, or name@derivation)"
+                 (an asset id, or name@derivation)"
             ),
             ProjectError::NoMatch(msg)
             | ProjectError::Ambiguous(msg)
@@ -468,9 +467,9 @@ mod tests {
         from_json(serde_json::json!({
             "project": {"id": "01PROJECT", "name": "take", "created_at": "2026-01-01T00:00:00Z"},
             "assets": [
-                {"id": "raw", "slug": "raw", "file": "src/take.wav", "sha256": "a".repeat(64)},
-                {"id": "mix-a", "slug": "mix-a", "file": "out/vocals.wav", "sha256": "b".repeat(64)},
-                {"id": "mix-b", "slug": "mix-b", "file": "out/vocals.flac", "sha256": "c".repeat(64)}
+                {"id": "raw", "path": "src/take.wav", "sha256": "a".repeat(64)},
+                {"id": "mix-a", "path": "out/vocals.wav", "sha256": "b".repeat(64)},
+                {"id": "mix-b", "path": "out/vocals.flac", "sha256": "c".repeat(64)}
             ],
             "derivations": [
                 {"id": "deriv-a", "inputs": ["raw"], "outputs": ["mix-a"]},
@@ -479,18 +478,17 @@ mod tests {
         }))
     }
 
-    /// A manifest where each ambiguity is reachable: two assets share the slug
-    /// `raw`, one derivation outputs two files sharing the basename-stem
-    /// `vocals`, and that derivation takes *both* raws as input — so the two
-    /// mixes share two possible sources.
+    /// A manifest where each reachable ambiguity is present: one derivation
+    /// outputs two files sharing the basename-stem `vocals`, and it takes
+    /// *both* raws as input — so the two mixes share two possible sources.
     fn ambiguous_manifest() -> Manifest {
         from_json(serde_json::json!({
             "project": {"id": "01AMBIGUOUS", "name": "take", "created_at": "2026-01-01T00:00:00Z"},
             "assets": [
-                {"id": "raw-1", "slug": "raw", "file": "src/take-1.wav", "sha256": "a".repeat(64)},
-                {"id": "raw-2", "slug": "raw", "file": "src/take-2.wav", "sha256": "b".repeat(64)},
-                {"id": "mix-a", "slug": "mix-a", "file": "out/a/vocals.wav", "sha256": "c".repeat(64)},
-                {"id": "mix-b", "slug": "mix-b", "file": "out/b/vocals.wav", "sha256": "d".repeat(64)}
+                {"id": "raw-1", "path": "src/take-1.wav", "sha256": "a".repeat(64)},
+                {"id": "raw-2", "path": "src/take-2.wav", "sha256": "b".repeat(64)},
+                {"id": "mix-a", "path": "out/a/vocals.wav", "sha256": "c".repeat(64)},
+                {"id": "mix-b", "path": "out/b/vocals.wav", "sha256": "d".repeat(64)}
             ],
             "derivations": [
                 {"id": "mix", "inputs": ["raw-1", "raw-2"], "outputs": ["mix-a", "mix-b"]}
@@ -499,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_slug_resolves_to_the_asset() {
+    fn a_bare_id_resolves_to_the_asset() {
         let m = manifest();
         let r = m.resolve("raw").unwrap();
         assert_eq!(r.asset.id, "raw");
@@ -542,27 +540,18 @@ mod tests {
     }
 
     #[test]
-    fn a_ref_matching_several_assets_is_ambiguous_and_lists_them() {
-        let m = ambiguous_manifest();
-
-        // Two assets carry the slug `raw`: the slug names them both equally, so
-        // the listing leads with the ids that tell them apart.
-        let Err(ProjectError::Ambiguous(msg)) = m.resolve("raw") else {
-            panic!("a duplicated slug is ambiguous");
-        };
-        assert!(
-            msg.contains("raw-1 (src/take-1.wav)") && msg.contains("raw-2 (src/take-2.wav)"),
-            "the colliding assets are listed: {msg}"
-        );
-
+    fn outputs_sharing_a_basename_stem_are_ambiguous_and_listed() {
         // Two outputs of one derivation share the basename-stem `vocals`, which
-        // the `<name>@<derivation>` form cannot tell apart.
+        // the `<name>@<derivation>` form cannot tell apart. (Duplicate asset
+        // ids are not a reachable ambiguity: the id is the manifest's identity
+        // and uncompose-project keeps it unique.)
+        let m = ambiguous_manifest();
         let Err(ProjectError::Ambiguous(msg)) = m.resolve("vocals@mix") else {
             panic!("two outputs sharing a basename-stem are ambiguous");
         };
         assert!(
             msg.contains("mix-a (out/a/vocals.wav)") && msg.contains("mix-b (out/b/vocals.wav)"),
-            "the colliding outputs are listed by slug and filename: {msg}"
+            "the colliding outputs are listed by id and filename: {msg}"
         );
     }
 
