@@ -1,0 +1,130 @@
+name: release
+
+# Pushing a `vX.Y.Z` tag publishes that version to PyPI, and nothing else does.
+# One run carries the release end to end so it can be read as one audit trail:
+# refuse a tag that disagrees with the source version, run the repo's own gates,
+# build the wheel (Vite bundle -> rust-embed -> maturin, so Node is a build-time
+# tool only and the published wheel needs none), prove it pip-installs and
+# serves with no toolchain in sight, and upload it with Trusted Publishing. No
+# API token exists in this repo, so there is none to leak — the publish job
+# authenticates with a short-lived OIDC token PyPI exchanges for the right to
+# upload this project from this workflow.
+#
+# uncompose#97 (M6 slice 3); decided in ADR-0011 and uncompose ADR-0008.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  # Rehearsal. The same jobs, on demand, from any ref: `none` stops after the
+  # wheel is built and proven, `testpypi` also publishes it to TestPyPI.
+  workflow_dispatch:
+    inputs:
+      index:
+        description: Index to publish the rehearsal build to
+        type: choice
+        options: [none, testpypi]
+        default: none
+
+# Nothing here writes to the repository. The publish job adds `id-token: write`
+# for OIDC, and only that job.
+permissions:
+  contents: read
+
+jobs:
+  version:
+    # First, so a mis-tagged release costs a few seconds rather than a build.
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            version="$(scripts/release-version.sh "$GITHUB_REF")"
+          else
+            version="$(scripts/release-version.sh)"
+          fi
+          echo "releasing version $version" >> "$GITHUB_STEP_SUMMARY"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  ci:
+    # The repo's gates, run as the repo itself defines them. A tag that does not
+    # pass cannot ship.
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  packaging:
+    needs: version
+    uses: ./.github/workflows/packaging.yml
+
+  build:
+    needs: [version, ci, packaging]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build-time toolchain only (#60): the wheel carries the compiled binary
+      # with the bundle embedded, and nothing else. rust-embed reads
+      # `frontend/dist` at compile time, so the bundle is built here, on the
+      # runner, before the container build below sees the workspace.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build the frontend bundle
+        run: npm run build:frontend
+
+      # Linux x86_64 only, per the v0.1 platform scope: one wheel, no matrix.
+      # Built in the manylinux container rather than on the runner — the same
+      # choice uncompose's own release makes — so the binary is tagged against
+      # an old glibc and runs on machines older than the runner, which a plain
+      # `maturin build` here (what scripts/build-wheel.sh does for local and CI
+      # builds) would quietly rule out.
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --locked --out target/wheels
+          manylinux: auto
+
+      - name: Check the wheel is the one this tag names
+        run: scripts/check-wheel.sh target/wheels "${{ needs.version.outputs.version }}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Prove the wheel installs and serves with no toolchain
+        run: scripts/clean-install-proof.sh
+
+      # The publish job uploads this artifact and never rebuilds, so the wheel
+      # that was proven is the wheel that is published.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: target/wheels/*.whl
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    if: github.event_name == 'push' || inputs.index == 'testpypi'
+    runs-on: ubuntu-latest
+    environment:
+      # The Trusted Publisher on each index is configured for this workflow file
+      # *and* this environment name, so a run of some other workflow — or of
+      # this one against the wrong index — cannot mint a usable token.
+      name: ${{ github.event_name == 'push' && 'pypi' || 'testpypi' }}
+      url: ${{ github.event_name == 'push' && 'https://pypi.org/p/uncompose-compare' || 'https://test.pypi.org/p/uncompose-compare' }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ github.event_name == 'push' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          # PEP 740 attestations, signed with the same OIDC identity: the
+          # published wheel names the repository, workflow, and commit that
+          # built it, so its provenance is checkable from the index alone.
+          attestations: true
+          print-hash: true

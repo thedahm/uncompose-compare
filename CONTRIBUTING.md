@@ -35,6 +35,14 @@ observe, never at internals:
 
 Fixtures are deterministic seeded noise generated at test time — never committed audio.
 
+## Releasing
+
+Releases are automated: pushing a `vX.Y.Z` tag runs the repo's gates, builds the wheel
+with the frontend embedded, and publishes it to PyPI with Trusted Publishing — no
+credential is stored in this repo. [`docs/releasing.md`](docs/releasing.md) is the
+runbook (including how to rehearse against TestPyPI first); the reasoning is
+[ADR-0011](docs/adr/0011-tag-driven-trusted-release-automation.md).
+
 ## Governance
 
 Uncompose Compare is created and maintained by Dominic Hanzely

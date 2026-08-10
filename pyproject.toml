@@ -4,15 +4,28 @@ build-backend = "maturin"
 
 [project]
 name = "uncompose-compare"
-version = "0.1.0"
-description = "Spike 2: a Vite/React stub embedded in a Rust binary, shipped as a maturin wheel and served over loopback."
+description = "Local-first A/B listening workbench for two audio files, keeping a portable record of the evaluation."
+readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
+authors = [{ name = "Dominic Hanzely" }]
+keywords = ["audio", "listening", "comparison", "uncompose"]
 classifiers = [
-    "Private :: Do Not Upload",
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Rust",
+    "Topic :: Multimedia :: Sound/Audio",
 ]
+# The version lives in Cargo.toml and nowhere else: maturin reads it from there,
+# and the release pipeline checks the tag against that one number (ADR-0011). A
+# second copy here would be a second thing to get wrong.
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/thedahm/uncompose-compare"
+Repository = "https://github.com/thedahm/uncompose-compare"
 
 # maturin ships the compiled Rust binary (Cargo `[[bin]] uncompose-compare`) as a
 # wheel script entry point — no Python code, no extension module. `bindings = "bin"`

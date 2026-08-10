@@ -9,6 +9,9 @@ on:
     branches: ["**"]
   pull_request:
   workflow_dispatch:
+  # The release workflow runs this one as its gate, so "the full suite passed"
+  # and "CI passed" can never mean two different things.
+  workflow_call:
 
 jobs:
   web:
@@ -48,3 +51,13 @@ jobs:
       # The process-boundary suite launches the compiled binary; a throwaway
       # XDG cache keeps it off the runner's home directory either way.
       - run: cargo test
+
+  release-checks:
+    # The guards the release workflow puts in front of `publish` — a tag that
+    # disagrees with the source version, a wheel that isn't the one the tag
+    # names. Seconds, no toolchain, so they are gated on every change rather
+    # than discovered at a release.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/release-checks.test.sh
