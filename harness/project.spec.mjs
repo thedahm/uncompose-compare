@@ -54,7 +54,11 @@ test.beforeAll(async () => {
   copyFileSync(path.join(fixtures, "b.wav"), path.join(projectRoot, "mix-b.wav"));
   const manifest = {
     schema: "https://uncompose.org/schemas/project/v0/uncompose.project.json",
-    id: "01PROJECTFLOWULID0000000000",
+    project: {
+      id: "01PROJECTFLOWULID0000000000",
+      name: "take",
+      created_at: "2026-01-01T00:00:00Z",
+    },
     assets: [
       {
         id: "mix-a",

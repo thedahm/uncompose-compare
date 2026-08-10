@@ -105,10 +105,14 @@ impl Manifest {
             ProjectError::manifest_invalid(&display, format!("not valid JSON: {e}"))
         })?;
 
+        // The project's identity lives at `project.id` (schema v0), not at the
+        // top level of the manifest.
         let id = value
-            .get("id")
+            .pointer("/project/id")
             .and_then(Value::as_str)
-            .ok_or_else(|| ProjectError::manifest_invalid(&display, "missing string \"id\""))?
+            .ok_or_else(|| {
+                ProjectError::manifest_invalid(&display, "missing string \"project.id\"")
+            })?
             .to_string();
 
         let assets = parse_assets(&value, &display)?;
@@ -453,7 +457,7 @@ mod tests {
 
     fn from_json(value: Value) -> Manifest {
         Manifest {
-            id: value["id"].as_str().unwrap().to_string(),
+            id: value["project"]["id"].as_str().unwrap().to_string(),
             assets: parse_assets(&value, "test").unwrap(),
             derivations: parse_derivations(&value, "test").unwrap(),
             root: PathBuf::from("/proj"),
@@ -462,7 +466,7 @@ mod tests {
 
     fn manifest() -> Manifest {
         from_json(serde_json::json!({
-            "id": "01PROJECT",
+            "project": {"id": "01PROJECT", "name": "take", "created_at": "2026-01-01T00:00:00Z"},
             "assets": [
                 {"id": "raw", "slug": "raw", "file": "src/take.wav", "sha256": "a".repeat(64)},
                 {"id": "mix-a", "slug": "mix-a", "file": "out/vocals.wav", "sha256": "b".repeat(64)},
@@ -481,7 +485,7 @@ mod tests {
     /// mixes share two possible sources.
     fn ambiguous_manifest() -> Manifest {
         from_json(serde_json::json!({
-            "id": "01AMBIGUOUS",
+            "project": {"id": "01AMBIGUOUS", "name": "take", "created_at": "2026-01-01T00:00:00Z"},
             "assets": [
                 {"id": "raw-1", "slug": "raw", "file": "src/take-1.wav", "sha256": "a".repeat(64)},
                 {"id": "raw-2", "slug": "raw", "file": "src/take-2.wav", "sha256": "b".repeat(64)},

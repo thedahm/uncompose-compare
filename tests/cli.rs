@@ -2480,7 +2480,7 @@ fn build_project() -> Project {
     let b_sha = wav_asset(&dir.path, "out/b/vocals.wav", 3, 1.0);
     let manifest = serde_json::json!({
         "schema": "https://uncompose.org/schemas/project/v0/uncompose.project.json",
-        "id": id,
+        "project": {"id": id, "name": "take", "created_at": "2026-01-01T00:00:00Z"},
         "assets": [
             {"id": "raw", "slug": "raw", "file": "src/take.wav", "sha256": raw_sha},
             {"id": "mix-a", "slug": "mix-a", "file": "out/a/vocals.wav", "sha256": a_sha},
@@ -2513,7 +2513,7 @@ fn build_ambiguous_project() -> Project {
     let b_sha = wav_asset(&dir.path, "out/b/vocals.wav", 24, 1.0);
     let manifest = serde_json::json!({
         "schema": "https://uncompose.org/schemas/project/v0/uncompose.project.json",
-        "id": id,
+        "project": {"id": id, "name": "take", "created_at": "2026-01-01T00:00:00Z"},
         "assets": [
             {"id": "raw-1", "slug": "raw", "file": "src/take-1.wav", "sha256": raw1_sha},
             {"id": "raw-2", "slug": "raw", "file": "src/take-2.wav", "sha256": raw2_sha},
