@@ -51,7 +51,7 @@ struct Cli {
 
     /// Project mode (spec #42): resolve the two positionals as manifest refs
     /// against `<DIR>/uncompose.project.json` instead of as file paths. A ref is
-    /// an asset slug, or `<name>@<derivation>`. The candidates' shared source
+    /// an asset id, or `<name>@<derivation>`. The candidates' shared source
     /// becomes the SRC lane unless `--exclude-source` is passed.
     #[arg(long, value_name = "DIR")]
     project: Option<PathBuf>,
@@ -150,7 +150,7 @@ fn resolve_lanes(
     } else {
         match manifest.shared_source(&ra, &rb)? {
             Some(asset) => Some(Lane {
-                path: project_dir.join(&asset.file),
+                path: project_dir.join(&asset.path),
                 expected_sha256: Some(asset.sha256.clone()),
                 // SRC is a playback lane, not a comparison candidate — it never
                 // enters the record's `candidates[]`, so it carries no recorded

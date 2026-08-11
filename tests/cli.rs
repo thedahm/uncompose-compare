@@ -2482,9 +2482,9 @@ fn build_project() -> Project {
         "schema": "https://uncompose.org/schemas/project/v0/uncompose.project.json",
         "project": {"id": id, "name": "take", "created_at": "2026-01-01T00:00:00Z"},
         "assets": [
-            {"id": "raw", "slug": "raw", "file": "src/take.wav", "sha256": raw_sha},
-            {"id": "mix-a", "slug": "mix-a", "file": "out/a/vocals.wav", "sha256": a_sha},
-            {"id": "mix-b", "slug": "mix-b", "file": "out/b/vocals.wav", "sha256": b_sha}
+            {"id": "raw", "path": "src/take.wav", "sha256": raw_sha},
+            {"id": "mix-a", "path": "out/a/vocals.wav", "sha256": a_sha},
+            {"id": "mix-b", "path": "out/b/vocals.wav", "sha256": b_sha}
         ],
         "derivations": [
             {"id": "deriv-a", "inputs": ["raw"], "outputs": ["mix-a"]},
@@ -2499,11 +2499,10 @@ fn build_project() -> Project {
     Project { dir, id }
 }
 
-/// A project where every ambiguity is reachable: two assets share the slug
-/// `raw`, one derivation outputs two files sharing the basename-stem `vocals`,
-/// and that derivation takes *both* raws as input — so the two mixes share two
-/// possible sources. The counterpart to `build_project`, which is unambiguous
-/// throughout.
+/// A project where every reachable ambiguity is present: one derivation
+/// outputs two files sharing the basename-stem `vocals`, and it takes *both*
+/// raws as input — so the two mixes share two possible sources. The
+/// counterpart to `build_project`, which is unambiguous throughout.
 fn build_ambiguous_project() -> Project {
     let dir = TempDir::new("project-ambiguous");
     let id = "01AMBIGUOUSULID0000000000000".to_string();
@@ -2515,10 +2514,10 @@ fn build_ambiguous_project() -> Project {
         "schema": "https://uncompose.org/schemas/project/v0/uncompose.project.json",
         "project": {"id": id, "name": "take", "created_at": "2026-01-01T00:00:00Z"},
         "assets": [
-            {"id": "raw-1", "slug": "raw", "file": "src/take-1.wav", "sha256": raw1_sha},
-            {"id": "raw-2", "slug": "raw", "file": "src/take-2.wav", "sha256": raw2_sha},
-            {"id": "mix-a", "slug": "mix-a", "file": "out/a/vocals.wav", "sha256": a_sha},
-            {"id": "mix-b", "slug": "mix-b", "file": "out/b/vocals.wav", "sha256": b_sha}
+            {"id": "raw-1", "path": "src/take-1.wav", "sha256": raw1_sha},
+            {"id": "raw-2", "path": "src/take-2.wav", "sha256": raw2_sha},
+            {"id": "mix-a", "path": "out/a/vocals.wav", "sha256": a_sha},
+            {"id": "mix-b", "path": "out/b/vocals.wav", "sha256": b_sha}
         ],
         "derivations": [
             {"id": "mix", "inputs": ["raw-1", "raw-2"], "outputs": ["mix-a", "mix-b"]}
@@ -2654,8 +2653,8 @@ fn project_opens_a_three_lane_session_and_records_asset_ids() {
 }
 
 #[test]
-fn project_bare_slug_resolves_and_omits_absent_source() {
-    // Bare-slug refs resolve to assets, and a pair that shares no producing-
+fn project_bare_id_resolves_and_omits_absent_source() {
+    // Bare-id refs resolve to assets, and a pair that shares no producing-
     // derivation input has no SRC lane — a stated absence, not an error. `raw`
     // has no producer; `mix-a`'s producer input is `raw` (a candidate here), so
     // the pair shares nothing.
@@ -2735,16 +2734,10 @@ fn project_ambiguous_refs_refuse_and_list_the_options() {
     let project = build_ambiguous_project();
     let (_tool, path_env) = stub_project_tool();
 
-    // A slug two assets carry: refused, listing the assets by id and filename.
-    let (code, stderr) = project_failure(&project.dir.path, &["raw", "mix-a"], &[], &path_env);
-    assert_eq!(code, Some(1));
-    assert!(
-        stderr.contains("raw-1 (src/take-1.wav)") && stderr.contains("raw-2 (src/take-2.wav)"),
-        "a duplicated slug is refused, listing the colliding assets: {stderr}"
-    );
-
     // A basename-stem two outputs of the derivation share: refused, listing the
-    // outputs by slug and filename — the same shape the no-match message uses.
+    // outputs by id and filename — the same shape the no-match message uses.
+    // (A duplicated ref target by bare token is unreachable now: bare tokens
+    // match asset ids, the manifest's own identity.)
     let (code, stderr) =
         project_failure(&project.dir.path, &["vocals@mix", "mix-b"], &[], &path_env);
     assert_eq!(code, Some(1));
@@ -2790,7 +2783,7 @@ fn project_no_match_lists_the_outputs() {
     let (_tool, path_env) = stub_project_tool();
 
     // A basename no output of the derivation carries: the message lists what the
-    // derivation does output (slug + filename) so the listener can pick.
+    // derivation does output (id + filename) so the listener can pick.
     let (code, stderr) = project_failure(
         &project.dir.path,
         &["nope@deriv-a", "vocals@deriv-b"],
@@ -2800,15 +2793,15 @@ fn project_no_match_lists_the_outputs() {
     assert_eq!(code, Some(1));
     assert!(
         stderr.contains("nope") && stderr.contains("vocals.wav") && stderr.contains("mix-a"),
-        "no-match lists the derivation's outputs with slug and filename: {stderr}"
+        "no-match lists the derivation's outputs with id and filename: {stderr}"
     );
 
-    // An unknown slug likewise names what it could not find.
+    // An unknown id likewise names what it could not find.
     let (code, stderr) = project_failure(&project.dir.path, &["ghost", "mix-a"], &[], &path_env);
     assert_eq!(code, Some(1));
     assert!(
-        stderr.to_lowercase().contains("slug") && stderr.contains("ghost"),
-        "an unknown slug is named: {stderr}"
+        stderr.contains("no asset with id") && stderr.contains("ghost"),
+        "an unknown id is named: {stderr}"
     );
 }
 

@@ -46,7 +46,7 @@ let stubArgvLog;
 
 test.beforeAll(async () => {
   // A self-contained project: the two matched fixtures as candidate mixes,
-  // resolved by bare slug (no derivations, so no SRC lane — this spec is about
+  // resolved by bare id (no derivations, so no SRC lane — this spec is about
   // the handover, not the source lane). The manifest records each file's real
   // sha256 so the loader's integrity check passes.
   projectRoot = mkdtempSync(path.join(tmpdir(), "project-flow-"));
@@ -62,14 +62,12 @@ test.beforeAll(async () => {
     assets: [
       {
         id: "mix-a",
-        slug: "mix-a",
-        file: "mix-a.wav",
+        path: "mix-a.wav",
         sha256: sha256(path.join(projectRoot, "mix-a.wav")),
       },
       {
         id: "mix-b",
-        slug: "mix-b",
-        file: "mix-b.wav",
+        path: "mix-b.wav",
         sha256: sha256(path.join(projectRoot, "mix-b.wav")),
       },
     ],
