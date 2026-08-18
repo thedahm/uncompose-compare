@@ -21,7 +21,7 @@ export const emptyVerdict: Verdict = {
 };
 
 /** True once a candidate (not "no preference") is picked — confidence applies. */
-function preferenceChosen(verdict: Verdict): boolean {
+export function preferenceChosen(verdict: Verdict): boolean {
   return verdict.preference === "A" || verdict.preference === "B";
 }
 

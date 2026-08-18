@@ -1,9 +1,9 @@
 /**
  * The workbench's modal shell: a dimmed full-screen overlay that closes on a
- * backdrop click, wrapping a centered panel that doesn't. Both the verdict and
- * the help modal are this shape, so it lives in one place.
+ * backdrop click or Escape, wrapping a centered panel that doesn't. Both the
+ * verdict and the help modal are this shape, so it lives in one place.
  */
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 
 export function Modal({
   testid,
@@ -19,6 +19,18 @@ export function Modal({
   onClose: () => void;
   children: ReactNode;
 }) {
+  // The shell owns *how a modal closes*, so every modal gets Escape for free.
+  // What the workbench underneath ignores while one is open is the other half,
+  // and lives with the state that knows it: the global handler in App.tsx
+  // (issue #52). Keyboard changes that cross that line touch both.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   return (
     <div
       data-testid={testid}
