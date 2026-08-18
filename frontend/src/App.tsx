@@ -537,7 +537,9 @@ export function App() {
         target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA");
       // Modals own the keyboard while open: a shortcut key doesn't leak
       // through to a transport action underneath (issue #52) — e.g. a
-      // confidence-star <button> in the verdict modal catching space.
+      // confidence-star <button> in the verdict modal catching space. Closing
+      // on Escape is the shared shell's job instead (Modal.tsx), so it applies
+      // to every modal without this handler enumerating them.
       const modalOpen = helpOpen || verdictOpen;
       // Undo/redo (issue #15) are the only ctrl keys the workbench owns. They
       // fire only when not typing into a field, so a text input keeps its

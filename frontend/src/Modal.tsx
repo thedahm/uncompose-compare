@@ -19,6 +19,10 @@ export function Modal({
   onClose: () => void;
   children: ReactNode;
 }) {
+  // The shell owns *how a modal closes*, so every modal gets Escape for free.
+  // What the workbench underneath ignores while one is open is the other half,
+  // and lives with the state that knows it: the global handler in App.tsx
+  // (issue #52). Keyboard changes that cross that line touch both.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
