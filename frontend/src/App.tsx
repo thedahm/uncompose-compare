@@ -535,11 +535,15 @@ export function App() {
       const target = e.target as HTMLElement | null;
       const typing =
         target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA");
+      // Modals own the keyboard while open: a shortcut key doesn't leak
+      // through to a transport action underneath (issue #52) — e.g. a
+      // confidence-star <button> in the verdict modal catching space.
+      const modalOpen = helpOpen || verdictOpen;
       // Undo/redo (issue #15) are the only ctrl keys the workbench owns. They
       // fire only when not typing into a field, so a text input keeps its
       // native editing/undo behavior.
       if (e.ctrlKey || e.metaKey) {
-        if (!typing && (e.key === "z" || e.key === "Z")) {
+        if (!typing && !modalOpen && (e.key === "z" || e.key === "Z")) {
           e.preventDefault();
           setLedger((l) => (e.shiftKey ? redo(l) : undo(l)));
         }
@@ -549,6 +553,15 @@ export function App() {
       // While typing into the composer or a ledger edit, the field's own key
       // handlers own the keyboard (so space, enter, etc. type normally).
       if (typing) return;
+      // "?" is the help modal's own toggle, so it keeps working while help is
+      // open (to close it) — it just won't stack help on top of the verdict
+      // modal.
+      if (e.key === "?") {
+        e.preventDefault();
+        if (!verdictOpen) setHelpOpen((open) => !open);
+        return;
+      }
+      if (modalOpen) return;
       switch (e.key) {
         case " ":
           e.preventDefault();
@@ -592,17 +605,24 @@ export function App() {
           e.preventDefault();
           composerRef.current?.focus();
           break;
-        case "?":
-          e.preventDefault();
-          setHelpOpen((open) => !open);
-          break;
         default:
           break;
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, toggleSwitch, toggleLoop, clearRegion, rewind, step, pin, liveTarget]);
+  }, [
+    togglePlay,
+    toggleSwitch,
+    toggleLoop,
+    clearRegion,
+    rewind,
+    step,
+    pin,
+    liveTarget,
+    helpOpen,
+    verdictOpen,
+  ]);
 
   // The two lanes keyed by label, narrowed once from the session payload: the
   // blind pair carries no identity to render, the sighted pair carries all of it.

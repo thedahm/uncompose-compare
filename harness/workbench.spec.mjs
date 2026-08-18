@@ -363,6 +363,28 @@ test("verdict: closing without saving discards the edit — Save is the engrave 
   await expect(page.getByTestId("prefer-A")).toHaveAttribute("aria-pressed", "true");
 });
 
+test("verdict: transport shortcuts are inert while the modal has focus (issue #52)", async ({ page }) => {
+  await page.getByTestId("open-verdict").click();
+  await page.getByTestId("prefer-A").click();
+  // Focus a confidence-star <button> — the exact case the issue calls out:
+  // space toggling both the star and playback underneath the modal.
+  await page.getByTestId("confidence-4").focus();
+  await expect(page.getByTestId("play-toggle")).toContainText("Play");
+  await expect(page.getByTestId("live-lane")).toContainText("A");
+  await expect(page.getByTestId("transport-position")).toContainText("0:00.000 /");
+
+  for (const key of [" ", "x", "r", "u", "ArrowRight", "Enter"]) {
+    await page.keyboard.press(key);
+  }
+
+  // The modal is still open and none of the transport state moved.
+  await expect(page.getByTestId("verdict-modal")).toBeVisible();
+  await expect(page.getByTestId("play-toggle")).toContainText("Play");
+  await expect(page.getByTestId("live-lane")).toContainText("A");
+  await expect(page.getByTestId("transport-position")).toContainText("0:00.000 /");
+  await expect(page.getByTestId("confidence-4")).toHaveAttribute("aria-pressed", "true");
+});
+
 test("conclude: writes a record that matches the session and reports where it landed", async ({ page }) => {
   // A full DoD slice: pin an observation, select a region, decide a verdict,
   // then conclude and assert the on-disk record matches.
