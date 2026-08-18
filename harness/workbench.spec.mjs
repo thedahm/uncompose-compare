@@ -97,6 +97,13 @@ test("help: ? toggles the keymap modal and documents the region keys", async ({ 
   await expect(page.getByTestId("help-modal")).toHaveCount(0);
 });
 
+test("help: Escape closes the keymap modal (issue #51)", async ({ page }) => {
+  await page.keyboard.press("?");
+  await expect(page.getByTestId("help-modal")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("help-modal")).toHaveCount(0);
+});
+
 // Drag across a waveform from `from` to `to` (both track fractions), selecting a
 // region; a genuine drag (well over the click threshold) never seeks.
 async function dragRegion(page, testid, from, to) {
@@ -383,6 +390,16 @@ test("verdict: transport shortcuts are inert while the modal has focus (issue #5
   await expect(page.getByTestId("live-lane")).toContainText("A");
   await expect(page.getByTestId("transport-position")).toContainText("0:00.000 /");
   await expect(page.getByTestId("confidence-4")).toHaveAttribute("aria-pressed", "true");
+});
+
+test("verdict: Escape closes the modal, discarding the edit like backdrop click (issue #51)", async ({ page }) => {
+  await page.getByTestId("open-verdict").click();
+  await expect(page.getByTestId("verdict-modal")).toBeVisible();
+  await page.getByTestId("prefer-A").click();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("verdict-modal")).toHaveCount(0);
+  // Nothing was saved.
+  await expect(page.getByTestId("verdict-stars-A")).toHaveCount(0);
 });
 
 test("conclude: writes a record that matches the session and reports where it landed", async ({ page }) => {

@@ -1,9 +1,9 @@
 /**
  * The workbench's modal shell: a dimmed full-screen overlay that closes on a
- * backdrop click, wrapping a centered panel that doesn't. Both the verdict and
- * the help modal are this shape, so it lives in one place.
+ * backdrop click or Escape, wrapping a centered panel that doesn't. Both the
+ * verdict and the help modal are this shape, so it lives in one place.
  */
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 
 export function Modal({
   testid,
@@ -19,6 +19,14 @@ export function Modal({
   onClose: () => void;
   children: ReactNode;
 }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   return (
     <div
       data-testid={testid}
