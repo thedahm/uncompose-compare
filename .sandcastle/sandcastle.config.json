@@ -1,4 +1,30 @@
 {
   "repoChecks": "`npm run typecheck` and `npm run test` at the repo root — they cover the frontend typecheck/build and `cargo test`. If the touched code has other documented checks (e.g. the packaging scripts under `scripts/`), run those too.",
-  "copyToWorktree": ["node_modules", "frontend/node_modules", "target"]
+  "copyToWorktree": [
+    "node_modules",
+    "frontend/node_modules",
+    "target"
+  ],
+  "roster": {
+    "haiku": {
+      "provider": "claudeCode",
+      "model": "claude-haiku-4-5"
+    },
+    "sonnet": {
+      "provider": "claudeCode",
+      "model": "claude-sonnet-5"
+    },
+    "opus": {
+      "provider": "claudeCode",
+      "model": "claude-opus-5"
+    },
+    "fable": {
+      "provider": "claudeCode",
+      "model": "claude-fable-5"
+    }
+  },
+  "implementerDefaults": {
+    "tier": "opus",
+    "effort": "high"
+  }
 }
