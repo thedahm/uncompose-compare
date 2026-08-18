@@ -39,13 +39,34 @@ your browser.
 
 ```
 uncompose-compare <A> <B> [--port <PORT>] [--out <PATH>] [--cache-max-bytes <BYTES>]
+                          [--project <DIR>] [--source <PATH>] [--exclude-source]
+                          [--loudness-match] [--blind]
 uncompose-compare cache clear
 ```
 
 - `--port` pins the loopback port instead of taking an ephemeral one.
 - `--out` writes the concluded comparison record to this path instead of `<ULID>.json` in
   the directory you ran from. An existing destination is refused, never overwritten.
+  Conflicts with `--project` (project records' destination is the handover's).
 - `--cache-max-bytes` caps the playback-proxy cache, pruned least-recently-used at
   startup. It defaults to 2 GiB — the flag is here because a cache that can grow to
   gigabytes of your disk should be yours to bound.
+- `--project <DIR>` runs in project mode: the two positionals are resolved as manifest
+  refs against `<DIR>/uncompose.project.json` instead of as file paths. A ref is an
+  asset id, or `<name>@<derivation>`. The candidates' shared source becomes the SRC
+  lane unless `--exclude-source` is passed.
+- `--source <PATH>` supplies the shared source for the SRC lane in bare-file mode: a
+  third, always-identified lane that joins the sample-locked graph and the loudness
+  match group. In project mode the source is auto-resolved instead, so this conflicts
+  with `--project`.
+- `--exclude-source` (project mode only) omits the SRC lane even when the candidates
+  share a source.
+- `--loudness-match` measures ITU-R BS.1770 integrated loudness per candidate at load
+  and attenuates the louder lane down to the quietest (gain-only, never boost). Off by
+  default — faithful as-is playback is the baseline.
+- `--blind` shuffles the label↔file assignment by an OS coin flip at load and conceals
+  every identifying detail (name, path, hash, size) from the served surface, so a
+  preference is judged without knowing which file is which. Refuses identical content
+  or a duration/rate/channel mismatch before binding. The written record still carries
+  full identities.
 - `cache clear` deletes every cached proxy and reports what it removed.
