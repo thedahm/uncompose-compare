@@ -15,10 +15,10 @@ having the rights to the audio you process.
 
 ## Status
 
-Pre-v0.1: the first release is being built in the open on the
-[issue tracker](https://github.com/thedahm/uncompose-compare/issues), with decisions this
-repo owns recorded in [`docs/adr/`](docs/adr/). The install line below goes live with the
-`v0.1.0` tag. See the [release notes](docs/releases/v0.1.0.md) and
+v0.1.0 is [on PyPI](https://pypi.org/project/uncompose-compare/). Development happens
+in the open on the [issue tracker](https://github.com/thedahm/uncompose-compare/issues),
+with decisions this repo owns recorded in [`docs/adr/`](docs/adr/). See the
+[release notes](docs/releases/v0.1.0.md) and
 [known limitations](docs/known-limitations.md) for what v0.1 does and does not do.
 
 ## Install
@@ -28,7 +28,7 @@ It installs as the `uncompose-compare` command and is also reachable through the
 `uncompose` dispatcher as `uncompose compare`:
 
 ```sh
-# placeholder — goes live with v0.1.0
+uv tool install uncompose-compare      # or: pip install uncompose-compare
 uncompose compare a.wav b.wav
 ```
 
